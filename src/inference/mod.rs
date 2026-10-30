@@ -1,0 +1,93 @@
+pub mod local;
+pub mod mock;
+pub mod sarvam;
+pub mod wav;
+
+use crate::audio::AudioChunk;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InferenceError {
+    MissingApiKey(String),
+    Network(String),
+    Http { status: u16, message: String },
+    Serialization(String),
+    NotConfigured(String),
+}
+
+impl std::fmt::Display for InferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingApiKey(msg) => write!(f, "Missing API key: {}", msg),
+            Self::Network(msg) => write!(f, "Network error: {}", msg),
+            Self::Http { status, message } => write!(f, "HTTP error {}: {}", status, message),
+            Self::Serialization(msg) => write!(f, "Serialization error: {}", msg),
+            Self::NotConfigured(msg) => write!(f, "Inference provider not configured: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for InferenceError {}
+
+pub trait SpeechInference: Send {
+    fn transcribe(&mut self, chunk: &AudioChunk) -> Result<String, InferenceError>;
+    fn provider_name(&self) -> &'static str;
+}
+
+impl SpeechInference for Box<dyn SpeechInference> {
+    fn transcribe(&mut self, chunk: &AudioChunk) -> Result<String, InferenceError> {
+        (**self).transcribe(chunk)
+    }
+
+    fn provider_name(&self) -> &'static str {
+        (**self).provider_name()
+    }
+}
+
+pub fn create_inference_provider(
+    config: &crate::config::InferenceConfig,
+) -> Result<Box<dyn SpeechInference>, String> {
+    match config.provider.to_lowercase().as_str() {
+        "mock" => Ok(Box::new(mock::MockSpeechInference::new())),
+        "sarvam" => {
+            let api_key = config.resolve_api_key().ok_or_else(|| {
+                "SARVAM_API_KEY is not configured in config.toml or environment variable. Check 'speechyyy doctor'.".to_string()
+            })?;
+            Ok(Box::new(sarvam::SarvamSpeechInference::new(
+                api_key,
+                config.model.clone(),
+                config.language_code.clone(),
+                config.mode.clone(),
+            )))
+        }
+        "local" => Ok(Box::new(local::LocalSpeechInference::new())),
+        other => Err(format!(
+            "Unknown inference provider '{}'. Supported providers are: 'mock', 'sarvam', 'local'.",
+            other
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inference_error_display() {
+        assert_eq!(
+            InferenceError::MissingApiKey("SARVAM_API_KEY".into()).to_string(),
+            "Missing API key: SARVAM_API_KEY"
+        );
+        assert_eq!(
+            InferenceError::Http {
+                status: 401,
+                message: "Unauthorized".into()
+            }
+            .to_string(),
+            "HTTP error 401: Unauthorized"
+        );
+        assert_eq!(
+            InferenceError::Network("Connection refused".into()).to_string(),
+            "Network error: Connection refused"
+        );
+    }
+}

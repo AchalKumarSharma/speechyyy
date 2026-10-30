@@ -166,6 +166,16 @@ impl MockAudioCapture {
             stop_calls: 0,
         }
     }
+
+    pub fn with_queued_chunks(chunks: Vec<AudioChunk>) -> Self {
+        Self {
+            is_recording: false,
+            queued_chunks: chunks,
+            captured_chunks: Vec::new(),
+            start_calls: 0,
+            stop_calls: 0,
+        }
+    }
 }
 
 impl AudioCapture for MockAudioCapture {

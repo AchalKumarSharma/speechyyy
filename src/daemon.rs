@@ -3,6 +3,7 @@ use crate::audio::vad::EnergyVad;
 use crate::config::Config;
 use crate::doctor::{run_doctor, RealSysEnv};
 use crate::engine::{AudioDictationEngine, DictationEngine, StateMachineController};
+use crate::inference::create_inference_provider;
 use crate::injector::{TextInjector, UinputInjector};
 use crate::input::{EvdevListener, InputEventSource};
 use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, PidFile, RuntimePaths};
@@ -87,9 +88,9 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
     let env = RealSysEnv;
     let report = run_doctor(&env);
     if !report.is_ready() {
-        eprintln!("[ERROR] System permissions missing for Speechyyy.");
-        eprintln!("Run 'speechyyy doctor' to inspect and fix permissions.");
-        return Err("Pre-flight permission check failed".into());
+        eprintln!("[ERROR] Pre-flight system and configuration checks failed for Speechyyy.");
+        eprintln!("Run 'speechyyy doctor' to inspect and fix permissions or configuration.");
+        return Err("Pre-flight check failed".into());
     }
 
     if !foreground {
@@ -190,7 +191,14 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
             }
         };
         let vad = EnergyVad::from_config(&config.audio);
-        let engine = AudioDictationEngine::new(capture, vad);
+        let inference = match create_inference_provider(&config.inference) {
+            Ok(p) => p,
+            Err(e) => {
+                paths.cleanup();
+                return Err(format!("Failed to initialize speech inference: {}", e));
+            }
+        };
+        let engine = AudioDictationEngine::new(capture, vad, inference);
         let mut controller = StateMachineController::new(target_chord, engine);
 
         println!(
@@ -199,6 +207,11 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
         );
         println!("Push-to-Talk Hotkey: {:?}", config.hotkey);
         println!("Pacing Delay: {}ms", config.pacing_delay_ms);
+        println!("Inference Provider: {}", config.inference.provider);
+        if config.inference.provider.to_lowercase() == "sarvam" {
+            println!("Sarvam Model: {}", config.inference.model);
+            println!("Sarvam Language: {}", config.inference.language_code);
+        }
 
         let _ = run_session_loop(
             &listener,

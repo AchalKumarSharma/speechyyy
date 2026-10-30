@@ -4,6 +4,7 @@ use speechyyy::audio::vad::EnergyVad;
 use speechyyy::audio::AudioChunk;
 use speechyyy::daemon::run_session_loop;
 use speechyyy::engine::{AudioDictationEngine, StateMachineController, TargetChord};
+use speechyyy::inference::mock::MockSpeechInference;
 use speechyyy::injector::{RecordingInjector, TextInjector};
 use speechyyy::input::{FakeInputSource, InputEventSource};
 use speechyyy::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, RuntimePaths};
@@ -62,7 +63,8 @@ fn test_audio_pipeline_e2e_valid_speech() {
     let speech_chunk = AudioChunk::new(vec![0.05; 8000]);
     let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
     let vad = EnergyVad::default();
-    let engine = AudioDictationEngine::new(capture, vad);
+    let inference = MockSpeechInference::with_transcript("Pipeline speech transcription");
+    let engine = AudioDictationEngine::new(capture, vad, inference);
     let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
 
     let loop_running = running.clone();
@@ -108,7 +110,7 @@ fn test_audio_pipeline_e2e_valid_speech() {
         .unwrap()
         .clone();
     assert_eq!(injected.len(), 1);
-    assert_eq!(injected[0], "[Speech: 0.50s, 16kHz, RMS 0.050]");
+    assert_eq!(injected[0], "Pipeline speech transcription");
 
     // 3. Stop daemon
     let _ = IpcClient::send_request(&paths.socket_path, &IpcRequest::Stop);
@@ -143,7 +145,8 @@ fn test_audio_pipeline_e2e_silence_rejected() {
     let silence_chunk = AudioChunk::new(vec![0.001; 8000]);
     let capture = MockAudioCapture::with_queued_chunk(silence_chunk);
     let vad = EnergyVad::default();
-    let engine = AudioDictationEngine::new(capture, vad);
+    let inference = MockSpeechInference::with_transcript("Pipeline speech transcription");
+    let engine = AudioDictationEngine::new(capture, vad, inference);
     let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
 
     let loop_running = running.clone();
@@ -213,7 +216,8 @@ fn test_audio_pipeline_e2e_micro_tap_rejected() {
     let micro_chunk = AudioChunk::new(vec![0.1; 800]);
     let capture = MockAudioCapture::with_queued_chunk(micro_chunk);
     let vad = EnergyVad::default();
-    let engine = AudioDictationEngine::new(capture, vad);
+    let inference = MockSpeechInference::with_transcript("Pipeline speech transcription");
+    let engine = AudioDictationEngine::new(capture, vad, inference);
     let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
 
     let loop_running = running.clone();

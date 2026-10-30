@@ -24,6 +24,60 @@ fn default_min_duration_ms() -> u64 {
     200
 }
 
+fn default_provider() -> String {
+    "mock".to_string()
+}
+
+fn default_model() -> String {
+    "saaras:v4".to_string()
+}
+
+fn default_language_code() -> String {
+    "unknown".to_string()
+}
+
+fn default_mode() -> String {
+    "transcribe".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InferenceConfig {
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default = "default_language_code")]
+    pub language_code: String,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            api_key: String::new(),
+            model: default_model(),
+            language_code: default_language_code(),
+            mode: default_mode(),
+        }
+    }
+}
+
+impl InferenceConfig {
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if !self.api_key.trim().is_empty() {
+            Some(self.api_key.trim().to_string())
+        } else {
+            std::env::var("SARVAM_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioConfig {
     #[serde(default = "default_sample_rate")]
@@ -52,6 +106,8 @@ pub struct Config {
     pub pacing_delay_ms: u64,
     #[serde(default)]
     pub audio: AudioConfig,
+    #[serde(default)]
+    pub inference: InferenceConfig,
 }
 
 impl Default for Config {
@@ -60,6 +116,7 @@ impl Default for Config {
             hotkey: default_hotkey(),
             pacing_delay_ms: default_pacing_ms(),
             audio: AudioConfig::default(),
+            inference: InferenceConfig::default(),
         }
     }
 }
@@ -171,6 +228,13 @@ pacing_delay_ms = 5
 sample_rate = 16000
 vad_threshold = 0.008
 min_duration_ms = 300
+
+[inference]
+provider = "sarvam"
+api_key = "test_sarvam_key_123"
+model = "saaras:v4"
+language_code = "hi-IN"
+mode = "codemix"
 "#;
         let parsed: Config = toml::from_str(toml_data).unwrap();
         assert_eq!(parsed.hotkey, "Ctrl+Space");
@@ -179,5 +243,33 @@ min_duration_ms = 300
         assert_eq!(parsed.audio.sample_rate, 16000);
         assert!((parsed.audio.vad_threshold - 0.008).abs() < 1e-6);
         assert_eq!(parsed.audio.min_duration_ms, 300);
+        assert_eq!(parsed.inference.provider, "sarvam");
+        assert_eq!(
+            parsed.inference.resolve_api_key(),
+            Some("test_sarvam_key_123".into())
+        );
+        assert_eq!(parsed.inference.model, "saaras:v4");
+        assert_eq!(parsed.inference.language_code, "hi-IN");
+        assert_eq!(parsed.inference.mode, "codemix");
+    }
+
+    #[test]
+    fn test_inference_config_api_key_env_var_fallback() {
+        let mut cfg = InferenceConfig::default();
+        assert_eq!(cfg.provider, "mock");
+        assert_eq!(cfg.model, "saaras:v4");
+        assert_eq!(cfg.language_code, "unknown");
+
+        std::env::remove_var("SARVAM_API_KEY");
+        assert_eq!(cfg.resolve_api_key(), None);
+
+        std::env::set_var("SARVAM_API_KEY", "env_key_secret_999");
+        assert_eq!(cfg.resolve_api_key(), Some("env_key_secret_999".into()));
+
+        // Explicit config field takes precedence over env var
+        cfg.api_key = "explicit_config_key".into();
+        assert_eq!(cfg.resolve_api_key(), Some("explicit_config_key".into()));
+
+        std::env::remove_var("SARVAM_API_KEY");
     }
 }

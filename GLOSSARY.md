@@ -47,3 +47,15 @@ _Avoid_: Sound filter, noise gate, speech detector
 **Audio Producer**:
 The lock-free, allocation-free producer handle writing real-time microphone frames into the SPSC ring buffer inside the OS audio callback.
 _Avoid_: Sound writer, audio pump, capture thread
+
+**Speech Inference**:
+The conversion of a processed 16,000 Hz single-channel PCM Audio Chunk into transcribed natural language text via an abstract provider.
+_Avoid_: Model processing, AI recognition, STT run
+
+**Inference Provider**:
+An implementation of the `SpeechInference` trait (e.g., `MockSpeechInference`, `SarvamSpeechInference`, `LocalSpeechInference`) providing transcription capability.
+_Avoid_: Speech backend, AI driver, STT adapter
+
+**WAV Container**:
+An in-memory 44-byte standard RIFF/WAVE header framing 16,000 Hz 16-bit signed PCM audio for HTTP multipart/form-data ingestion by cloud models.
+_Avoid_: Audio file wrapper, sound file, WAV payload

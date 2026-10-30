@@ -9,6 +9,7 @@ pub trait SysEnv {
     fn can_write_path(&self, path: &Path) -> bool;
     fn list_input_events(&self) -> Vec<PathBuf>;
     fn check_audio_input(&self) -> Result<String, String>;
+    fn check_inference(&self) -> Result<String, String>;
 }
 
 pub struct RealSysEnv;
@@ -107,6 +108,33 @@ impl SysEnv for RealSysEnv {
             .map_err(|e| format!("Default input config error: {}", e))?;
 
         Ok(name)
+    }
+
+    fn check_inference(&self) -> Result<String, String> {
+        let config = crate::config::Config::load();
+        match config.inference.provider.to_lowercase().as_str() {
+            "sarvam" => {
+                if let Some(key) = config.inference.resolve_api_key() {
+                    let masked = if key.len() > 8 {
+                        format!("{}...{}", &key[..4], &key[key.len() - 4..])
+                    } else {
+                        "********".to_string()
+                    };
+                    Ok(format!(
+                        "Sarvam AI (key: {}, model: {})",
+                        masked, config.inference.model
+                    ))
+                } else {
+                    Err("SARVAM_API_KEY is not set (configure in config.toml or set environment variable)".into())
+                }
+            }
+            "mock" => Ok("Mock provider (mock)".into()),
+            "local" => Ok("Local offline runtime (stub)".into()),
+            other => Err(format!(
+                "Unknown inference provider '{}'. Supported providers are 'mock', 'sarvam', 'local'.",
+                other
+            )),
+        }
     }
 }
 
@@ -227,6 +255,25 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
         }
     }
 
+    // 5. Speech inference provider readiness check
+    match env.check_inference() {
+        Ok(info) => {
+            items.push(DiagnosticItem {
+                name: format!("Speech inference provider: {}", info),
+                status: CheckStatus::Pass,
+            });
+        }
+        Err(err) => {
+            items.push(DiagnosticItem {
+                name: "Speech inference provider".into(),
+                status: CheckStatus::Fail(err),
+            });
+            fix_instructions.push(
+                "Export SARVAM_API_KEY (e.g. 'export SARVAM_API_KEY=your_key') or set api_key in ~/.config/speechyyy/config.toml".into(),
+            );
+        }
+    }
+
     let udev_rule_content =
         r#"# Speechyyy uinput rule for unprivileged virtual keyboard caret injection
 KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
@@ -278,6 +325,7 @@ mod tests {
         writable_paths: Vec<PathBuf>,
         events: Vec<PathBuf>,
         audio_input: Result<String, String>,
+        inference_result: Result<String, String>,
     }
 
     impl SysEnv for MockEnv {
@@ -299,6 +347,9 @@ mod tests {
         fn check_audio_input(&self) -> Result<String, String> {
             self.audio_input.clone()
         }
+        fn check_inference(&self) -> Result<String, String> {
+            self.inference_result.clone()
+        }
     }
 
     #[test]
@@ -310,6 +361,7 @@ mod tests {
             writable_paths: vec![PathBuf::from("/dev/uinput")],
             events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Default Source".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
         };
 
         let report = run_doctor(&env);
@@ -319,6 +371,10 @@ mod tests {
             .items
             .iter()
             .any(|i| i.name.contains("PipeWire Default Source")));
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name.contains("Speech inference provider")));
     }
 
     #[test]
@@ -330,6 +386,7 @@ mod tests {
             writable_paths: vec![],
             events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("Builtin Mic".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
         };
 
         let report = run_doctor(&env);
@@ -351,6 +408,7 @@ mod tests {
             writable_paths: vec![PathBuf::from("/dev/uinput")],
             events: vec![],
             audio_input: Ok("Builtin Mic".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
         };
 
         let report = run_doctor(&env);
@@ -370,6 +428,7 @@ mod tests {
             writable_paths: vec![PathBuf::from("/dev/uinput")],
             events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Err("No default audio input device found".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
         };
 
         let report = run_doctor(&env);
@@ -383,5 +442,51 @@ mod tests {
             .fix_instructions
             .iter()
             .any(|cmd| cmd.contains("PipeWire")));
+    }
+
+    #[test]
+    fn test_doctor_missing_sarvam_api_key() {
+        let env = MockEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("PipeWire Default Source".into()),
+            inference_result: Err("SARVAM_API_KEY is not set".into()),
+        };
+
+        let report = run_doctor(&env);
+        assert!(!report.is_ready());
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name.contains("Speech inference provider")
+                && matches!(i.status, CheckStatus::Fail(_))));
+        assert!(report
+            .fix_instructions
+            .iter()
+            .any(|cmd| cmd.contains("SARVAM_API_KEY")));
+    }
+
+    #[test]
+    fn test_doctor_invalid_inference_provider() {
+        let env = MockEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into(), "uinput".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("PipeWire Default Source".into()),
+            inference_result: Err("Unknown inference provider 'foo'".into()),
+        };
+
+        let report = run_doctor(&env);
+        assert!(!report.is_ready());
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name.contains("Speech inference provider")
+                && matches!(i.status, CheckStatus::Fail(_))));
     }
 }

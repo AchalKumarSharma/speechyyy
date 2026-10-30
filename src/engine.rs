@@ -1,5 +1,6 @@
 use crate::audio::vad::EnergyVad;
 use crate::audio::AudioCapture;
+use crate::inference::SpeechInference;
 use evdev::KeyCode;
 use std::collections::HashSet;
 
@@ -192,18 +193,23 @@ impl DictationEngine for MockDictationEngine {
     }
 }
 
-pub struct AudioDictationEngine<C: AudioCapture> {
+pub struct AudioDictationEngine<C: AudioCapture, I: SpeechInference> {
     pub capture: C,
     pub vad: EnergyVad,
+    pub inference: I,
 }
 
-impl<C: AudioCapture> AudioDictationEngine<C> {
-    pub fn new(capture: C, vad: EnergyVad) -> Self {
-        Self { capture, vad }
+impl<C: AudioCapture, I: SpeechInference> AudioDictationEngine<C, I> {
+    pub fn new(capture: C, vad: EnergyVad, inference: I) -> Self {
+        Self {
+            capture,
+            vad,
+            inference,
+        }
     }
 }
 
-impl<C: AudioCapture> DictationEngine for AudioDictationEngine<C> {
+impl<C: AudioCapture, I: SpeechInference> DictationEngine for AudioDictationEngine<C, I> {
     fn on_press(&mut self) -> Result<(), String> {
         self.capture
             .start_capture()
@@ -218,11 +224,26 @@ impl<C: AudioCapture> DictationEngine for AudioDictationEngine<C> {
 
         match self.vad.evaluate(&chunk) {
             Some(metrics) => {
-                let summary = format!(
-                    "[Speech: {:.2}s, 16kHz, RMS {:.3}]",
-                    metrics.duration_secs, metrics.rms
+                eprintln!(
+                    "VAD speech detected: {:.2}s, RMS {:.4} (samples: {})",
+                    metrics.duration_secs, metrics.rms, metrics.sample_count
                 );
-                Ok(Some(summary))
+                match self.inference.transcribe(&chunk) {
+                    Ok(transcript) => {
+                        let trimmed = transcript.trim();
+                        if trimmed.is_empty() {
+                            eprintln!("Inference returned empty transcript");
+                            Ok(None)
+                        } else {
+                            Ok(Some(trimmed.to_string()))
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Speech inference failed: {}", e);
+                        // Do not inject error string into active caret
+                        Ok(None)
+                    }
+                }
             }
             None => {
                 eprintln!("Audio discarded: below VAD threshold or duration < 200ms");
@@ -390,12 +411,14 @@ mod tests {
     fn test_audio_dictation_engine_speech_detected() {
         use crate::audio::capture::MockAudioCapture;
         use crate::audio::AudioChunk;
+        use crate::inference::mock::MockSpeechInference;
 
         // Valid speech chunk: 500ms at 16kHz with RMS 0.05
         let speech_chunk = AudioChunk::new(vec![0.05; 8000]);
         let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
         let vad = EnergyVad::default();
-        let engine = AudioDictationEngine::new(capture, vad);
+        let inference = MockSpeechInference::with_transcript("Real transcribed speech");
+        let engine = AudioDictationEngine::new(capture, vad, inference);
         let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
 
         // Press hotkey
@@ -411,9 +434,7 @@ mod tests {
             .unwrap();
         assert_eq!(controller.state, DictationState::Emitting);
         assert!(!controller.engine.capture.is_capturing());
-        assert!(output.is_some());
-        let text = output.unwrap();
-        assert!(text.starts_with("[Speech: 0.50s, 16kHz, RMS 0.050]"));
+        assert_eq!(output, Some("Real transcribed speech".to_string()));
 
         controller.finish_emission();
         assert_eq!(controller.state, DictationState::Idle);
@@ -423,12 +444,14 @@ mod tests {
     fn test_audio_dictation_engine_silence_discarded() {
         use crate::audio::capture::MockAudioCapture;
         use crate::audio::AudioChunk;
+        use crate::inference::mock::MockSpeechInference;
 
         // Silence chunk: 500ms at 16kHz with RMS 0.0001
         let silence_chunk = AudioChunk::new(vec![0.0001; 8000]);
         let capture = MockAudioCapture::with_queued_chunk(silence_chunk);
         let vad = EnergyVad::default();
-        let engine = AudioDictationEngine::new(capture, vad);
+        let inference = MockSpeechInference::with_transcript("Should not be called");
+        let engine = AudioDictationEngine::new(capture, vad, inference);
         let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
 
         // Press
@@ -449,17 +472,75 @@ mod tests {
     fn test_audio_dictation_engine_micro_tap_discarded() {
         use crate::audio::capture::MockAudioCapture;
         use crate::audio::AudioChunk;
+        use crate::inference::mock::MockSpeechInference;
 
         // Micro-tap chunk: 50ms at 16kHz (800 samples < 3200 minimum)
         let micro_tap_chunk = AudioChunk::new(vec![0.1; 800]);
         let capture = MockAudioCapture::with_queued_chunk(micro_tap_chunk);
         let vad = EnergyVad::default();
-        let engine = AudioDictationEngine::new(capture, vad);
+        let inference = MockSpeechInference::new();
+        let engine = AudioDictationEngine::new(capture, vad, inference);
         let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
 
         controller
             .handle_key_event(KeyCode::KEY_RIGHTALT, true)
             .unwrap();
+        let output = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
+            .unwrap();
+        assert_eq!(output, None);
+        assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_audio_dictation_engine_empty_transcript_returns_none() {
+        use crate::audio::capture::MockAudioCapture;
+        use crate::audio::AudioChunk;
+        use crate::inference::mock::MockSpeechInference;
+
+        let speech_chunk = AudioChunk::new(vec![0.05; 8000]);
+        let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
+        let vad = EnergyVad::default();
+        let inference = MockSpeechInference::with_transcript("   ");
+        let engine = AudioDictationEngine::new(capture, vad, inference);
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, true)
+            .unwrap();
+        let output = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
+            .unwrap();
+        assert_eq!(output, None);
+        assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_audio_dictation_engine_inference_error_returns_none() {
+        use crate::audio::capture::MockAudioCapture;
+        use crate::audio::AudioChunk;
+        use crate::inference::{InferenceError, SpeechInference};
+
+        struct FailingInference;
+        impl SpeechInference for FailingInference {
+            fn transcribe(&mut self, _chunk: &AudioChunk) -> Result<String, InferenceError> {
+                Err(InferenceError::Network("Server down".into()))
+            }
+            fn provider_name(&self) -> &'static str {
+                "failing"
+            }
+        }
+
+        let speech_chunk = AudioChunk::new(vec![0.05; 8000]);
+        let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
+        let vad = EnergyVad::default();
+        let engine = AudioDictationEngine::new(capture, vad, FailingInference);
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, true)
+            .unwrap();
+        // Failure shouldn't cause an unwrap or error propagation, just Ok(None) to stay resilient
         let output = controller
             .handle_key_event(KeyCode::KEY_RIGHTALT, false)
             .unwrap();
