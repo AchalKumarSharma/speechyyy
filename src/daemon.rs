@@ -56,6 +56,15 @@ where
 }
 
 pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String> {
+    if let Some(parent) = paths.pid_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create runtime directory {}: {}", parent.display(), e))?;
+    }
+    if let Some(parent) = paths.socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create runtime directory {}: {}", parent.display(), e))?;
+    }
+
     // Pre-flight check
     let env = RealSysEnv;
     let report = run_doctor(&env);

@@ -88,6 +88,11 @@ impl PidFile {
     }
 
     pub fn acquire(path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
+        }
+
         if let Some(existing_pid) = Self::read_pid(path) {
             if Self::is_process_running(existing_pid) {
                 return Err(format!("Daemon is already running with PID {}", existing_pid));
@@ -147,8 +152,10 @@ impl IpcServer {
     }
 
     pub fn start_listener(&self) -> Result<UnixListener, std::io::Result<()>> {
+        if let Some(parent) = self.paths.socket_path.parent() {
+            fs::create_dir_all(parent).map_err(Err)?;
+        }
         let _ = fs::remove_file(&self.paths.socket_path);
-        let _ = self.paths.ensure_dir();
         UnixListener::bind(&self.paths.socket_path).map_err(Err)
     }
 
@@ -271,5 +278,31 @@ mod tests {
         assert_eq!(PidFile::read_pid(&pid_path), None);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_creates_parent_directory_automatically() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("speechyyy_nested_{}", std::process::id()))
+            .join("sub_dir")
+            .join("nested");
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+
+        assert!(!temp_dir.exists());
+
+        // Acquire PID creates parent directories automatically
+        assert!(PidFile::acquire(&paths.pid_path).is_ok());
+        assert!(temp_dir.exists());
+        assert!(paths.pid_path.exists());
+
+        // Start listener also ensures parent directories exist
+        let server = IpcServer::new(paths.clone());
+        let listener = server.start_listener();
+        assert!(listener.is_ok());
+        assert!(paths.socket_path.exists());
+
+        paths.cleanup();
+        let root_created = temp_dir.parent().unwrap().parent().unwrap();
+        let _ = fs::remove_dir_all(root_created);
     }
 }
