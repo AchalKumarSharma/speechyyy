@@ -35,3 +35,15 @@ _Avoid_: Transcription run, recording event
 **Pre-flight Check**:
 The startup verification of required OS permissions and device node access before the daemon initializes.
 _Avoid_: Permission probe, initialization check, sanity test
+
+**Audio Chunk**:
+A discrete contiguous vector of 16,000 Hz single-channel PCM audio samples produced by downmixing and resampling.
+_Avoid_: Sound buffer, audio segment, recording slice
+
+**Voice Activity Detection (VAD)**:
+Energy-based evaluation assessing Root Mean Square (RMS) signal level and minimum duration to discard silence and accidental micro-taps before inference.
+_Avoid_: Sound filter, noise gate, speech detector
+
+**Audio Producer**:
+The lock-free, allocation-free producer handle writing real-time microphone frames into the SPSC ring buffer inside the OS audio callback.
+_Avoid_: Sound writer, audio pump, capture thread

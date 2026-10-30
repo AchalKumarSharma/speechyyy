@@ -71,14 +71,22 @@ fn test_end_to_end_push_to_talk_mock_session() {
     });
 
     // 1. Simulate Push-to-Talk: KeyDown RightAlt
-    raw_source.lock().unwrap().push_event(KeyCode::KEY_RIGHTALT, true);
+    raw_source
+        .lock()
+        .unwrap()
+        .push_event(KeyCode::KEY_RIGHTALT, true);
     std::thread::sleep(Duration::from_millis(50));
 
     // 2. Query status while key is held down
     let status_res = IpcClient::send_request(&paths.socket_path, &IpcRequest::Status);
     assert!(status_res.is_ok());
     match status_res.unwrap() {
-        IpcResponse::Status { state, hotkey, pacing_delay_ms, .. } => {
+        IpcResponse::Status {
+            state,
+            hotkey,
+            pacing_delay_ms,
+            ..
+        } => {
             assert_eq!(state, "Recording");
             assert_eq!(hotkey, "RightAlt");
             assert_eq!(pacing_delay_ms, 3);
@@ -87,11 +95,20 @@ fn test_end_to_end_push_to_talk_mock_session() {
     }
 
     // 3. Simulate KeyUp RightAlt -> triggers Mock emission
-    raw_source.lock().unwrap().push_event(KeyCode::KEY_RIGHTALT, false);
+    raw_source
+        .lock()
+        .unwrap()
+        .push_event(KeyCode::KEY_RIGHTALT, false);
     std::thread::sleep(Duration::from_millis(50));
 
     // Verify injected output
-    let strings = raw_injector.lock().unwrap().injected_strings.lock().unwrap().clone();
+    let strings = raw_injector
+        .lock()
+        .unwrap()
+        .injected_strings
+        .lock()
+        .unwrap()
+        .clone();
     assert_eq!(strings, vec!["Hello from Speechyyy".to_string()]);
 
     // 4. Send Stop command via IPC

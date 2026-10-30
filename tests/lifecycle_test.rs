@@ -21,7 +21,13 @@ fn test_daemon_full_lifecycle_on_temp_paths() {
     let server_thread = std::thread::spawn(move || {
         while server_running.load(Ordering::SeqCst) {
             if let Ok((mut stream, _)) = listener.accept() {
-                let _ = IpcServer::handle_connection(&mut stream, &server_running, "Idle", "RightAlt", 3);
+                let _ = IpcServer::handle_connection(
+                    &mut stream,
+                    &server_running,
+                    "Idle",
+                    "RightAlt",
+                    3,
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -48,7 +54,7 @@ fn test_daemon_full_lifecycle_on_temp_paths() {
 
     let stop_result = stop_daemon(&paths);
     assert!(stop_result.is_ok());
-    assert_eq!(running.load(Ordering::SeqCst), false);
+    assert!(!running.load(Ordering::SeqCst));
 
     server_thread.join().unwrap();
 

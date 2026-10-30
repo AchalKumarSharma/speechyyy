@@ -13,3 +13,4 @@ Passively monitors Linux input devices to detect push-to-talk press and release 
 
 ### Requirement: Caret Keystroke Injection with Pacing Delay
 Emits synthesized keystrokes into the active focused window using a persistent kernel virtual keyboard device with a 3ms inter-keystroke pacing delay.
+

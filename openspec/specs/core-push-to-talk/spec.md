@@ -99,3 +99,4 @@ The system MUST emit synthesized keystrokes into the active focused window using
 #### Scenario: Excluding virtual device from input sniffing
 - **When** the daemon initializes its virtual keyboard device
 - **Then** `EvdevListener` filters out any input node containing `"Speechyyy"` so the daemon never sniffs its own emitted keystrokes.
+

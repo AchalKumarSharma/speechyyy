@@ -1,3 +1,5 @@
+use crate::audio::vad::EnergyVad;
+use crate::audio::AudioCapture;
 use evdev::KeyCode;
 use std::collections::HashSet;
 
@@ -174,6 +176,12 @@ impl MockDictationEngine {
     }
 }
 
+impl Default for MockDictationEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DictationEngine for MockDictationEngine {
     fn on_press(&mut self) -> Result<(), String> {
         Ok(())
@@ -181,6 +189,46 @@ impl DictationEngine for MockDictationEngine {
 
     fn on_release(&mut self) -> Result<Option<String>, String> {
         Ok(Some(self.payload.clone()))
+    }
+}
+
+pub struct AudioDictationEngine<C: AudioCapture> {
+    pub capture: C,
+    pub vad: EnergyVad,
+}
+
+impl<C: AudioCapture> AudioDictationEngine<C> {
+    pub fn new(capture: C, vad: EnergyVad) -> Self {
+        Self { capture, vad }
+    }
+}
+
+impl<C: AudioCapture> DictationEngine for AudioDictationEngine<C> {
+    fn on_press(&mut self) -> Result<(), String> {
+        self.capture
+            .start_capture()
+            .map_err(|e| format!("Audio capture start failed: {}", e))
+    }
+
+    fn on_release(&mut self) -> Result<Option<String>, String> {
+        let chunk = self
+            .capture
+            .stop_capture()
+            .map_err(|e| format!("Audio capture stop failed: {}", e))?;
+
+        match self.vad.evaluate(&chunk) {
+            Some(metrics) => {
+                let summary = format!(
+                    "[Speech: {:.2}s, 16kHz, RMS {:.3}]",
+                    metrics.duration_secs, metrics.rms
+                );
+                Ok(Some(summary))
+            }
+            None => {
+                eprintln!("Audio discarded: below VAD threshold or duration < 200ms");
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -199,7 +247,11 @@ impl<E: DictationEngine> StateMachineController<E> {
         }
     }
 
-    pub fn handle_key_event(&mut self, key: KeyCode, is_down: bool) -> Result<Option<String>, String> {
+    pub fn handle_key_event(
+        &mut self,
+        key: KeyCode,
+        is_down: bool,
+    ) -> Result<Option<String>, String> {
         match self.tracker.handle_key(key, is_down) {
             ChordEvent::Press => {
                 if self.state == DictationState::Idle {
@@ -241,35 +293,74 @@ mod tests {
     fn test_single_key_right_alt_press_and_release() {
         let mut tracker = KeyChordTracker::new(TargetChord::right_alt());
 
-        assert_eq!(tracker.handle_key(KeyCode::KEY_RIGHTALT, true), ChordEvent::Press);
-        assert_eq!(tracker.handle_key(KeyCode::KEY_RIGHTALT, true), ChordEvent::None);
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_RIGHTALT, true),
+            ChordEvent::Press
+        );
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_RIGHTALT, true),
+            ChordEvent::None
+        );
         assert_eq!(tracker.handle_key(KeyCode::KEY_A, true), ChordEvent::None);
-        assert_eq!(tracker.handle_key(KeyCode::KEY_RIGHTALT, false), ChordEvent::Release);
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_RIGHTALT, false),
+            ChordEvent::Release
+        );
     }
 
     #[test]
     fn test_compound_chord_ctrl_space() {
         let mut tracker = KeyChordTracker::new(TargetChord::ctrl_space());
 
-        assert_eq!(tracker.handle_key(KeyCode::KEY_SPACE, true), ChordEvent::None);
-        assert_eq!(tracker.handle_key(KeyCode::KEY_SPACE, false), ChordEvent::None);
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_SPACE, true),
+            ChordEvent::None
+        );
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_SPACE, false),
+            ChordEvent::None
+        );
 
-        assert_eq!(tracker.handle_key(KeyCode::KEY_LEFTCTRL, true), ChordEvent::None);
-        assert_eq!(tracker.handle_key(KeyCode::KEY_SPACE, true), ChordEvent::Press);
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_LEFTCTRL, true),
+            ChordEvent::None
+        );
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_SPACE, true),
+            ChordEvent::Press
+        );
 
-        assert_eq!(tracker.handle_key(KeyCode::KEY_SPACE, false), ChordEvent::Release);
-        assert_eq!(tracker.handle_key(KeyCode::KEY_LEFTCTRL, false), ChordEvent::None);
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_SPACE, false),
+            ChordEvent::Release
+        );
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_LEFTCTRL, false),
+            ChordEvent::None
+        );
     }
 
     #[test]
     fn test_compound_chord_modifier_released_first() {
         let mut tracker = KeyChordTracker::new(TargetChord::ctrl_space());
 
-        assert_eq!(tracker.handle_key(KeyCode::KEY_RIGHTCTRL, true), ChordEvent::None);
-        assert_eq!(tracker.handle_key(KeyCode::KEY_SPACE, true), ChordEvent::Press);
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_RIGHTCTRL, true),
+            ChordEvent::None
+        );
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_SPACE, true),
+            ChordEvent::Press
+        );
 
-        assert_eq!(tracker.handle_key(KeyCode::KEY_RIGHTCTRL, false), ChordEvent::Release);
-        assert_eq!(tracker.handle_key(KeyCode::KEY_SPACE, false), ChordEvent::None);
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_RIGHTCTRL, false),
+            ChordEvent::Release
+        );
+        assert_eq!(
+            tracker.handle_key(KeyCode::KEY_SPACE, false),
+            ChordEvent::None
+        );
     }
 
     #[test]
@@ -279,15 +370,100 @@ mod tests {
 
         assert_eq!(controller.state, DictationState::Idle);
 
-        let res = controller.handle_key_event(KeyCode::KEY_RIGHTALT, true).unwrap();
+        let res = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, true)
+            .unwrap();
         assert_eq!(res, None);
         assert_eq!(controller.state, DictationState::Recording);
 
-        let res = controller.handle_key_event(KeyCode::KEY_RIGHTALT, false).unwrap();
+        let res = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
+            .unwrap();
         assert_eq!(res, Some("Hello from Speechyyy".to_string()));
         assert_eq!(controller.state, DictationState::Emitting);
 
         controller.finish_emission();
+        assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_audio_dictation_engine_speech_detected() {
+        use crate::audio::capture::MockAudioCapture;
+        use crate::audio::AudioChunk;
+
+        // Valid speech chunk: 500ms at 16kHz with RMS 0.05
+        let speech_chunk = AudioChunk::new(vec![0.05; 8000]);
+        let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
+        let vad = EnergyVad::default();
+        let engine = AudioDictationEngine::new(capture, vad);
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        // Press hotkey
+        controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, true)
+            .unwrap();
+        assert_eq!(controller.state, DictationState::Recording);
+        assert!(controller.engine.capture.is_capturing());
+
+        // Release hotkey
+        let output = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
+            .unwrap();
+        assert_eq!(controller.state, DictationState::Emitting);
+        assert!(!controller.engine.capture.is_capturing());
+        assert!(output.is_some());
+        let text = output.unwrap();
+        assert!(text.starts_with("[Speech: 0.50s, 16kHz, RMS 0.050]"));
+
+        controller.finish_emission();
+        assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_audio_dictation_engine_silence_discarded() {
+        use crate::audio::capture::MockAudioCapture;
+        use crate::audio::AudioChunk;
+
+        // Silence chunk: 500ms at 16kHz with RMS 0.0001
+        let silence_chunk = AudioChunk::new(vec![0.0001; 8000]);
+        let capture = MockAudioCapture::with_queued_chunk(silence_chunk);
+        let vad = EnergyVad::default();
+        let engine = AudioDictationEngine::new(capture, vad);
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        // Press
+        controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, true)
+            .unwrap();
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // Release: silence should evaluate to None and state should return directly to Idle
+        let output = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
+            .unwrap();
+        assert_eq!(output, None);
+        assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_audio_dictation_engine_micro_tap_discarded() {
+        use crate::audio::capture::MockAudioCapture;
+        use crate::audio::AudioChunk;
+
+        // Micro-tap chunk: 50ms at 16kHz (800 samples < 3200 minimum)
+        let micro_tap_chunk = AudioChunk::new(vec![0.1; 800]);
+        let capture = MockAudioCapture::with_queued_chunk(micro_tap_chunk);
+        let vad = EnergyVad::default();
+        let engine = AudioDictationEngine::new(capture, vad);
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, true)
+            .unwrap();
+        let output = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
+            .unwrap();
+        assert_eq!(output, None);
         assert_eq!(controller.state, DictationState::Idle);
     }
 }

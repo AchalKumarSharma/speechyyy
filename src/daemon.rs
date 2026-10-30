@@ -1,6 +1,8 @@
+use crate::audio::capture::CpalAudioCapture;
+use crate::audio::vad::EnergyVad;
 use crate::config::Config;
 use crate::doctor::{run_doctor, RealSysEnv};
-use crate::engine::{DictationEngine, MockDictationEngine, StateMachineController};
+use crate::engine::{AudioDictationEngine, DictationEngine, StateMachineController};
 use crate::injector::{TextInjector, UinputInjector};
 use crate::input::{EvdevListener, InputEventSource};
 use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, PidFile, RuntimePaths};
@@ -28,7 +30,13 @@ where
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let state_str = controller.state.as_str();
-                let _ = IpcServer::handle_connection(&mut stream, running, state_str, hotkey, pacing_delay_ms);
+                let _ = IpcServer::handle_connection(
+                    &mut stream,
+                    running,
+                    state_str,
+                    hotkey,
+                    pacing_delay_ms,
+                );
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
@@ -57,12 +65,22 @@ where
 
 pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String> {
     if let Some(parent) = paths.pid_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create runtime directory {}: {}", parent.display(), e))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create runtime directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
     }
     if let Some(parent) = paths.socket_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create runtime directory {}: {}", parent.display(), e))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create runtime directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
     }
 
     // Pre-flight check
@@ -77,7 +95,10 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
     if !foreground {
         if let Some(pid) = PidFile::read_pid(&paths.pid_path) {
             if PidFile::is_process_running(pid) {
-                return Err(format!("Speechyyy daemon is already running with PID {}", pid));
+                return Err(format!(
+                    "Speechyyy daemon is already running with PID {}",
+                    pid
+                ));
             }
         }
 
@@ -99,7 +120,9 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
         let mut ready = false;
         while start.elapsed() < Duration::from_secs(2) {
             if paths.socket_path.exists() {
-                if let Ok(IpcResponse::Pong) = IpcClient::send_request(&paths.socket_path, &IpcRequest::Ping) {
+                if let Ok(IpcResponse::Pong) =
+                    IpcClient::send_request(&paths.socket_path, &IpcRequest::Ping)
+                {
                     ready = true;
                     break;
                 }
@@ -108,11 +131,17 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
         }
 
         if ready {
-            println!("Speechyyy daemon started successfully (PID: {}).", child_pid);
+            println!(
+                "Speechyyy daemon started successfully (PID: {}).",
+                child_pid
+            );
             Ok(())
         } else {
             if let Ok(Some(status)) = child.try_wait() {
-                Err(format!("Daemon process exited immediately with status: {}", status))
+                Err(format!(
+                    "Daemon process exited immediately with status: {}",
+                    status
+                ))
             } else {
                 let _ = child.kill();
                 Err("Daemon process timed out waiting for socket initialization".into())
@@ -126,7 +155,11 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
             Ok(l) => l,
             Err(e) => {
                 paths.cleanup();
-                return Err(format!("Failed to bind daemon socket at {}: {:?}", paths.socket_path.display(), e));
+                return Err(format!(
+                    "Failed to bind daemon socket at {}: {:?}",
+                    paths.socket_path.display(),
+                    e
+                ));
             }
         };
 
@@ -146,10 +179,24 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
         };
 
         let mut input_source = EvdevListener::new();
-        let engine = MockDictationEngine::new();
+        let capture = match CpalAudioCapture::new() {
+            Ok(c) => c,
+            Err(e) => {
+                paths.cleanup();
+                return Err(format!(
+                    "Failed to initialize audio capture: {}. Check 'speechyyy doctor'.",
+                    e
+                ));
+            }
+        };
+        let vad = EnergyVad::from_config(&config.audio);
+        let engine = AudioDictationEngine::new(capture, vad);
         let mut controller = StateMachineController::new(target_chord, engine);
 
-        println!("Speechyyy daemon running in foreground (PID: {}).", std::process::id());
+        println!(
+            "Speechyyy daemon running in foreground (PID: {}).",
+            std::process::id()
+        );
         println!("Push-to-Talk Hotkey: {:?}", config.hotkey);
         println!("Pacing Delay: {}ms", config.pacing_delay_ms);
 
@@ -178,7 +225,9 @@ pub fn stop_daemon(paths: &RuntimePaths) -> Result<(), String> {
     let existing_pid = PidFile::read_pid(&paths.pid_path);
 
     if paths.socket_path.exists() {
-        if let Ok(IpcResponse::Ok { message }) = IpcClient::send_request(&paths.socket_path, &IpcRequest::Stop) {
+        if let Ok(IpcResponse::Ok { message }) =
+            IpcClient::send_request(&paths.socket_path, &IpcRequest::Stop)
+        {
             println!("{}", message);
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(2) {
@@ -234,7 +283,10 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
                 return Ok(());
             }
             Ok(other) => {
-                println!("[WARN] Daemon returned unexpected status response: {:?}", other);
+                println!(
+                    "[WARN] Daemon returned unexpected status response: {:?}",
+                    other
+                );
                 return Ok(());
             }
             Err(_) => {}
@@ -243,7 +295,10 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
 
     if let Some(pid) = PidFile::read_pid(&paths.pid_path) {
         if PidFile::is_process_running(pid) {
-            println!("[ACTIVE] Daemon process found (PID: {}), but socket is unresponsive.", pid);
+            println!(
+                "[ACTIVE] Daemon process found (PID: {}), but socket is unresponsive.",
+                pid
+            );
             return Ok(());
         }
     }

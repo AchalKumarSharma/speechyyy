@@ -39,7 +39,8 @@ mod tests {
 
     #[test]
     fn test_parse_start_foreground() {
-        let cli = Cli::try_parse_from(["speechyyy", "start", "--foreground"]).expect("parse start foreground");
+        let cli = Cli::try_parse_from(["speechyyy", "start", "--foreground"])
+            .expect("parse start foreground");
         assert_eq!(cli.command, Command::Start { foreground: true });
     }
 
@@ -61,4 +62,3 @@ mod tests {
         assert_eq!(cli.command, Command::Doctor);
     }
 }
-

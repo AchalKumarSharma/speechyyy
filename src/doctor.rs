@@ -8,6 +8,7 @@ pub trait SysEnv {
     fn can_read_path(&self, path: &Path) -> bool;
     fn can_write_path(&self, path: &Path) -> bool;
     fn list_input_events(&self) -> Vec<PathBuf>;
+    fn check_audio_input(&self) -> Result<String, String>;
 }
 
 pub struct RealSysEnv;
@@ -34,7 +35,8 @@ impl SysEnv for RealSysEnv {
                     if let Ok(gid) = parts[2].parse::<u32>() {
                         gid_to_name.insert(gid, group_name.clone());
                     }
-                    let members: Vec<&str> = parts[3].split(',').filter(|s| !s.is_empty()).collect();
+                    let members: Vec<&str> =
+                        parts[3].split(',').filter(|s| !s.is_empty()).collect();
                     if members.contains(&username.as_str()) {
                         user_in_group_names.push(group_name);
                     }
@@ -88,6 +90,24 @@ impl SysEnv for RealSysEnv {
         events.sort();
         events
     }
+
+    fn check_audio_input(&self) -> Result<String, String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        let device = host.default_input_device().ok_or_else(|| {
+            "No default audio input device found (check PipeWire/ALSA)".to_string()
+        })?;
+
+        let name = device
+            .description()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|_| "Default Audio Device".to_string());
+        let _ = device
+            .default_input_config()
+            .map_err(|e| format!("Default input config error: {}", e))?;
+
+        Ok(name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +131,9 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn is_ready(&self) -> bool {
-        self.items.iter().all(|i| matches!(i.status, CheckStatus::Pass))
+        self.items
+            .iter()
+            .all(|i| matches!(i.status, CheckStatus::Pass))
     }
 }
 
@@ -123,7 +145,7 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
 
     // 1. Group membership checks (input and uinput)
     let has_input_group = groups.iter().any(|g| g == "input");
-    let has_uinput_group = groups.iter().any(|g| g == "uinput");
+    let _has_uinput_group = groups.iter().any(|g| g == "uinput");
 
     if has_input_group {
         items.push(DiagnosticItem {
@@ -137,17 +159,10 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
         });
     }
 
-    if has_uinput_group {
-        items.push(DiagnosticItem {
-            name: "User 'uinput' group membership".into(),
-            status: CheckStatus::Pass,
-        });
-    } else {
-        items.push(DiagnosticItem {
-            name: "User 'uinput' group membership".into(),
-            status: CheckStatus::Pass, // On many distros uinput is managed under input group via udev
-        });
-    }
+    items.push(DiagnosticItem {
+        name: "User 'uinput' group membership".into(),
+        status: CheckStatus::Pass, // On many distros uinput is managed under input group via udev
+    });
 
     if !has_input_group {
         fix_instructions.push(format!("sudo usermod -aG input,uinput {}", username));
@@ -193,14 +208,35 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
         fix_instructions.push("sudo cp /etc/udev/rules.d/99-speechyyy.rules (or generate below) && sudo udevadm control --reload-rules && sudo udevadm trigger".into());
     }
 
-    let udev_rule_content = r#"# Speechyyy uinput rule for unprivileged virtual keyboard caret injection
+    // 4. Microphone audio input device check
+    match env.check_audio_input() {
+        Ok(device_name) => {
+            items.push(DiagnosticItem {
+                name: format!("Microphone input device ({})", device_name),
+                status: CheckStatus::Pass,
+            });
+        }
+        Err(err) => {
+            items.push(DiagnosticItem {
+                name: "Microphone input device".into(),
+                status: CheckStatus::Fail(err),
+            });
+            fix_instructions.push(
+                "Verify microphone is connected and PipeWire/PulseAudio/ALSA is running (e.g. 'wpctl status' or 'pactl info').".into(),
+            );
+        }
+    }
+
+    let udev_rule_content =
+        r#"# Speechyyy uinput rule for unprivileged virtual keyboard caret injection
 KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
 "#
-    .trim_start()
-    .to_string();
+        .trim_start()
+        .to_string();
 
     if !has_input_group {
-        fix_instructions.push("Log out and log back in for new group permissions to take effect.".into());
+        fix_instructions
+            .push("Log out and log back in for new group permissions to take effect.".into());
     }
 
     DoctorReport {
@@ -241,6 +277,7 @@ mod tests {
         readable_paths: Vec<PathBuf>,
         writable_paths: Vec<PathBuf>,
         events: Vec<PathBuf>,
+        audio_input: Result<String, String>,
     }
 
     impl SysEnv for MockEnv {
@@ -259,6 +296,9 @@ mod tests {
         fn list_input_events(&self) -> Vec<PathBuf> {
             self.events.clone()
         }
+        fn check_audio_input(&self) -> Result<String, String> {
+            self.audio_input.clone()
+        }
     }
 
     #[test]
@@ -269,11 +309,16 @@ mod tests {
             readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
             events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("PipeWire Default Source".into()),
         };
 
         let report = run_doctor(&env);
         assert!(report.is_ready(), "Expected all checks to pass");
         assert!(report.fix_instructions.is_empty());
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name.contains("PipeWire Default Source")));
     }
 
     #[test]
@@ -284,12 +329,16 @@ mod tests {
             readable_paths: vec![],
             writable_paths: vec![],
             events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("Builtin Mic".into()),
         };
 
         let report = run_doctor(&env);
         assert!(!report.is_ready(), "Expected checks to fail");
         assert!(!report.fix_instructions.is_empty());
-        assert!(report.fix_instructions.iter().any(|cmd| cmd.contains("usermod -aG input")));
+        assert!(report
+            .fix_instructions
+            .iter()
+            .any(|cmd| cmd.contains("usermod -aG input")));
         assert!(report.udev_rule_content.contains("KERNEL==\"uinput\""));
     }
 
@@ -301,10 +350,38 @@ mod tests {
             readable_paths: vec![],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
             events: vec![],
+            audio_input: Ok("Builtin Mic".into()),
         };
 
         let report = run_doctor(&env);
         assert!(!report.is_ready());
-        assert!(report.items.iter().any(|i| i.name.contains("Linux evdev devices")));
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name.contains("Linux evdev devices")));
+    }
+
+    #[test]
+    fn test_doctor_no_audio_input_device() {
+        let env = MockEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Err("No default audio input device found".into()),
+        };
+
+        let report = run_doctor(&env);
+        assert!(!report.is_ready());
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name.contains("Microphone input device")
+                && matches!(i.status, CheckStatus::Fail(_))));
+        assert!(report
+            .fix_instructions
+            .iter()
+            .any(|cmd| cmd.contains("PipeWire")));
     }
 }

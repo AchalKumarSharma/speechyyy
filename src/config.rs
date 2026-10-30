@@ -12,12 +12,46 @@ fn default_pacing_ms() -> u64 {
     3
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+fn default_sample_rate() -> u32 {
+    16000
+}
+
+fn default_vad_threshold() -> f32 {
+    0.005
+}
+
+fn default_min_duration_ms() -> u64 {
+    200
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioConfig {
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: u32,
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    #[serde(default = "default_min_duration_ms")]
+    pub min_duration_ms: u64,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: default_sample_rate(),
+            vad_threshold: default_vad_threshold(),
+            min_duration_ms: default_min_duration_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
     #[serde(default = "default_pacing_ms")]
     pub pacing_delay_ms: u64,
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 impl Default for Config {
@@ -25,6 +59,7 @@ impl Default for Config {
         Self {
             hotkey: default_hotkey(),
             pacing_delay_ms: default_pacing_ms(),
+            audio: AudioConfig::default(),
         }
     }
 }
@@ -56,7 +91,7 @@ impl Config {
     }
 
     pub fn to_target_chord(&self) -> TargetChord {
-        parse_hotkey(&self.hotkey).unwrap_or_else(|| TargetChord::right_alt())
+        parse_hotkey(&self.hotkey).unwrap_or_else(TargetChord::right_alt)
     }
 }
 
@@ -131,10 +166,18 @@ mod tests {
         let toml_data = r#"
 hotkey = "Ctrl+Space"
 pacing_delay_ms = 5
+
+[audio]
+sample_rate = 16000
+vad_threshold = 0.008
+min_duration_ms = 300
 "#;
         let parsed: Config = toml::from_str(toml_data).unwrap();
         assert_eq!(parsed.hotkey, "Ctrl+Space");
         assert_eq!(parsed.pacing_delay_ms, 5);
         assert_eq!(parsed.to_target_chord(), TargetChord::ctrl_space());
+        assert_eq!(parsed.audio.sample_rate, 16000);
+        assert!((parsed.audio.vad_threshold - 0.008).abs() < 1e-6);
+        assert_eq!(parsed.audio.min_duration_ms, 300);
     }
 }

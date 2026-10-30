@@ -51,7 +51,15 @@ impl RuntimePaths {
         let dir = base.join("speechyyy");
         Self::with_dir(dir)
     }
+}
 
+impl Default for RuntimePaths {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RuntimePaths {
     pub fn with_dir(dir: PathBuf) -> Self {
         let socket_path = dir.join("speechyyy.sock");
         let pid_path = dir.join("speechyyy.pid");
@@ -80,11 +88,7 @@ impl PidFile {
     }
 
     pub fn read_pid(path: &Path) -> Option<u32> {
-        fs::read_to_string(path)
-            .ok()?
-            .trim()
-            .parse::<u32>()
-            .ok()
+        fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
     }
 
     pub fn acquire(path: &Path) -> Result<(), String> {
@@ -95,7 +99,10 @@ impl PidFile {
 
         if let Some(existing_pid) = Self::read_pid(path) {
             if Self::is_process_running(existing_pid) {
-                return Err(format!("Daemon is already running with PID {}", existing_pid));
+                return Err(format!(
+                    "Daemon is already running with PID {}",
+                    existing_pid
+                ));
             }
             let _ = fs::remove_file(path);
         }
@@ -114,8 +121,13 @@ pub struct IpcClient;
 
 impl IpcClient {
     pub fn send_request(socket_path: &Path, req: &IpcRequest) -> Result<IpcResponse, String> {
-        let mut stream = UnixStream::connect(socket_path)
-            .map_err(|e| format!("Failed to connect to daemon socket at {}: {}", socket_path.display(), e))?;
+        let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+            format!(
+                "Failed to connect to daemon socket at {}: {}",
+                socket_path.display(),
+                e
+            )
+        })?;
 
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -123,7 +135,9 @@ impl IpcClient {
 
         let mut payload = serde_json::to_string(req).map_err(|e| e.to_string())?;
         payload.push('\n');
-        stream.write_all(payload.as_bytes()).map_err(|e| e.to_string())?;
+        stream
+            .write_all(payload.as_bytes())
+            .map_err(|e| e.to_string())?;
         stream.flush().map_err(|e| e.to_string())?;
 
         let mut reader = BufReader::new(stream);
@@ -225,7 +239,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
 
-        IpcServer::handle_connection(&mut stream, &running, "Idle", "RightAlt", 3).expect("handle connection");
+        IpcServer::handle_connection(&mut stream, &running, "Idle", "RightAlt", 3)
+            .expect("handle connection");
         let resp = client_thread.join().unwrap();
         assert_eq!(resp, IpcResponse::Pong);
 
@@ -241,7 +256,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
 
-        IpcServer::handle_connection(&mut stream, &running, "Recording", "RightAlt", 3).expect("handle connection");
+        IpcServer::handle_connection(&mut stream, &running, "Recording", "RightAlt", 3)
+            .expect("handle connection");
         let resp = client_thread.join().unwrap();
         match resp {
             IpcResponse::Status {
@@ -264,7 +280,8 @@ mod tests {
 
     #[test]
     fn test_pid_file_lifecycle() {
-        let temp_dir = std::env::temp_dir().join(format!("speechyyy_pid_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("speechyyy_pid_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let pid_path = temp_dir.join("test.pid");
 

@@ -135,11 +135,17 @@ impl TextInjector for RecordingInjector {
                         thread::sleep(self.pacing_delay);
                     }
                 }
-                self.emitted_events.lock().unwrap().push(KeyStroke { key, is_down: true });
+                self.emitted_events
+                    .lock()
+                    .unwrap()
+                    .push(KeyStroke { key, is_down: true });
                 if !self.pacing_delay.is_zero() {
                     thread::sleep(self.pacing_delay);
                 }
-                self.emitted_events.lock().unwrap().push(KeyStroke { key, is_down: false });
+                self.emitted_events.lock().unwrap().push(KeyStroke {
+                    key,
+                    is_down: false,
+                });
                 if !self.pacing_delay.is_zero() {
                     thread::sleep(self.pacing_delay);
                 }
@@ -176,7 +182,12 @@ impl UinputInjector {
             .with_keys(&keys)
             .map_err(|e| format!("Failed to register keys: {}", e))?
             .build()
-            .map_err(|e| format!("Failed to create uinput virtual device (is /dev/uinput writable?): {}", e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to create uinput virtual device (is /dev/uinput writable?): {}",
+                    e
+                )
+            })?;
 
         Ok(Self {
             device,
@@ -241,27 +252,27 @@ mod tests {
         // 'i' -> i down, i up
         // '!' -> Shift down, 1 down, 1 up, Shift up
         assert_eq!(events[0].key, KeyCode::KEY_LEFTSHIFT);
-        assert_eq!(events[0].is_down, true);
+        assert!(events[0].is_down);
         assert_eq!(events[1].key, KeyCode::KEY_H);
-        assert_eq!(events[1].is_down, true);
+        assert!(events[1].is_down);
         assert_eq!(events[2].key, KeyCode::KEY_H);
-        assert_eq!(events[2].is_down, false);
+        assert!(!events[2].is_down);
         assert_eq!(events[3].key, KeyCode::KEY_LEFTSHIFT);
-        assert_eq!(events[3].is_down, false);
+        assert!(!events[3].is_down);
 
         assert_eq!(events[4].key, KeyCode::KEY_I);
-        assert_eq!(events[4].is_down, true);
+        assert!(events[4].is_down);
         assert_eq!(events[5].key, KeyCode::KEY_I);
-        assert_eq!(events[5].is_down, false);
+        assert!(!events[5].is_down);
 
         assert_eq!(events[6].key, KeyCode::KEY_LEFTSHIFT);
-        assert_eq!(events[6].is_down, true);
+        assert!(events[6].is_down);
         assert_eq!(events[7].key, KeyCode::KEY_1);
-        assert_eq!(events[7].is_down, true);
+        assert!(events[7].is_down);
         assert_eq!(events[8].key, KeyCode::KEY_1);
-        assert_eq!(events[8].is_down, false);
+        assert!(!events[8].is_down);
         assert_eq!(events[9].key, KeyCode::KEY_LEFTSHIFT);
-        assert_eq!(events[9].is_down, false);
+        assert!(!events[9].is_down);
     }
 
     #[test]
@@ -272,6 +283,10 @@ mod tests {
         injector.inject("ab").unwrap();
         let elapsed = start.elapsed();
         // 2 characters, each has down and up (4 transitions * 2ms = ~8ms minimum)
-        assert!(elapsed >= Duration::from_millis(7), "Expected pacing delay to be respected, got {:?}", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(7),
+            "Expected pacing delay to be respected, got {:?}",
+            elapsed
+        );
     }
 }

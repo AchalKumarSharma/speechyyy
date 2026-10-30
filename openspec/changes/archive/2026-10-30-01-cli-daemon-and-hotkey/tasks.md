@@ -10,3 +10,4 @@
 - [x] Configuration file loader for `~/.config/speechyyy/config.toml` (`src/config.rs`)
 - [x] End-to-end integration test suite verifying full push-to-talk loop (`tests/`)
 - [x] Release binary size verification (< 10MB target, reached 1.3MB stripped)
+

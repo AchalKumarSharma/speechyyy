@@ -26,6 +26,12 @@ impl FakeInputSource {
     }
 }
 
+impl Default for FakeInputSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InputEventSource for FakeInputSource {
     fn poll_event(&mut self, _timeout: Duration) -> Option<(KeyCode, bool)> {
         self.events.pop_front()
@@ -60,7 +66,15 @@ impl EvdevListener {
     pub fn new() -> Self {
         Self::with_dir(PathBuf::from("/dev/input"))
     }
+}
 
+impl Default for EvdevListener {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EvdevListener {
     pub fn with_dir(dir: PathBuf) -> Self {
         let mut listener = Self {
             input_dir: dir.clone(),
@@ -115,10 +129,14 @@ impl EvdevListener {
             if n > 0 {
                 let mut offset = 0;
                 while offset < n as usize {
-                    let event = unsafe { &*(buf.as_ptr().add(offset) as *const libc::inotify_event) };
+                    let event =
+                        unsafe { &*(buf.as_ptr().add(offset) as *const libc::inotify_event) };
                     let name_len = event.len as usize;
                     if name_len > 0 {
-                        let name_ptr = unsafe { buf.as_ptr().add(offset + std::mem::size_of::<libc::inotify_event>()) };
+                        let name_ptr = unsafe {
+                            buf.as_ptr()
+                                .add(offset + std::mem::size_of::<libc::inotify_event>())
+                        };
                         let name = unsafe { CStr::from_ptr(name_ptr as *const libc::c_char) }
                             .to_string_lossy();
                         if name.starts_with("event") {
@@ -178,7 +196,11 @@ impl InputEventSource for EvdevListener {
 
         let timeout_ms = timeout.as_millis() as libc::c_int;
         let poll_res = unsafe {
-            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms)
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
         };
 
         if poll_res <= 0 {
@@ -239,14 +261,21 @@ mod tests {
         source.push_event(KeyCode::KEY_RIGHTALT, true);
         source.push_event(KeyCode::KEY_RIGHTALT, false);
 
-        assert_eq!(source.poll_event(Duration::ZERO), Some((KeyCode::KEY_RIGHTALT, true)));
-        assert_eq!(source.poll_event(Duration::ZERO), Some((KeyCode::KEY_RIGHTALT, false)));
+        assert_eq!(
+            source.poll_event(Duration::ZERO),
+            Some((KeyCode::KEY_RIGHTALT, true))
+        );
+        assert_eq!(
+            source.poll_event(Duration::ZERO),
+            Some((KeyCode::KEY_RIGHTALT, false))
+        );
         assert_eq!(source.poll_event(Duration::ZERO), None);
     }
 
     #[test]
     fn test_evdev_listener_with_empty_temp_dir() {
-        let temp_dir = std::env::temp_dir().join(format!("speechyyy_evdev_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("speechyyy_evdev_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
 
         let mut listener = EvdevListener::with_dir(temp_dir.clone());

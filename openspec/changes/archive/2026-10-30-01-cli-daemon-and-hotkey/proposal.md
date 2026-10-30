@@ -12,3 +12,4 @@ Wayland compositors intentionally block unprivileged applications from intercept
 - Stateful `KeyChordTracker` supporting single keys (`RightAlt`) and compound chords (`Ctrl+Space`).
 - Persistent `/dev/uinput` virtual keyboard injector with a 3ms inter-keystroke pacing delay.
 - Decoupled four-state machine (`Idle -> Recording -> Processing -> Emitting`) driven by `DictationEngine`.
+
