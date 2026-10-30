@@ -129,7 +129,24 @@ impl SysEnv for RealSysEnv {
                 }
             }
             "mock" => Ok("Mock provider (mock)".into()),
-            "local" => Ok("Local offline runtime (stub)".into()),
+            "local" => {
+                let model_type = crate::model::LocalModelType::from_str_name(&config.inference.model)
+                    .unwrap_or(crate::model::LocalModelType::MoonshineTiny);
+                let model_dir = crate::model::ModelManager::model_dir(model_type);
+                match crate::model::ModelManager::verify_model_files(model_type, &model_dir) {
+                    Ok(info) => Ok(format!(
+                        "Local model: {} ({:.1} MB, {} files)",
+                        model_type.display_name(),
+                        info.total_mb(),
+                        info.file_count
+                    )),
+                    Err(err) => Err(format!(
+                        "Local model missing at {}: {}. Run 'speechyyy model download' to fetch weights.",
+                        model_dir.display(),
+                        err
+                    )),
+                }
+            }
             other => Err(format!(
                 "Unknown inference provider '{}'. Supported providers are 'mock', 'sarvam', 'local'.",
                 other
@@ -269,7 +286,7 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
                 status: CheckStatus::Fail(err),
             });
             fix_instructions.push(
-                "Export SARVAM_API_KEY (e.g. 'export SARVAM_API_KEY=your_key') or set api_key in ~/.config/speechyyy/config.toml".into(),
+                "Export SARVAM_API_KEY (e.g. 'export SARVAM_API_KEY=your_key') or run 'speechyyy model download' for offline local inference.".into(),
             );
         }
     }

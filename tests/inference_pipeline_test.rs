@@ -354,7 +354,8 @@ fn test_inference_pipeline_e2e_multiple_utterances() {
         .clone();
     assert_eq!(injected.len(), 2);
     assert_eq!(injected[0], "First utterance");
-    assert_eq!(injected[1], "Second utterance");
+    // Smart spacing prepends a space between consecutive word utterances
+    assert_eq!(injected[1], " Second utterance");
 
     let _ = IpcClient::send_request(&paths.socket_path, &IpcRequest::Stop);
     let _ = loop_thread.join().unwrap();

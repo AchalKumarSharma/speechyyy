@@ -1,6 +1,8 @@
 use crate::audio::vad::EnergyVad;
 use crate::audio::AudioCapture;
+use crate::history::HistoryLogger;
 use crate::inference::SpeechInference;
+use crate::text::TextPipeline;
 use evdev::KeyCode;
 use std::collections::HashSet;
 
@@ -197,6 +199,8 @@ pub struct AudioDictationEngine<C: AudioCapture, I: SpeechInference> {
     pub capture: C,
     pub vad: EnergyVad,
     pub inference: I,
+    pub pipeline: TextPipeline,
+    pub history: Option<HistoryLogger>,
 }
 
 impl<C: AudioCapture, I: SpeechInference> AudioDictationEngine<C, I> {
@@ -205,6 +209,24 @@ impl<C: AudioCapture, I: SpeechInference> AudioDictationEngine<C, I> {
             capture,
             vad,
             inference,
+            pipeline: TextPipeline::default(),
+            history: None,
+        }
+    }
+
+    pub fn with_pipeline_and_history(
+        capture: C,
+        vad: EnergyVad,
+        inference: I,
+        pipeline: TextPipeline,
+        history: Option<HistoryLogger>,
+    ) -> Self {
+        Self {
+            capture,
+            vad,
+            inference,
+            pipeline,
+            history,
         }
     }
 }
@@ -233,9 +255,25 @@ impl<C: AudioCapture, I: SpeechInference> DictationEngine for AudioDictationEngi
                         let trimmed = transcript.trim();
                         if trimmed.is_empty() {
                             eprintln!("Inference returned empty transcript");
-                            Ok(None)
-                        } else {
-                            Ok(Some(trimmed.to_string()))
+                            return Ok(None);
+                        }
+
+                        match self.pipeline.process(trimmed) {
+                            Some(final_text) => {
+                                if let Some(ref logger) = self.history {
+                                    let _ = logger.log(
+                                        trimmed,
+                                        &final_text,
+                                        self.inference.provider_name(),
+                                        metrics.duration_secs,
+                                    );
+                                }
+                                Ok(Some(final_text))
+                            }
+                            None => {
+                                eprintln!("Transcript cleaned to empty (hallucination discarded)");
+                                Ok(None)
+                            }
                         }
                     }
                     Err(e) => {
@@ -546,5 +584,77 @@ mod tests {
             .unwrap();
         assert_eq!(output, None);
         assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_audio_dictation_engine_hallucination_discarded() {
+        use crate::audio::capture::MockAudioCapture;
+        use crate::audio::AudioChunk;
+        use crate::inference::mock::MockSpeechInference;
+
+        let speech_chunk = AudioChunk::new(vec![0.05; 8000]);
+        let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
+        let vad = EnergyVad::default();
+        let inference = MockSpeechInference::with_transcript("[BLANK_AUDIO]");
+        let engine = AudioDictationEngine::new(capture, vad, inference);
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, true)
+            .unwrap();
+        let output = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
+            .unwrap();
+        assert_eq!(output, None);
+        assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_audio_dictation_engine_dictionary_and_history_logging() {
+        use crate::audio::capture::MockAudioCapture;
+        use crate::audio::AudioChunk;
+        use crate::inference::mock::MockSpeechInference;
+        use crate::text::{LearningDictionary, TextFormatter, TextPipeline};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("engine_hist_test_{}", std::process::id()));
+        let hist_path = temp_dir.join("history.jsonl");
+        let history = HistoryLogger::with_path(hist_path.clone());
+
+        let mut dict = LearningDictionary::new();
+        dict.add_rule("post gress", "PostgreSQL");
+
+        let pipeline = TextPipeline::new(TextFormatter::default(), dict);
+
+        let speech_chunk = AudioChunk::new(vec![0.05; 8000]);
+        let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
+        let vad = EnergyVad::default();
+        let inference = MockSpeechInference::with_transcript("i love post gress");
+
+        let engine = AudioDictationEngine::with_pipeline_and_history(
+            capture,
+            vad,
+            inference,
+            pipeline,
+            Some(history.clone()),
+        );
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, true)
+            .unwrap();
+        let output = controller
+            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
+            .unwrap();
+
+        assert_eq!(output, Some("I love PostgreSQL".to_string()));
+        assert_eq!(controller.state, DictationState::Emitting);
+
+        // Verify history log was appended
+        let last = history.get_last_entry().unwrap().unwrap();
+        assert_eq!(last.raw_text, "i love post gress");
+        assert_eq!(last.final_text, "I love PostgreSQL");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

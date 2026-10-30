@@ -1,3 +1,4 @@
+use crate::model::LocalModelType;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug, PartialEq, Eq)]
@@ -25,6 +26,39 @@ pub enum Command {
     Status,
     /// Inspect system permissions and input device accessibility
     Doctor,
+    /// Add or update a dynamic vocabulary replacement rule in dictionary.toml
+    Learn {
+        /// The incorrect phrase heard by the speech model
+        wrong: String,
+        /// The correct replacement text
+        correct: String,
+    },
+    /// Diff against the most recent utterance and save the correction rule
+    Fix {
+        /// The fully corrected phrase
+        corrected_phrase: String,
+    },
+    /// Inspect recent dictation history
+    History {
+        /// Number of recent records to display
+        #[arg(short, long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Manage local speech recognition models
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
+pub enum ModelAction {
+    /// Download pre-converted INT8 quantized ONNX model weights
+    Download {
+        /// Target model architecture ('moonshine-tiny' or 'whisper-tiny')
+        #[arg(short, long, default_value = "moonshine-tiny")]
+        model: LocalModelType,
+    },
 }
 
 #[cfg(test)]
@@ -60,5 +94,52 @@ mod tests {
     fn test_parse_doctor() {
         let cli = Cli::try_parse_from(["speechyyy", "doctor"]).expect("parse doctor");
         assert_eq!(cli.command, Command::Doctor);
+    }
+
+    #[test]
+    fn test_parse_learn() {
+        let cli = Cli::try_parse_from(["speechyyy", "learn", "post gress", "PostgreSQL"])
+            .expect("parse learn");
+        assert_eq!(
+            cli.command,
+            Command::Learn {
+                wrong: "post gress".into(),
+                correct: "PostgreSQL".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_fix() {
+        let cli =
+            Cli::try_parse_from(["speechyyy", "fix", "I love PostgreSQL"]).expect("parse fix");
+        assert_eq!(
+            cli.command,
+            Command::Fix {
+                corrected_phrase: "I love PostgreSQL".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_history() {
+        let cli =
+            Cli::try_parse_from(["speechyyy", "history", "--limit", "25"]).expect("parse history");
+        assert_eq!(cli.command, Command::History { limit: 25 });
+    }
+
+    #[test]
+    fn test_parse_model_download() {
+        let cli =
+            Cli::try_parse_from(["speechyyy", "model", "download", "--model", "whisper-tiny"])
+                .expect("parse model download");
+        assert_eq!(
+            cli.command,
+            Command::Model {
+                action: ModelAction::Download {
+                    model: LocalModelType::WhisperTiny,
+                }
+            }
+        );
     }
 }

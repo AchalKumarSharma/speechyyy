@@ -3,10 +3,12 @@ use crate::audio::vad::EnergyVad;
 use crate::config::Config;
 use crate::doctor::{run_doctor, RealSysEnv};
 use crate::engine::{AudioDictationEngine, DictationEngine, StateMachineController};
+use crate::history::HistoryLogger;
 use crate::inference::create_inference_provider;
 use crate::injector::{TextInjector, UinputInjector};
 use crate::input::{EvdevListener, InputEventSource};
 use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, PidFile, RuntimePaths};
+use crate::text::{LearningDictionary, TextFormatter, TextPipeline};
 use std::os::unix::net::UnixListener;
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -198,7 +200,11 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
                 return Err(format!("Failed to initialize speech inference: {}", e));
             }
         };
-        let engine = AudioDictationEngine::new(capture, vad, inference);
+        let pipeline = TextPipeline::new(TextFormatter::default(), LearningDictionary::load());
+        let history = Some(HistoryLogger::new());
+        let engine = AudioDictationEngine::with_pipeline_and_history(
+            capture, vad, inference, pipeline, history,
+        );
         let mut controller = StateMachineController::new(target_chord, engine);
 
         println!(

@@ -59,7 +59,14 @@ pub fn create_inference_provider(
                 config.mode.clone(),
             )))
         }
-        "local" => Ok(Box::new(local::LocalSpeechInference::new())),
+        "local" => {
+            let model_type = crate::model::LocalModelType::from_str_name(&config.model)
+                .unwrap_or(crate::model::LocalModelType::MoonshineTiny);
+            let model_dir = crate::model::ModelManager::model_dir(model_type);
+            Ok(Box::new(local::LocalSpeechInference::new(
+                model_type, model_dir,
+            )))
+        }
         other => Err(format!(
             "Unknown inference provider '{}'. Supported providers are: 'mock', 'sarvam', 'local'.",
             other

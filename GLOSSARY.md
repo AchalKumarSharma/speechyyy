@@ -59,3 +59,19 @@ _Avoid_: Speech backend, AI driver, STT adapter
 **WAV Container**:
 An in-memory 44-byte standard RIFF/WAVE header framing 16,000 Hz 16-bit signed PCM audio for HTTP multipart/form-data ingestion by cloud models.
 _Avoid_: Audio file wrapper, sound file, WAV payload
+
+**Learning Dictionary**:
+The user-customizable substitution table in `~/.config/speechyyy/dictionary.toml` performing case-insensitive, word-boundary replacements on recognized speech before typing.
+_Avoid_: Autocorrect, spellchecker, word map
+
+**Transcription History**:
+An append-only record of spoken utterances logged to `~/.local/share/speechyyy/history.jsonl` tracking timestamps, raw model output, finalized text, and audio duration.
+_Avoid_: Speech cache, audit log, dictation records
+
+**Smart Spacing**:
+The inter-utterance context evaluation that prepends a space before alphanumeric words when following a word while attaching punctuation directly to the previous character.
+_Avoid_: Space insertion, auto-space, typing pad
+
+**Local Model Manager**:
+The subsystem that manages INT8 quantized ONNX speech recognition weights (Moonshine-Tiny or Whisper-Tiny) stored in `~/.local/share/speechyyy/models/`.
+_Avoid_: Model store, AI loader, weight cache

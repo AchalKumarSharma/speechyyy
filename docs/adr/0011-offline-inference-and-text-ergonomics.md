@@ -1,0 +1,11 @@
+# Offline Local Inference, Dynamic Word Learning, and Text Ergonomics
+
+Speechyyy must support 100% offline, on-device speech dictation without relying on external network access or third-party cloud keys, while adapting to technical terminology and preventing typing collisions across rapid push-to-talk bursts. At the same time, the application must strictly adhere to its project constraints: binary size < 10 MB and idle RAM < 30 MB. We decided to decouple local model weights and companion libraries from the compiled binary by downloading pre-converted INT8 quantized ONNX weights (Moonshine-Tiny and Whisper-Tiny) into `~/.local/share/speechyyy/models/` on demand via `speechyyy model download`, isolate user vocabulary into `~/.config/speechyyy/dictionary.toml`, log utterances to `~/.local/share/speechyyy/history.jsonl`, and layer an ergonomics pipeline that cleans non-speech hallucinations (`[BLANK_AUDIO]`, `(music)`), applies case-insensitive word-boundary substitutions, and handles sentence casing and smart inter-utterance spacing.
+
+## Considered Options
+
+- **Static Linking of ONNX Runtime**: Rejected because linking static `onnxruntime.a` causes the stripped binary size to balloon to 25–45 MB, directly violating Speechyyy's < 10 MB binary size constraint. Downloading quantized weights into the XDG data directory preserves the 3.7 MB binary footprint.
+- **Unified config.toml for Dictionary Replacements**: Rejected because programmatic mutation via `speechyyy learn` and `speechyyy fix` could inadvertently overwrite comments, hotkey chords, or pacing settings in `config.toml`; storing rules in `dictionary.toml` provides clean separation of concerns.
+- **Heavy Regex Crates for Word Boundaries**: Rejected to avoid unnecessary dependency bloat, compilation latency, and catastrophic backtracking risks; a zero-dependency token and character boundary check provides deterministic microsecond-speed replacement without substring collisions.
+- **Always-Resident Heavy Model Memory**: Rejected because holding full neural weights and execution providers continuously in memory exceeds the < 30 MB idle RAM limit; model decoding structures are allocated on demand during active transcription and released during prolonged idle periods.
+
