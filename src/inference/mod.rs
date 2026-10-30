@@ -12,6 +12,7 @@ pub enum InferenceError {
     Http { status: u16, message: String },
     Serialization(String),
     NotConfigured(String),
+    LocalEngine(String),
 }
 
 impl std::fmt::Display for InferenceError {
@@ -22,6 +23,7 @@ impl std::fmt::Display for InferenceError {
             Self::Http { status, message } => write!(f, "HTTP error {}: {}", status, message),
             Self::Serialization(msg) => write!(f, "Serialization error: {}", msg),
             Self::NotConfigured(msg) => write!(f, "Inference provider not configured: {}", msg),
+            Self::LocalEngine(msg) => write!(f, "Local inference engine error: {}", msg),
         }
     }
 }

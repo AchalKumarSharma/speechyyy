@@ -64,16 +64,19 @@ fn test_local_dictation_pipeline_e2e_with_dictionary_and_history() {
         injector: raw_injector.clone(),
     };
 
-    // 1. Setup local mock model files
-    let model_dir = temp_dir.join("models").join("moonshine-tiny-en-int8");
-    fs::create_dir_all(&model_dir).unwrap();
-    for &file in LocalModelType::MoonshineTiny.required_files() {
-        fs::write(model_dir.join(file), b"FAKE_ONNX_DATA").unwrap();
+    // 1. Point to real Moonshine model assets
+    let model_dir = speechyyy::model::ModelManager::model_dir(LocalModelType::MoonshineTiny);
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping e2e local test: Moonshine model not found at {}",
+            model_dir.display()
+        );
+        return;
     }
 
     // 2. Setup dictionary and formatting pipeline
     let mut dict = LearningDictionary::new();
-    dict.add_rule("offline", "on-device");
+    dict.add_rule("yellow lamps", "golden lanterns");
 
     let formatter = TextFormatter::default();
     let pipeline = TextPipeline::new(formatter, dict);
@@ -82,8 +85,9 @@ fn test_local_dictation_pipeline_e2e_with_dictionary_and_history() {
     let hist_path = temp_dir.join("history.jsonl");
     let history = HistoryLogger::with_path(hist_path.clone());
 
-    // 4. Setup AudioDictationEngine with LocalSpeechInference
-    let speech_chunk = AudioChunk::new(vec![0.05; 8000]);
+    // 4. Setup AudioDictationEngine with LocalSpeechInference using real speech audio
+    let (samples, _) = sherpa_rs::read_audio_file("tests/test_data/0.wav").expect("read 0.wav");
+    let speech_chunk = AudioChunk::new(samples);
     let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
     let vad = EnergyVad::default();
     let inference = LocalSpeechInference::new(LocalModelType::MoonshineTiny, model_dir);
@@ -122,29 +126,43 @@ fn test_local_dictation_pipeline_e2e_with_dictionary_and_history() {
         .lock()
         .unwrap()
         .push_event(KeyCode::KEY_RIGHTALT, false);
-    std::thread::sleep(Duration::from_millis(50));
 
-    // Verify injected text:
-    // Raw: "Local offline speech recognition"
-    // Replaced: "Local on-device speech recognition"
-    let injected = raw_injector
-        .lock()
-        .unwrap()
-        .injected_strings
-        .lock()
-        .unwrap()
-        .clone();
-    assert_eq!(injected.len(), 1);
-    assert_eq!(injected[0], "Local on-device speech recognition");
-
-    // Verify history log was created
-    let last = history.get_last_entry().unwrap().unwrap();
-    assert_eq!(last.raw_text, "Local offline speech recognition");
-    assert_eq!(last.final_text, "Local on-device speech recognition");
-    assert_eq!(last.provider, "local");
+    // Wait for the background session loop to complete ONNX model initialization and inference
+    let mut injected = Vec::new();
+    for _ in 0..200 {
+        injected = raw_injector
+            .lock()
+            .unwrap()
+            .injected_strings
+            .lock()
+            .unwrap()
+            .clone();
+        if !injected.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let _ = IpcClient::send_request(&paths.socket_path, &IpcRequest::Stop);
     let _ = loop_thread.join().unwrap();
+
+    // Verify injected text:
+    // Raw: "...the yellow lamps would light up..."
+    // Replaced: "...the golden lanterns would light up..."
+    assert_eq!(injected.len(), 1);
+    let injected_text = &injected[0];
+    assert!(
+        injected_text.contains("golden lanterns"),
+        "Expected injected text to contain 'golden lanterns', got: {}",
+        injected_text
+    );
+
+    // Verify history log was created
+    let last = history.get_last_entry().unwrap().unwrap();
+    assert!(last.raw_text.contains("yellow lamps"));
+    assert!(last.final_text.contains("golden lanterns"));
+    assert_eq!(last.provider, "local");
+
     let _ = fs::remove_dir_all(temp_dir);
 }
 

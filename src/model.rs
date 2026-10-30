@@ -82,12 +82,21 @@ pub struct ModelManager;
 
 impl ModelManager {
     pub fn default_models_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("SPEECHYYY_MODELS_DIR") {
+            return PathBuf::from(dir);
+        }
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home)
+        let standard_dir = PathBuf::from(home)
             .join(".local")
             .join("share")
             .join("speechyyy")
-            .join("models")
+            .join("models");
+
+        if !standard_dir.exists() && Path::new("/tmp/speechyyy_models").exists() {
+            return PathBuf::from("/tmp/speechyyy_models");
+        }
+
+        standard_dir
     }
 
     pub fn model_dir(model_type: LocalModelType) -> PathBuf {
