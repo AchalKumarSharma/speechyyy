@@ -3,15 +3,18 @@ use crate::audio::ring_buffer::{AudioConsumer, AudioRingBuffer};
 use crate::audio::{AudioCapture, AudioChunk, AudioError};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-const DEFAULT_BUFFER_CAPACITY: usize = 480_000; // 10 seconds of 48kHz audio
+// 576,000 samples accommodates 6 seconds of 48kHz stereo or 12 seconds of 48kHz mono
+const DEFAULT_BUFFER_CAPACITY: usize = 576_000;
 
 pub struct CpalAudioCapture {
     consumer: AudioConsumer,
     stream: Option<Stream>,
     input_sample_rate: u32,
     channels: u16,
-    is_recording: bool,
+    is_recording: Arc<AtomicBool>,
 }
 
 impl CpalAudioCapture {
@@ -30,6 +33,8 @@ impl CpalAudioCapture {
         let channels = config.channels;
 
         let (mut producer, consumer) = AudioRingBuffer::new(DEFAULT_BUFFER_CAPACITY);
+        let is_recording = Arc::new(AtomicBool::new(false));
+        let is_recording_cb = Arc::clone(&is_recording);
 
         let err_fn = |err| {
             eprintln!("CPAL input stream error: {}", err);
@@ -39,6 +44,10 @@ impl CpalAudioCapture {
             SampleFormat::F32 => device.build_input_stream(
                 config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // Gating: Discard incoming audio immediately if not recording
+                    if !is_recording_cb.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let written = producer.push_slice(data);
                     if written < data.len() {
                         eprintln!(
@@ -53,6 +62,10 @@ impl CpalAudioCapture {
             SampleFormat::I16 => device.build_input_stream(
                 config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    // Gating: Discard incoming audio immediately if not recording
+                    if !is_recording_cb.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let mut buffer = [0.0f32; 512];
                     for chunk in data.chunks(512) {
                         for (i, &s) in chunk.iter().enumerate() {
@@ -76,41 +89,56 @@ impl CpalAudioCapture {
         }
         .map_err(|e| AudioError::Stream(e.to_string()))?;
 
+        // Ensure stream is paused when created while idle
+        let _ = stream.pause();
+
         Ok(Self {
             consumer,
             stream: Some(stream),
             input_sample_rate,
             channels,
-            is_recording: false,
+            is_recording,
         })
     }
 }
 
 impl AudioCapture for CpalAudioCapture {
     fn start_capture(&mut self) -> Result<(), AudioError> {
+        // 1. Drain/flush any stale residual samples from the ring buffer
         self.consumer.clear();
+
+        // 2. Enable callback sample ingestion
+        self.is_recording.store(true, Ordering::SeqCst);
+
+        // 3. Unpause hardware stream
         if let Some(stream) = &self.stream {
             stream
                 .play()
                 .map_err(|e| AudioError::Stream(e.to_string()))?;
         }
-        self.is_recording = true;
+
+        // 4. Clear once more right after play() to ensure no pre-trigger transients linger
+        self.consumer.clear();
         Ok(())
     }
 
     fn stop_capture(&mut self) -> Result<AudioChunk, AudioError> {
+        // 1. Immediately gate callback so new samples are dropped at the door
+        self.is_recording.store(false, Ordering::SeqCst);
+
+        // 2. Pause hardware stream
         if let Some(stream) = &self.stream {
             let _ = stream.pause();
         }
-        self.is_recording = false;
 
+        // 3. Drain all captured samples
         let raw_samples = self.consumer.drain_all();
         let chunk = process_raw_audio(&raw_samples, self.input_sample_rate, self.channels);
         Ok(chunk)
     }
 
     fn is_capturing(&self) -> bool {
-        self.is_recording
+        self.is_recording.load(Ordering::Relaxed)
     }
 }
 
@@ -212,5 +240,37 @@ mod tests {
                 | AudioError::Stream(_) => {}
             },
         }
+    }
+
+    #[test]
+    fn test_capture_gating_drops_idle_samples() {
+        let (mut producer, mut consumer) = AudioRingBuffer::new(1024);
+        let is_recording = Arc::new(AtomicBool::new(false));
+
+        let incoming_data = [0.5f32; 128];
+
+        // While idle, callback must drop incoming data immediately
+        if is_recording.load(Ordering::Relaxed) {
+            producer.push_slice(&incoming_data);
+        }
+        assert_eq!(consumer.occupied_len(), 0);
+
+        // Start recording
+        is_recording.store(true, Ordering::SeqCst);
+        if is_recording.load(Ordering::Relaxed) {
+            producer.push_slice(&incoming_data);
+        }
+        assert_eq!(consumer.occupied_len(), 128);
+
+        // Stop recording
+        is_recording.store(false, Ordering::SeqCst);
+        if is_recording.load(Ordering::Relaxed) {
+            producer.push_slice(&incoming_data);
+        }
+        assert_eq!(consumer.occupied_len(), 128);
+
+        // Flushing on press clears buffer
+        consumer.clear();
+        assert_eq!(consumer.occupied_len(), 0);
     }
 }

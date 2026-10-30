@@ -44,7 +44,7 @@ impl AudioConsumer {
 
     /// Discards all samples currently in the ring buffer.
     pub fn clear(&mut self) {
-        self.consumer.skip(self.consumer.occupied_len());
+        while self.consumer.try_pop().is_some() {}
     }
 
     /// Number of samples currently waiting in the ring buffer.
