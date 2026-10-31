@@ -6,8 +6,8 @@ use cpal::{SampleFormat, Stream, StreamConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-// 576,000 samples accommodates 6 seconds of 48kHz stereo or 12 seconds of 48kHz mono
-const DEFAULT_BUFFER_CAPACITY: usize = 576_000;
+// 2,880,000 samples accommodates 30 seconds of 48kHz stereo or 60 seconds of 48kHz mono (~11.5 MB RAM)
+const DEFAULT_BUFFER_CAPACITY: usize = 2_880_000;
 
 pub struct CpalAudioCapture {
     consumer: AudioConsumer,
@@ -40,6 +40,7 @@ impl CpalAudioCapture {
             eprintln!("CPAL input stream error: {}", err);
         };
 
+        let channels_usize = channels.max(1) as usize;
         let stream = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
                 config,
@@ -48,7 +49,7 @@ impl CpalAudioCapture {
                     if !is_recording_cb.load(Ordering::Relaxed) {
                         return;
                     }
-                    let written = producer.push_slice(data);
+                    let written = producer.push_frames(data, channels_usize);
                     if written < data.len() {
                         eprintln!(
                             "Audio ring buffer overflow: dropped {} samples",
@@ -67,11 +68,13 @@ impl CpalAudioCapture {
                         return;
                     }
                     let mut buffer = [0.0f32; 512];
-                    for chunk in data.chunks(512) {
+                    let step = (512 / channels_usize) * channels_usize;
+                    let step = if step == 0 { 512 } else { step };
+                    for chunk in data.chunks(step) {
                         for (i, &s) in chunk.iter().enumerate() {
                             buffer[i] = s as f32 / 32768.0;
                         }
-                        let written = producer.push_slice(&buffer[..chunk.len()]);
+                        let written = producer.push_frames(&buffer[..chunk.len()], channels_usize);
                         if written < chunk.len() {
                             eprintln!(
                                 "Audio ring buffer overflow: dropped {} samples",

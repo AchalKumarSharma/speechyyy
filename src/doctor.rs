@@ -10,6 +10,14 @@ pub trait SysEnv {
     fn list_input_events(&self) -> Vec<PathBuf>;
     fn check_audio_input(&self) -> Result<String, String>;
     fn check_inference(&self) -> Result<String, String>;
+
+    fn is_wayland(&self) -> bool {
+        false
+    }
+
+    fn has_command(&self, _cmd: &str) -> bool {
+        false
+    }
 }
 
 pub struct RealSysEnv;
@@ -153,6 +161,22 @@ impl SysEnv for RealSysEnv {
             )),
         }
     }
+
+    fn is_wayland(&self) -> bool {
+        std::env::var_os("WAYLAND_DISPLAY").is_some()
+    }
+
+    fn has_command(&self, cmd: &str) -> bool {
+        if let Ok(path) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let candidate = dir.join(cmd);
+                if candidate.is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,11 +262,20 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
         }
     }
 
-    // 3. /dev/uinput write access
+    // 3. /dev/uinput write access or Wayland clipboard fallback
     let uinput_path = Path::new("/dev/uinput");
     if env.can_write_path(uinput_path) {
         items.push(DiagnosticItem {
             name: "Virtual keyboard permissions (/dev/uinput)".into(),
+            status: CheckStatus::Pass,
+        });
+    } else if env.is_wayland() && env.has_command("wl-copy") {
+        items.push(DiagnosticItem {
+            name: "Virtual keyboard permissions (/dev/uinput)".into(),
+            status: CheckStatus::Pass,
+        });
+        items.push(DiagnosticItem {
+            name: "Wayland clipboard fallback (wl-copy)".into(),
             status: CheckStatus::Pass,
         });
     } else {
@@ -287,6 +320,26 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
             });
             fix_instructions.push(
                 "Export SARVAM_API_KEY (e.g. 'export SARVAM_API_KEY=your_key') or run 'speechyyy model download' for offline local inference.".into(),
+            );
+        }
+    }
+
+    // 6. Text injection pipeline verification
+    let config = crate::config::Config::load();
+    match crate::injector::create_injector(&config) {
+        Ok(inj) => {
+            items.push(DiagnosticItem {
+                name: format!("Text injector pipeline ({})", inj.name()),
+                status: CheckStatus::Pass,
+            });
+        }
+        Err(err) => {
+            items.push(DiagnosticItem {
+                name: "Text injector pipeline".into(),
+                status: CheckStatus::Fail(err),
+            });
+            fix_instructions.push(
+                "Ensure either /dev/uinput is writable or 'wl-copy' is installed for Wayland clipboard typing.".into(),
             );
         }
     }
@@ -505,5 +558,66 @@ mod tests {
             .iter()
             .any(|i| i.name.contains("Speech inference provider")
                 && matches!(i.status, CheckStatus::Fail(_))));
+    }
+
+    struct MockWaylandEnv {
+        user: String,
+        groups: Vec<String>,
+        readable_paths: Vec<PathBuf>,
+        events: Vec<PathBuf>,
+        audio_input: Result<String, String>,
+        inference_result: Result<String, String>,
+    }
+
+    impl SysEnv for MockWaylandEnv {
+        fn current_username(&self) -> String {
+            self.user.clone()
+        }
+        fn user_groups(&self) -> Vec<String> {
+            self.groups.clone()
+        }
+        fn can_read_path(&self, path: &Path) -> bool {
+            self.readable_paths.iter().any(|p| p == path)
+        }
+        fn can_write_path(&self, _path: &Path) -> bool {
+            false
+        }
+        fn list_input_events(&self) -> Vec<PathBuf> {
+            self.events.clone()
+        }
+        fn check_audio_input(&self) -> Result<String, String> {
+            self.audio_input.clone()
+        }
+        fn check_inference(&self) -> Result<String, String> {
+            self.inference_result.clone()
+        }
+        fn is_wayland(&self) -> bool {
+            true
+        }
+        fn has_command(&self, cmd: &str) -> bool {
+            cmd == "wl-copy"
+        }
+    }
+
+    #[test]
+    fn test_doctor_wayland_fallback_passes_when_uinput_unwritable() {
+        let env = MockWaylandEnv {
+            user: "alfred".into(),
+            groups: vec!["alfred".into(), "input".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("PipeWire Source".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
+        };
+
+        let report = run_doctor(&env);
+        assert!(
+            report.is_ready(),
+            "Wayland fallback should pass preflight even without /dev/uinput write access"
+        );
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name.contains("Wayland clipboard fallback")));
     }
 }

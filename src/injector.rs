@@ -6,8 +6,31 @@ use std::time::Duration;
 
 pub trait TextInjector: Send + Sync {
     fn inject(&mut self, text: &str) -> Result<(), String>;
+
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        self.inject(text)
+    }
+
+    fn name(&self) -> &'static str {
+        "TextInjector"
+    }
 }
 
+impl TextInjector for Box<dyn TextInjector> {
+    fn inject(&mut self, text: &str) -> Result<(), String> {
+        (**self).inject(text)
+    }
+
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        (**self).send_text(text)
+    }
+
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyStroke {
     pub key: KeyCode,
     pub is_down: bool,
@@ -15,6 +38,7 @@ pub struct KeyStroke {
 
 pub fn char_to_key(c: char) -> Option<(KeyCode, bool)> {
     match c {
+        // Lowercase
         'a' => Some((KeyCode::KEY_A, false)),
         'b' => Some((KeyCode::KEY_B, false)),
         'c' => Some((KeyCode::KEY_C, false)),
@@ -42,6 +66,7 @@ pub fn char_to_key(c: char) -> Option<(KeyCode, bool)> {
         'y' => Some((KeyCode::KEY_Y, false)),
         'z' => Some((KeyCode::KEY_Z, false)),
 
+        // Uppercase
         'A' => Some((KeyCode::KEY_A, true)),
         'B' => Some((KeyCode::KEY_B, true)),
         'C' => Some((KeyCode::KEY_C, true)),
@@ -69,6 +94,7 @@ pub fn char_to_key(c: char) -> Option<(KeyCode, bool)> {
         'Y' => Some((KeyCode::KEY_Y, true)),
         'Z' => Some((KeyCode::KEY_Z, true)),
 
+        // Digits
         '0' => Some((KeyCode::KEY_0, false)),
         '1' => Some((KeyCode::KEY_1, false)),
         '2' => Some((KeyCode::KEY_2, false)),
@@ -80,13 +106,36 @@ pub fn char_to_key(c: char) -> Option<(KeyCode, bool)> {
         '8' => Some((KeyCode::KEY_8, false)),
         '9' => Some((KeyCode::KEY_9, false)),
 
+        // Whitespace
         ' ' => Some((KeyCode::KEY_SPACE, false)),
         '\n' => Some((KeyCode::KEY_ENTER, false)),
         '\t' => Some((KeyCode::KEY_TAB, false)),
+
+        // Symbols and Punctuation (Full Printable ASCII)
         '.' => Some((KeyCode::KEY_DOT, false)),
+        '>' => Some((KeyCode::KEY_DOT, true)),
         ',' => Some((KeyCode::KEY_COMMA, false)),
+        '<' => Some((KeyCode::KEY_COMMA, true)),
         '-' => Some((KeyCode::KEY_MINUS, false)),
         '_' => Some((KeyCode::KEY_MINUS, true)),
+        '=' => Some((KeyCode::KEY_EQUAL, false)),
+        '+' => Some((KeyCode::KEY_EQUAL, true)),
+        ';' => Some((KeyCode::KEY_SEMICOLON, false)),
+        ':' => Some((KeyCode::KEY_SEMICOLON, true)),
+        '/' => Some((KeyCode::KEY_SLASH, false)),
+        '?' => Some((KeyCode::KEY_SLASH, true)),
+        '\'' => Some((KeyCode::KEY_APOSTROPHE, false)),
+        '"' => Some((KeyCode::KEY_APOSTROPHE, true)),
+        '[' => Some((KeyCode::KEY_LEFTBRACE, false)),
+        '{' => Some((KeyCode::KEY_LEFTBRACE, true)),
+        ']' => Some((KeyCode::KEY_RIGHTBRACE, false)),
+        '}' => Some((KeyCode::KEY_RIGHTBRACE, true)),
+        '\\' => Some((KeyCode::KEY_BACKSLASH, false)),
+        '|' => Some((KeyCode::KEY_BACKSLASH, true)),
+        '`' => Some((KeyCode::KEY_GRAVE, false)),
+        '~' => Some((KeyCode::KEY_GRAVE, true)),
+
+        // Shifted number row symbols
         '!' => Some((KeyCode::KEY_1, true)),
         '@' => Some((KeyCode::KEY_2, true)),
         '#' => Some((KeyCode::KEY_3, true)),
@@ -97,10 +146,7 @@ pub fn char_to_key(c: char) -> Option<(KeyCode, bool)> {
         '*' => Some((KeyCode::KEY_8, true)),
         '(' => Some((KeyCode::KEY_9, true)),
         ')' => Some((KeyCode::KEY_0, true)),
-        ':' => Some((KeyCode::KEY_SEMICOLON, true)),
-        ';' => Some((KeyCode::KEY_SEMICOLON, false)),
-        '/' => Some((KeyCode::KEY_SLASH, false)),
-        '?' => Some((KeyCode::KEY_SLASH, true)),
+
         _ => None,
     }
 }
@@ -109,14 +155,20 @@ pub struct RecordingInjector {
     pub injected_strings: Arc<Mutex<Vec<String>>>,
     pub emitted_events: Arc<Mutex<Vec<KeyStroke>>>,
     pub pacing_delay: Duration,
+    pub settle_modifiers: bool,
 }
 
 impl RecordingInjector {
     pub fn new(pacing_delay: Duration) -> Self {
+        Self::with_settle(pacing_delay, false)
+    }
+
+    pub fn with_settle(pacing_delay: Duration, settle_modifiers: bool) -> Self {
         Self {
             injected_strings: Arc::new(Mutex::new(Vec::new())),
             emitted_events: Arc::new(Mutex::new(Vec::new())),
             pacing_delay,
+            settle_modifiers,
         }
     }
 }
@@ -124,6 +176,18 @@ impl RecordingInjector {
 impl TextInjector for RecordingInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
         self.injected_strings.lock().unwrap().push(text.to_string());
+
+        if self.settle_modifiers {
+            self.emitted_events.lock().unwrap().push(KeyStroke {
+                key: KeyCode::KEY_RIGHTALT,
+                is_down: false,
+            });
+            self.emitted_events.lock().unwrap().push(KeyStroke {
+                key: KeyCode::KEY_LEFTALT,
+                is_down: false,
+            });
+        }
+
         for c in text.chars() {
             if let Some((key, needs_shift)) = char_to_key(c) {
                 if needs_shift {
@@ -162,6 +226,53 @@ impl TextInjector for RecordingInjector {
         }
         Ok(())
     }
+
+    fn name(&self) -> &'static str {
+        "RecordingInjector"
+    }
+}
+
+pub fn create_virtual_device() -> Result<VirtualDevice, String> {
+    let mut keys = AttributeSet::<KeyCode>::new();
+    for code in 1..=255 {
+        keys.insert(KeyCode(code));
+    }
+
+    VirtualDevice::builder()
+        .map_err(|e| format!("Failed to create uinput builder: {}", e))?
+        .name("Speechyyy Virtual Keyboard")
+        .with_keys(&keys)
+        .map_err(|e| format!("Failed to register keys: {}", e))?
+        .build()
+        .map_err(|e| {
+            format!(
+                "Failed to create uinput virtual device (is /dev/uinput writable?): {}",
+                e
+            )
+        })
+}
+
+pub fn emit_defuse_and_paste<F, S>(mut emit_batch: F, mut sleep_fn: S) -> Result<(), String>
+where
+    F: FnMut(&[InputEvent]) -> Result<(), String>,
+    S: FnMut(Duration),
+{
+    // Synthesize paste chord: KEY_LEFTCTRL down -> KEY_V down -> SYN_REPORT -> 20ms sleep -> KEY_V up -> KEY_LEFTCTRL up -> SYN_REPORT
+    let ctrl_v_down = [
+        InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.0, 1),
+        InputEvent::new(EventType::KEY.0, KeyCode::KEY_V.0, 1),
+    ];
+    emit_batch(&ctrl_v_down)?;
+
+    sleep_fn(WaylandClipboardInjector::PASTE_HOLD_DELAY);
+
+    let ctrl_v_up = [
+        InputEvent::new(EventType::KEY.0, KeyCode::KEY_V.0, 0),
+        InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTCTRL.0, 0),
+    ];
+    emit_batch(&ctrl_v_up)?;
+
+    Ok(())
 }
 
 pub struct UinputInjector {
@@ -170,29 +281,44 @@ pub struct UinputInjector {
 }
 
 impl UinputInjector {
+    pub const MODIFIER_SETTLE_DELAY: Duration = Duration::from_millis(50);
+
     pub fn new(pacing_delay: Duration) -> Result<Self, String> {
-        let mut keys = AttributeSet::<KeyCode>::new();
-        for code in 1..=255 {
-            keys.insert(KeyCode(code));
-        }
-
-        let device = VirtualDevice::builder()
-            .map_err(|e| format!("Failed to create uinput builder: {}", e))?
-            .name("Speechyyy Virtual Keyboard")
-            .with_keys(&keys)
-            .map_err(|e| format!("Failed to register keys: {}", e))?
-            .build()
-            .map_err(|e| {
-                format!(
-                    "Failed to create uinput virtual device (is /dev/uinput writable?): {}",
-                    e
-                )
-            })?;
-
+        let device = create_virtual_device()?;
         Ok(Self {
             device,
             pacing_delay,
         })
+    }
+
+    pub fn settle_modifiers(&mut self) -> Result<(), String> {
+        // 1. Explicit release for hotkey RightAlt with SYN_REPORT
+        let right_alt_ev = InputEvent::new(EventType::KEY.0, KeyCode::KEY_RIGHTALT.0, 0);
+        self.device
+            .emit(&[right_alt_ev])
+            .map_err(|e| format!("Failed to emit RightAlt settle: {}", e))?;
+
+        // 2. Release other potential modifiers with SYN_REPORT
+        let other_modifiers = [
+            KeyCode::KEY_LEFTALT,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTCTRL,
+            KeyCode::KEY_LEFTSHIFT,
+            KeyCode::KEY_RIGHTSHIFT,
+            KeyCode::KEY_LEFTMETA,
+            KeyCode::KEY_RIGHTMETA,
+        ];
+        let events: Vec<InputEvent> = other_modifiers
+            .iter()
+            .map(|k| InputEvent::new(EventType::KEY.0, k.0, 0))
+            .collect();
+        self.device
+            .emit(&events)
+            .map_err(|e| format!("Failed to emit modifier settle: {}", e))?;
+
+        // 3. 50ms settle delay for compositor seat modifier reset
+        thread::sleep(Self::MODIFIER_SETTLE_DELAY);
+        Ok(())
     }
 
     fn emit_key(&mut self, key: KeyCode, is_down: bool) -> Result<(), String> {
@@ -211,6 +337,8 @@ impl UinputInjector {
 
 impl TextInjector for UinputInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
+        self.settle_modifiers()?;
+
         for c in text.chars() {
             if let Some((key, needs_shift)) = char_to_key(c) {
                 if needs_shift {
@@ -225,6 +353,142 @@ impl TextInjector for UinputInjector {
         }
         Ok(())
     }
+
+    fn name(&self) -> &'static str {
+        "uinput virtual keyboard"
+    }
+}
+
+pub struct WaylandClipboardInjector {
+    device: Option<VirtualDevice>,
+    settle_delay: Duration,
+}
+
+impl WaylandClipboardInjector {
+    pub const SETTLE_DELAY: Duration = Duration::from_millis(80);
+    pub const PASTE_HOLD_DELAY: Duration = Duration::from_millis(20);
+
+    pub fn new(_pacing_delay: Duration) -> Self {
+        let device = create_virtual_device().ok();
+        Self {
+            device,
+            settle_delay: Self::SETTLE_DELAY,
+        }
+    }
+
+    pub fn with_device(device: Option<VirtualDevice>, settle_delay: Duration) -> Self {
+        Self {
+            device,
+            settle_delay,
+        }
+    }
+
+    pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+        let mut child = std::process::Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn wl-copy: {}", e))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("Failed to write to wl-copy stdin: {}", e))?;
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed to wait for wl-copy: {}", e))?;
+        if !status.success() {
+            return Err(format!("wl-copy exited with error status: {}", status));
+        }
+        Ok(())
+    }
+
+    pub fn trigger_uinput_paste(device: &mut VirtualDevice) -> Result<(), String> {
+        emit_defuse_and_paste(
+            |batch| {
+                device
+                    .emit(batch)
+                    .map_err(|e| format!("Failed to emit paste event batch: {}", e))
+            },
+            thread::sleep,
+        )
+    }
+
+    pub fn fallback_wtype_paste() -> Result<(), String> {
+        // Synthetic Ctrl+V paste via wtype
+        let status = std::process::Command::new("wtype")
+            .args(["-M", "ctrl", "-k", "v", "-m", "ctrl"])
+            .status()
+            .map_err(|e| format!("Failed to run wtype paste shortcut: {}", e))?;
+
+        if !status.success() {
+            return Err(format!("wtype exited with status: {}", status));
+        }
+        Ok(())
+    }
+}
+
+impl TextInjector for WaylandClipboardInjector {
+    fn inject(&mut self, text: &str) -> Result<(), String> {
+        Self::copy_to_clipboard(text)?;
+        thread::sleep(self.settle_delay);
+
+        if self.device.is_none() {
+            self.device = create_virtual_device().ok();
+        }
+
+        if let Some(ref mut device) = self.device {
+            Self::trigger_uinput_paste(device)?;
+        } else if let Err(e) = Self::fallback_wtype_paste() {
+            eprintln!(
+                "Wayland paste warning: could not emit uinput paste chord and wtype failed: {}. Transcript is in clipboard.",
+                e
+            );
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "Wayland clipboard (wl-copy + uinput paste)"
+    }
+}
+
+pub fn create_injector(config: &crate::config::Config) -> Result<Box<dyn TextInjector>, String> {
+    let pacing = Duration::from_millis(config.pacing_delay_ms);
+    let method = config.injector.method.to_lowercase();
+
+    match method.as_str() {
+        "clipboard" | "wayland" => Ok(Box::new(WaylandClipboardInjector::new(pacing))),
+        "uinput" => {
+            let inj = UinputInjector::new(pacing)?;
+            Ok(Box::new(inj))
+        }
+        "auto" => {
+            let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+            if is_wayland {
+                Ok(Box::new(WaylandClipboardInjector::new(pacing)))
+            } else {
+                match UinputInjector::new(pacing) {
+                    Ok(inj) => Ok(Box::new(inj)),
+                    Err(e) => {
+                        eprintln!(
+                            "UinputInjector initialization failed ({}); falling back to Wayland clipboard injector",
+                            e
+                        );
+                        Ok(Box::new(WaylandClipboardInjector::new(pacing)))
+                    }
+                }
+            }
+        }
+        other => Err(format!(
+            "Unknown injector method '{}'. Supported: 'auto', 'uinput', 'clipboard'.",
+            other
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +501,8 @@ mod tests {
         assert_eq!(char_to_key('H'), Some((KeyCode::KEY_H, true)));
         assert_eq!(char_to_key(' '), Some((KeyCode::KEY_SPACE, false)));
         assert_eq!(char_to_key('!'), Some((KeyCode::KEY_1, true)));
+        assert_eq!(char_to_key('"'), Some((KeyCode::KEY_APOSTROPHE, true)));
+        assert_eq!(char_to_key('['), Some((KeyCode::KEY_LEFTBRACE, false)));
     }
 
     #[test]

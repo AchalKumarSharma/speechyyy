@@ -30,6 +30,28 @@ impl AudioProducer {
     pub fn push_slice(&mut self, samples: &[f32]) -> usize {
         self.producer.push_slice(samples)
     }
+
+    /// Push audio samples strictly aligned to full audio frames (`channels` samples per frame).
+    /// Prevents channel interleaving desynchronization during buffer overflows.
+    pub fn push_frames(&mut self, samples: &[f32], channels: usize) -> usize {
+        if channels == 0 || samples.is_empty() {
+            return 0;
+        }
+        let vacant = self.producer.vacant_len();
+        let max_frames = vacant / channels;
+        let requested_frames = samples.len() / channels;
+        let frames_to_push = requested_frames.min(max_frames);
+        let samples_to_push = frames_to_push * channels;
+        if samples_to_push == 0 {
+            return 0;
+        }
+        self.producer.push_slice(&samples[..samples_to_push])
+    }
+
+    /// Number of sample slots currently free in the ring buffer.
+    pub fn vacant_len(&self) -> usize {
+        self.producer.vacant_len()
+    }
 }
 
 impl AudioConsumer {
@@ -90,6 +112,22 @@ mod tests {
         let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let written = prod.push_slice(&input);
         // Capacity is 4, so at most 4 samples can be pushed
+        assert_eq!(written, 4);
+
+        let drained = cons.drain_all();
+        assert_eq!(drained, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_push_frames_maintains_channel_alignment() {
+        // Buffer capacity of 5 samples (can fit at most two 2-channel stereo frames = 4 samples)
+        let (mut prod, mut cons) = AudioRingBuffer::new(5);
+        assert_eq!(prod.vacant_len(), 5);
+
+        // 3 stereo frames = 6 samples [L0, R0, L1, R1, L2, R2]
+        let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let written = prod.push_frames(&input, 2);
+        // Even though capacity is 5, it must ONLY write 4 samples (2 complete frames)
         assert_eq!(written, 4);
 
         let drained = cons.drain_all();

@@ -9,7 +9,25 @@ fn default_hotkey() -> String {
 }
 
 fn default_pacing_ms() -> u64 {
-    3
+    10
+}
+
+fn default_injector_method() -> String {
+    "auto".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InjectorConfig {
+    #[serde(default = "default_injector_method")]
+    pub method: String,
+}
+
+impl Default for InjectorConfig {
+    fn default() -> Self {
+        Self {
+            method: default_injector_method(),
+        }
+    }
 }
 
 fn default_sample_rate() -> u32 {
@@ -108,6 +126,8 @@ pub struct Config {
     pub audio: AudioConfig,
     #[serde(default)]
     pub inference: InferenceConfig,
+    #[serde(default)]
+    pub injector: InjectorConfig,
 }
 
 impl Default for Config {
@@ -117,6 +137,7 @@ impl Default for Config {
             pacing_delay_ms: default_pacing_ms(),
             audio: AudioConfig::default(),
             inference: InferenceConfig::default(),
+            injector: InjectorConfig::default(),
         }
     }
 }
@@ -217,7 +238,8 @@ mod tests {
     fn test_config_defaults_and_parsing() {
         let default_cfg = Config::default();
         assert_eq!(default_cfg.hotkey, "RightAlt");
-        assert_eq!(default_cfg.pacing_delay_ms, 3);
+        assert_eq!(default_cfg.pacing_delay_ms, 10);
+        assert_eq!(default_cfg.injector.method, "auto");
         assert_eq!(default_cfg.to_target_chord(), TargetChord::right_alt());
 
         let toml_data = r#"

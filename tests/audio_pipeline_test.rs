@@ -1,14 +1,19 @@
 use evdev::KeyCode;
 use speechyyy::audio::capture::MockAudioCapture;
+use speechyyy::audio::resample::process_raw_audio;
 use speechyyy::audio::vad::EnergyVad;
 use speechyyy::audio::AudioChunk;
 use speechyyy::daemon::run_session_loop;
 use speechyyy::engine::{AudioDictationEngine, StateMachineController, TargetChord};
+use speechyyy::inference::local::LocalSpeechInference;
 use speechyyy::inference::mock::MockSpeechInference;
+use speechyyy::inference::SpeechInference;
 use speechyyy::injector::{RecordingInjector, TextInjector};
 use speechyyy::input::{FakeInputSource, InputEventSource};
 use speechyyy::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, RuntimePaths};
+use speechyyy::model::{LocalModelType, ModelManager};
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -258,4 +263,60 @@ fn test_audio_pipeline_e2e_micro_tap_rejected() {
     let _ = IpcClient::send_request(&paths.socket_path, &IpcRequest::Stop);
     let _ = loop_thread.join().unwrap();
     let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn test_audio_pipeline_differential_mic_and_dc_offset_repro() {
+    let model_dir = ModelManager::model_dir(LocalModelType::MoonshineTiny);
+    let wav_path = Path::new("tests/test_data/0.wav");
+    if !model_dir.exists() || !wav_path.exists() {
+        eprintln!("Skipping repro test: model or test wav not found");
+        return;
+    }
+
+    let (speech_samples, _) = sherpa_rs::read_audio_file(wav_path.to_str().unwrap()).unwrap();
+
+    // 1. Symptom B: Constant DC offset (e.g. 0.2023) without speech must be rejected as silence by VAD
+    let pure_dc_raw = vec![0.2023f32; 48000 * 2]; // 1 second of stereo DC 0.2023 at 48kHz
+    let processed_dc = process_raw_audio(&pure_dc_raw, 48000, 2);
+    let vad = EnergyVad::default();
+    assert_eq!(
+        vad.evaluate(&processed_dc),
+        None,
+        "Expected pure DC offset to be rejected by VAD after DC removal, but it was detected as speech"
+    );
+
+    // 2. Symptom A: Real speech on differential mic (stereo with phase inversion L = s, R = -s + DC bias 0.2023)
+    // Interleaved stereo samples: [L0, R0, L1, R1, ...]
+    let mut raw_stereo = Vec::with_capacity(speech_samples.len() * 2);
+    for &s in &speech_samples {
+        raw_stereo.push(s + 0.2023);
+        raw_stereo.push(-s + 0.2023);
+    }
+
+    // Process raw 16kHz stereo audio through audio pipeline
+    let processed_chunk = process_raw_audio(&raw_stereo, 16000, 2);
+
+    // VAD must detect speech
+    let metrics = vad
+        .evaluate(&processed_chunk)
+        .expect("VAD must detect speech in differential mic audio");
+    assert!(metrics.rms > 0.01);
+
+    // Decoder must transcribe valid speech rather than returning an empty string
+    let mut local = LocalSpeechInference::new(LocalModelType::MoonshineTiny, model_dir);
+    let transcript = local
+        .transcribe(&processed_chunk)
+        .expect("Transcription must succeed");
+
+    assert!(
+        !transcript.trim().is_empty(),
+        "Decoder yielded an empty string on differential mic audio"
+    );
+    let lower = transcript.to_lowercase();
+    assert!(
+        lower.contains("yellow lamps"),
+        "Expected transcript to contain 'yellow lamps', got: {}",
+        transcript
+    );
 }

@@ -5,7 +5,7 @@ use crate::doctor::{run_doctor, RealSysEnv};
 use crate::engine::{AudioDictationEngine, DictationEngine, StateMachineController};
 use crate::history::HistoryLogger;
 use crate::inference::create_inference_provider;
-use crate::injector::{TextInjector, UinputInjector};
+use crate::injector::{create_injector, TextInjector};
 use crate::input::{EvdevListener, InputEventSource};
 use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, PidFile, RuntimePaths};
 use crate::text::{LearningDictionary, TextFormatter, TextPipeline};
@@ -171,13 +171,12 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
 
         let config = Config::load();
         let target_chord = config.to_target_chord();
-        let pacing = Duration::from_millis(config.pacing_delay_ms);
 
-        let mut injector = match UinputInjector::new(pacing) {
+        let mut injector = match create_injector(&config) {
             Ok(inj) => inj,
             Err(e) => {
                 paths.cleanup();
-                return Err(e);
+                return Err(format!("Failed to initialize text injector: {}", e));
             }
         };
 
@@ -213,6 +212,7 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
         );
         println!("Push-to-Talk Hotkey: {:?}", config.hotkey);
         println!("Pacing Delay: {}ms", config.pacing_delay_ms);
+        println!("Text Injector: {}", injector.name());
         println!("Inference Provider: {}", config.inference.provider);
         if config.inference.provider.to_lowercase() == "sarvam" {
             println!("Sarvam Model: {}", config.inference.model);
