@@ -8,6 +8,9 @@ use crate::audio::AudioChunk;
 #[derive(Debug, Clone, PartialEq)]
 pub enum InferenceError {
     MissingApiKey(String),
+    Authentication(String),
+    RateLimited(String),
+    Timeout(String),
     Network(String),
     Http { status: u16, message: String },
     Serialization(String),
@@ -19,6 +22,9 @@ impl std::fmt::Display for InferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingApiKey(msg) => write!(f, "Missing API key: {}", msg),
+            Self::Authentication(msg) => write!(f, "Authentication error: {}", msg),
+            Self::RateLimited(msg) => write!(f, "Rate limit exceeded: {}", msg),
+            Self::Timeout(msg) => write!(f, "Inference timeout: {}", msg),
             Self::Network(msg) => write!(f, "Network error: {}", msg),
             Self::Http { status, message } => write!(f, "HTTP error {}: {}", status, message),
             Self::Serialization(msg) => write!(f, "Serialization error: {}", msg),

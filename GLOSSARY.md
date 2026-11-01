@@ -75,3 +75,16 @@ _Avoid_: Space insertion, auto-space, typing pad
 **Local Model Manager**:
 The subsystem that manages INT8 quantized ONNX speech recognition weights (Moonshine-Tiny or Whisper-Tiny) stored in `~/.local/share/speechyyy/models/`.
 _Avoid_: Model store, AI loader, weight cache
+
+**Transliteration Mode**:
+Spoken Indic and bilingual speech (e.g. Hinglish) converted into phonetically faithful Romanized English script (e.g. speaking *"mera phone number hai"* and transcribing *"mera phone number hai"*), powered by Sarvam Saaras v4 `mode="translit"`.
+_Avoid_: Romanizer, phonetic converter, Hinglish mode
+
+**Typewriter Mode**:
+Sequential character-by-character caret injection pacing evdev key events with virtual Shift keychords and configurable inter-key delays (default 15ms) to produce a natural, human-like typewriter visual effect.
+_Avoid_: Slow typing, key streamer, character typer
+
+**In-Memory WAV**:
+Purely in-RAM serialization of phase-corrected, normalized 16kHz mono f32 PCM audio slices into a 44-byte RIFF/WAVE container without creating temporary files or performing disk I/O.
+_Avoid_: Temp audio file, disk WAV, ramdisk audio
+

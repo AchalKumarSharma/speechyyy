@@ -9,23 +9,30 @@ fn default_hotkey() -> String {
 }
 
 fn default_pacing_ms() -> u64 {
-    10
+    15
 }
 
 fn default_injector_method() -> String {
-    "auto".to_string()
+    "typewriter".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InjectorConfig {
-    #[serde(default = "default_injector_method")]
+    #[serde(
+        default = "default_injector_method",
+        alias = "injection_mode",
+        alias = "mode"
+    )]
     pub method: String,
+    #[serde(default = "default_pacing_ms", alias = "typing_delay_ms")]
+    pub pacing_delay_ms: u64,
 }
 
 impl Default for InjectorConfig {
     fn default() -> Self {
         Self {
             method: default_injector_method(),
+            pacing_delay_ms: default_pacing_ms(),
         }
     }
 }
@@ -43,7 +50,7 @@ fn default_min_duration_ms() -> u64 {
 }
 
 fn default_provider() -> String {
-    "mock".to_string()
+    "local".to_string()
 }
 
 fn default_model() -> String {
@@ -55,20 +62,20 @@ fn default_language_code() -> String {
 }
 
 fn default_mode() -> String {
-    "transcribe".to_string()
+    "translit".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferenceConfig {
     #[serde(default = "default_provider")]
     pub provider: String,
-    #[serde(default)]
+    #[serde(default, alias = "sarvam_api_key")]
     pub api_key: String,
-    #[serde(default = "default_model")]
+    #[serde(default = "default_model", alias = "sarvam_model")]
     pub model: String,
     #[serde(default = "default_language_code")]
     pub language_code: String,
-    #[serde(default = "default_mode")]
+    #[serde(default = "default_mode", alias = "sarvam_mode")]
     pub mode: String,
 }
 
@@ -117,17 +124,85 @@ impl Default for AudioConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "RawConfig")]
 pub struct Config {
-    #[serde(default = "default_hotkey")]
     pub hotkey: String,
-    #[serde(default = "default_pacing_ms")]
     pub pacing_delay_ms: u64,
-    #[serde(default)]
     pub audio: AudioConfig,
-    #[serde(default)]
     pub inference: InferenceConfig,
-    #[serde(default)]
     pub injector: InjectorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawConfig {
+    #[serde(default = "default_hotkey")]
+    hotkey: String,
+    #[serde(default)]
+    pacing_delay_ms: Option<u64>,
+    #[serde(default)]
+    typing_delay_ms: Option<u64>,
+    #[serde(default)]
+    audio: AudioConfig,
+    #[serde(default)]
+    inference: InferenceConfig,
+    #[serde(default)]
+    injector: InjectorConfig,
+
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    sarvam_api_key: Option<String>,
+    #[serde(default)]
+    sarvam_mode: Option<String>,
+    #[serde(default)]
+    sarvam_model: Option<String>,
+    #[serde(default)]
+    injection_mode: Option<String>,
+}
+
+impl From<RawConfig> for Config {
+    fn from(raw: RawConfig) -> Self {
+        let mut inference = raw.inference;
+        if let Some(p) = raw.provider {
+            inference.provider = p;
+        }
+        if let Some(k) = raw.sarvam_api_key {
+            inference.api_key = k;
+        }
+        if let Some(m) = raw.sarvam_mode {
+            inference.mode = m;
+        }
+        if let Some(mdl) = raw.sarvam_model {
+            inference.model = mdl;
+        }
+
+        let mut injector = raw.injector;
+        if let Some(inj) = raw.injection_mode {
+            injector.method = inj;
+        }
+
+        let delay = raw
+            .typing_delay_ms
+            .or_else(|| {
+                if injector.pacing_delay_ms != default_pacing_ms() {
+                    Some(injector.pacing_delay_ms)
+                } else {
+                    raw.pacing_delay_ms
+                }
+            })
+            .or(raw.pacing_delay_ms)
+            .unwrap_or_else(default_pacing_ms);
+
+        injector.pacing_delay_ms = delay;
+
+        Config {
+            hotkey: raw.hotkey,
+            pacing_delay_ms: delay,
+            audio: raw.audio,
+            inference,
+            injector,
+        }
+    }
 }
 
 impl Default for Config {
@@ -170,6 +245,28 @@ impl Config {
 
     pub fn to_target_chord(&self) -> TargetChord {
         parse_hotkey(&self.hotkey).unwrap_or_else(TargetChord::right_alt)
+    }
+
+    pub fn apply_cli_overrides(
+        &mut self,
+        provider: Option<&str>,
+        mode: Option<&str>,
+        injection: Option<&str>,
+        typing_delay: Option<u64>,
+    ) {
+        if let Some(p) = provider {
+            self.inference.provider = p.to_string();
+        }
+        if let Some(m) = mode {
+            self.inference.mode = m.to_string();
+        }
+        if let Some(inj) = injection {
+            self.injector.method = inj.to_string();
+        }
+        if let Some(d) = typing_delay {
+            self.pacing_delay_ms = d;
+            self.injector.pacing_delay_ms = d;
+        }
     }
 }
 
@@ -238,8 +335,8 @@ mod tests {
     fn test_config_defaults_and_parsing() {
         let default_cfg = Config::default();
         assert_eq!(default_cfg.hotkey, "RightAlt");
-        assert_eq!(default_cfg.pacing_delay_ms, 10);
-        assert_eq!(default_cfg.injector.method, "auto");
+        assert_eq!(default_cfg.pacing_delay_ms, 15);
+        assert_eq!(default_cfg.injector.method, "typewriter");
         assert_eq!(default_cfg.to_target_chord(), TargetChord::right_alt());
 
         let toml_data = r#"
@@ -278,7 +375,7 @@ mode = "codemix"
     #[test]
     fn test_inference_config_api_key_env_var_fallback() {
         let mut cfg = InferenceConfig::default();
-        assert_eq!(cfg.provider, "mock");
+        assert_eq!(cfg.provider, "local");
         assert_eq!(cfg.model, "saaras:v4");
         assert_eq!(cfg.language_code, "unknown");
 

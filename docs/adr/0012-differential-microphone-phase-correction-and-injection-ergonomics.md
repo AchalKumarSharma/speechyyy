@@ -13,3 +13,4 @@ We decided to implement:
 - **Static Single-Channel Capture**: Rejected because ALSA/PipeWire hardware configurations vary between mono and multi-channel; querying the system default config and dynamically detecting phase relationships in software guarantees portable operation across both conventional stereo mics and differential arrays.
 - **Dynamic Array Reallocation during Overflow**: Rejected to maintain real-time safety inside the audio callback; a fixed pre-allocated lock-free SPSC buffer of 30 seconds eliminates allocation latency while adhering to RAM constraints.
 - **Escape Defuse Keystroke for Electron Menus**: Rejected because emitting synthetic `KEY_ESC` before pasting deselects active text inputs and cancels input focus across Chromium and Electron webviews. A clean 80ms settle delay and pure `Ctrl+V` uinput chord provides reliable paste delivery without focus loss.
+

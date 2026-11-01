@@ -7,8 +7,8 @@ use std::time::Duration;
 fn test_default_config_pacing_delay_is_at_least_8ms() {
     let config = Config::default();
     assert!(
-        config.pacing_delay_ms >= 8 && config.pacing_delay_ms <= 10,
-        "Default pacing delay must be 8-10ms for Wayland stability, got {}ms",
+        config.pacing_delay_ms >= 8 && config.pacing_delay_ms <= 20,
+        "Default pacing delay must be 8-20ms for Wayland stability, got {}ms",
         config.pacing_delay_ms
     );
 }
@@ -190,6 +190,291 @@ fn test_uinput_isolated_send_text_or_permission_error() {
             // Expected in unprivileged/sandboxed test environments
             assert!(
                 e.contains("uinput") || e.contains("permission") || e.contains("writable"),
+                "Expected descriptive permission error, got: {}",
+                e
+            );
+        }
+    }
+}
+
+#[test]
+fn test_injection_mode_configuration_and_serialization() {
+    use speechyyy::injector::InjectionMode;
+
+    let default_mode = InjectionMode::default();
+    assert_eq!(default_mode, InjectionMode::Typewriter { delay_ms: 15 });
+
+    let paste_mode = InjectionMode::Paste;
+    let serialized_paste = serde_json::to_string(&paste_mode).unwrap();
+    assert_eq!(serialized_paste, r#""paste""#);
+
+    let typewriter_mode = InjectionMode::Typewriter { delay_ms: 20 };
+    let serialized_tw = serde_json::to_string(&typewriter_mode).unwrap();
+    assert!(serialized_tw.contains(r#""typewriter""#) && serialized_tw.contains("20"));
+
+    let deserialized: InjectionMode = serde_json::from_str(&serialized_tw).unwrap();
+    assert_eq!(deserialized, typewriter_mode);
+
+    let mut injector = RecordingInjector::with_mode(typewriter_mode, false);
+    assert_eq!(injector.mode(), typewriter_mode);
+    assert_eq!(injector.pacing_delay, Duration::from_millis(20));
+
+    injector.set_mode(InjectionMode::Typewriter { delay_ms: 35 });
+    assert_eq!(injector.mode(), InjectionMode::Typewriter { delay_ms: 35 });
+    assert_eq!(injector.pacing_delay, Duration::from_millis(35));
+}
+
+#[test]
+fn test_typewriter_pacing_verification() {
+    use speechyyy::injector::InjectionMode;
+
+    let mut injector =
+        RecordingInjector::with_mode(InjectionMode::Typewriter { delay_ms: 12 }, false);
+    injector.inject("hello").expect("inject string");
+
+    let events = injector.emitted_events.lock().unwrap().clone();
+    // 5 letters ('h', 'e', 'l', 'l', 'o') -> 5 down, 5 up
+    assert_eq!(
+        events.len(),
+        10,
+        "Expected 10 events for 5 lowercase letters"
+    );
+
+    for i in 0..5 {
+        assert!(events[i * 2].is_down, "Event {} must be key down", i * 2);
+        assert!(
+            !events[i * 2 + 1].is_down,
+            "Event {} must be key up",
+            i * 2 + 1
+        );
+        assert_eq!(events[i * 2].key, events[i * 2 + 1].key);
+    }
+
+    // Verify pacing delay recording: each transition had 12ms delay recorded
+    let delays = injector.recorded_delays.lock().unwrap().clone();
+    assert_eq!(
+        delays.len(),
+        10,
+        "Expected 10 recorded pacing delays for 10 transitions"
+    );
+    for d in delays {
+        assert_eq!(d, Duration::from_millis(12));
+    }
+}
+
+#[test]
+fn test_typewriter_shift_chord_verification() {
+    use speechyyy::injector::InjectionMode;
+
+    // 1. All uppercase letters 'A'..='Z'
+    for c in 'A'..='Z' {
+        let mut injector =
+            RecordingInjector::with_mode(InjectionMode::Typewriter { delay_ms: 0 }, false);
+        let s = c.to_string();
+        injector.inject(&s).expect("inject uppercase letter");
+
+        let events = injector.emitted_events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            4,
+            "Shift chord for '{}' must emit exactly 4 events (Shift down, Key down, Key up, Shift up)",
+            c
+        );
+        assert_eq!(events[0].key, KeyCode::KEY_LEFTSHIFT);
+        assert!(events[0].is_down, "Shift must be down");
+        assert!(events[1].is_down, "Character key must be down");
+        assert_ne!(events[1].key, KeyCode::KEY_LEFTSHIFT);
+        assert!(!events[2].is_down, "Character key must be up");
+        assert_eq!(events[1].key, events[2].key);
+        assert_eq!(events[3].key, KeyCode::KEY_LEFTSHIFT);
+        assert!(!events[3].is_down, "Shift must be up");
+    }
+
+    // 2. Shifted punctuation: !, @, #, $, %, ^, &, *, (, ), _, +, {, }, |, :, ", <, >, ?
+    let shifted_symbols = [
+        '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '{', '}', '|', ':', '"', '<',
+        '>', '?',
+    ];
+    for &sym in &shifted_symbols {
+        let mut injector =
+            RecordingInjector::with_mode(InjectionMode::Typewriter { delay_ms: 0 }, false);
+        let s = sym.to_string();
+        injector.inject(&s).expect("inject shifted punctuation");
+
+        let events = injector.emitted_events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            4,
+            "Shift chord for symbol '{}' must emit exactly 4 events (Shift down, Key down, Key up, Shift up)",
+            sym
+        );
+        assert_eq!(events[0].key, KeyCode::KEY_LEFTSHIFT);
+        assert!(events[0].is_down);
+        assert!(events[1].is_down);
+        assert_ne!(events[1].key, KeyCode::KEY_LEFTSHIFT);
+        assert!(!events[2].is_down);
+        assert_eq!(events[1].key, events[2].key);
+        assert_eq!(events[3].key, KeyCode::KEY_LEFTSHIFT);
+        assert!(!events[3].is_down);
+    }
+}
+
+#[test]
+fn test_typewriter_whitespace_and_digits() {
+    use speechyyy::injector::InjectionMode;
+
+    let test_chars = [
+        ('0', KeyCode::KEY_0),
+        ('1', KeyCode::KEY_1),
+        ('2', KeyCode::KEY_2),
+        ('3', KeyCode::KEY_3),
+        ('4', KeyCode::KEY_4),
+        ('5', KeyCode::KEY_5),
+        ('6', KeyCode::KEY_6),
+        ('7', KeyCode::KEY_7),
+        ('8', KeyCode::KEY_8),
+        ('9', KeyCode::KEY_9),
+        (' ', KeyCode::KEY_SPACE),
+        ('\t', KeyCode::KEY_TAB),
+        ('\n', KeyCode::KEY_ENTER),
+    ];
+
+    for (c, expected_key) in test_chars {
+        let mut injector =
+            RecordingInjector::with_mode(InjectionMode::Typewriter { delay_ms: 0 }, false);
+        let s = c.to_string();
+        injector.inject(&s).expect("inject whitespace/digit");
+
+        let events = injector.emitted_events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            2,
+            "Character '{}' must emit exactly 2 events without Shift",
+            c
+        );
+        assert_eq!(events[0].key, expected_key);
+        assert!(events[0].is_down);
+        assert_eq!(events[1].key, expected_key);
+        assert!(!events[1].is_down);
+
+        // Assert Shift is NOT emitted
+        for ev in &events {
+            assert_ne!(
+                ev.key,
+                KeyCode::KEY_LEFTSHIFT,
+                "Shift must not be emitted for '{}'",
+                c
+            );
+        }
+    }
+}
+
+#[test]
+fn test_typewriter_utf8_fallback_unmapped_characters() {
+    use speechyyy::injector::InjectionMode;
+
+    let mut injector =
+        RecordingInjector::with_mode(InjectionMode::Typewriter { delay_ms: 0 }, false);
+    injector
+        .inject("hello 🚀 world")
+        .expect("inject text with emoji");
+
+    let fallback = injector.fallback_pastes.lock().unwrap().clone();
+    assert_eq!(
+        fallback,
+        vec!["🚀".to_string()],
+        "Unmapped emoji '🚀' must fall back to clipboard paste"
+    );
+
+    let events = injector.emitted_events.lock().unwrap().clone();
+    // 'hello ' = 6 chars = 12 events; ' world' = 6 chars = 12 events -> total 24 key events
+    assert_eq!(
+        events.len(),
+        24,
+        "Mapped characters before and after fallback must still type normally"
+    );
+
+    // Multi-byte script fallback
+    let mut script_injector =
+        RecordingInjector::with_mode(InjectionMode::Typewriter { delay_ms: 0 }, false);
+    script_injector
+        .inject("namaste नमस्ते")
+        .expect("inject text with Devanagari");
+
+    let script_fallback = script_injector.fallback_pastes.lock().unwrap().clone();
+    assert_eq!(
+        script_fallback,
+        vec!["नमस्ते".to_string()],
+        "Devanagari script must fall back to clipboard paste intact"
+    );
+}
+
+#[test]
+fn test_typewriter_modifier_settle_releases_all_held_modifiers() {
+    use speechyyy::injector::InjectionMode;
+
+    let mut injector = RecordingInjector::with_mode(
+        InjectionMode::Typewriter { delay_ms: 0 },
+        true, // settle_modifiers enabled
+    );
+    injector.inject("A").expect("inject with settle");
+
+    let events = injector.emitted_events.lock().unwrap().clone();
+    assert!(
+        events.len() >= 8,
+        "Must emit releases for all held modifiers"
+    );
+
+    let required_modifiers = [
+        KeyCode::KEY_RIGHTALT,
+        KeyCode::KEY_LEFTALT,
+        KeyCode::KEY_LEFTCTRL,
+        KeyCode::KEY_RIGHTCTRL,
+        KeyCode::KEY_LEFTSHIFT,
+        KeyCode::KEY_RIGHTSHIFT,
+        KeyCode::KEY_LEFTMETA,
+        KeyCode::KEY_RIGHTMETA,
+    ];
+
+    for &mod_key in &required_modifiers {
+        let release_pos = events
+            .iter()
+            .position(|ev| ev.key == mod_key && !ev.is_down);
+        assert!(
+            release_pos.is_some(),
+            "Expected release event for modifier {:?}",
+            mod_key
+        );
+
+        let char_down_pos = events
+            .iter()
+            .position(|ev| ev.key == KeyCode::KEY_A && ev.is_down)
+            .expect("KEY_A down must be present");
+
+        assert!(
+            release_pos.unwrap() < char_down_pos,
+            "Modifier {:?} release must precede character emission",
+            mod_key
+        );
+    }
+}
+
+#[test]
+fn test_create_injector_supports_typewriter_method() {
+    let mut config = Config::default();
+    config.injector.method = "typewriter".into();
+    match speechyyy::injector::create_injector(&config) {
+        Ok(injector) => {
+            assert!(
+                injector.name().contains("typewriter") || injector.name().contains("uinput"),
+                "Injector should be typewriter-capable uinput injector, got: {}",
+                injector.name()
+            );
+        }
+        Err(e) => {
+            // Expected in unprivileged test environments where /dev/uinput is unwritable
+            assert!(
+                e.contains("uinput") || e.contains("Permission denied") || e.contains("writable"),
                 "Expected descriptive permission error, got: {}",
                 e
             );

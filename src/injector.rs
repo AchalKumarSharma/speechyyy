@@ -1,8 +1,22 @@
 use evdev::uinput::VirtualDevice;
 use evdev::{AttributeSet, EventType, InputEvent, KeyCode};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InjectionMode {
+    Typewriter { delay_ms: u64 },
+    Paste,
+}
+
+impl Default for InjectionMode {
+    fn default() -> Self {
+        Self::Typewriter { delay_ms: 15 }
+    }
+}
 
 pub trait TextInjector: Send + Sync {
     fn inject(&mut self, text: &str) -> Result<(), String>;
@@ -151,24 +165,98 @@ pub fn char_to_key(c: char) -> Option<(KeyCode, bool)> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextSegment {
+    Mapped(char, KeyCode, bool),
+    Unmapped(String),
+}
+
+pub fn segment_text(text: &str) -> Vec<TextSegment> {
+    let mut segments: Vec<TextSegment> = Vec::new();
+    let mut current_unmapped = String::new();
+
+    for c in text.chars() {
+        if let Some((key, needs_shift)) = char_to_key(c) {
+            if !current_unmapped.is_empty() {
+                segments.push(TextSegment::Unmapped(std::mem::take(&mut current_unmapped)));
+            }
+            segments.push(TextSegment::Mapped(c, key, needs_shift));
+        } else {
+            current_unmapped.push(c);
+        }
+    }
+    if !current_unmapped.is_empty() {
+        segments.push(TextSegment::Unmapped(current_unmapped));
+    }
+
+    segments
+}
+
 pub struct RecordingInjector {
     pub injected_strings: Arc<Mutex<Vec<String>>>,
     pub emitted_events: Arc<Mutex<Vec<KeyStroke>>>,
+    pub fallback_pastes: Arc<Mutex<Vec<String>>>,
+    pub recorded_delays: Arc<Mutex<Vec<Duration>>>,
     pub pacing_delay: Duration,
     pub settle_modifiers: bool,
+    pub mode: InjectionMode,
 }
 
 impl RecordingInjector {
     pub fn new(pacing_delay: Duration) -> Self {
-        Self::with_settle(pacing_delay, false)
+        Self::with_mode(
+            InjectionMode::Typewriter {
+                delay_ms: pacing_delay.as_millis() as u64,
+            },
+            false,
+        )
     }
 
     pub fn with_settle(pacing_delay: Duration, settle_modifiers: bool) -> Self {
+        Self::with_mode(
+            InjectionMode::Typewriter {
+                delay_ms: pacing_delay.as_millis() as u64,
+            },
+            settle_modifiers,
+        )
+    }
+
+    pub fn with_mode(mode: InjectionMode, settle_modifiers: bool) -> Self {
+        let pacing_delay = match mode {
+            InjectionMode::Typewriter { delay_ms } => Duration::from_millis(delay_ms),
+            InjectionMode::Paste => Duration::ZERO,
+        };
         Self {
             injected_strings: Arc::new(Mutex::new(Vec::new())),
             emitted_events: Arc::new(Mutex::new(Vec::new())),
+            fallback_pastes: Arc::new(Mutex::new(Vec::new())),
+            recorded_delays: Arc::new(Mutex::new(Vec::new())),
             pacing_delay,
             settle_modifiers,
+            mode,
+        }
+    }
+
+    pub fn mode(&self) -> InjectionMode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: InjectionMode) {
+        self.mode = mode;
+        self.pacing_delay = match mode {
+            InjectionMode::Typewriter { delay_ms } => Duration::from_millis(delay_ms),
+            InjectionMode::Paste => Duration::ZERO,
+        };
+    }
+
+    fn emit_keystroke(&self, key: KeyCode, is_down: bool) {
+        self.emitted_events
+            .lock()
+            .unwrap()
+            .push(KeyStroke { key, is_down });
+        if !self.pacing_delay.is_zero() {
+            self.recorded_delays.lock().unwrap().push(self.pacing_delay);
+            thread::sleep(self.pacing_delay);
         }
     }
 }
@@ -178,48 +266,45 @@ impl TextInjector for RecordingInjector {
         self.injected_strings.lock().unwrap().push(text.to_string());
 
         if self.settle_modifiers {
-            self.emitted_events.lock().unwrap().push(KeyStroke {
-                key: KeyCode::KEY_RIGHTALT,
-                is_down: false,
-            });
-            self.emitted_events.lock().unwrap().push(KeyStroke {
-                key: KeyCode::KEY_LEFTALT,
-                is_down: false,
-            });
-        }
-
-        for c in text.chars() {
-            if let Some((key, needs_shift)) = char_to_key(c) {
-                if needs_shift {
-                    self.emitted_events.lock().unwrap().push(KeyStroke {
-                        key: KeyCode::KEY_LEFTSHIFT,
-                        is_down: true,
-                    });
-                    if !self.pacing_delay.is_zero() {
-                        thread::sleep(self.pacing_delay);
-                    }
-                }
-                self.emitted_events
-                    .lock()
-                    .unwrap()
-                    .push(KeyStroke { key, is_down: true });
-                if !self.pacing_delay.is_zero() {
-                    thread::sleep(self.pacing_delay);
-                }
+            let modifiers = [
+                KeyCode::KEY_RIGHTALT,
+                KeyCode::KEY_LEFTALT,
+                KeyCode::KEY_LEFTCTRL,
+                KeyCode::KEY_RIGHTCTRL,
+                KeyCode::KEY_LEFTSHIFT,
+                KeyCode::KEY_RIGHTSHIFT,
+                KeyCode::KEY_LEFTMETA,
+                KeyCode::KEY_RIGHTMETA,
+            ];
+            for key in modifiers {
                 self.emitted_events.lock().unwrap().push(KeyStroke {
                     key,
                     is_down: false,
                 });
-                if !self.pacing_delay.is_zero() {
-                    thread::sleep(self.pacing_delay);
-                }
-                if needs_shift {
-                    self.emitted_events.lock().unwrap().push(KeyStroke {
-                        key: KeyCode::KEY_LEFTSHIFT,
-                        is_down: false,
-                    });
-                    if !self.pacing_delay.is_zero() {
-                        thread::sleep(self.pacing_delay);
+            }
+        }
+
+        match self.mode {
+            InjectionMode::Paste => {
+                self.fallback_pastes.lock().unwrap().push(text.to_string());
+            }
+            InjectionMode::Typewriter { .. } => {
+                let segments = segment_text(text);
+                for segment in segments {
+                    match segment {
+                        TextSegment::Mapped(_c, key, needs_shift) => {
+                            if needs_shift {
+                                self.emit_keystroke(KeyCode::KEY_LEFTSHIFT, true);
+                            }
+                            self.emit_keystroke(key, true);
+                            self.emit_keystroke(key, false);
+                            if needs_shift {
+                                self.emit_keystroke(KeyCode::KEY_LEFTSHIFT, false);
+                            }
+                        }
+                        TextSegment::Unmapped(fallback_text) => {
+                            self.fallback_pastes.lock().unwrap().push(fallback_text);
+                        }
                     }
                 }
             }
@@ -278,6 +363,7 @@ where
 pub struct UinputInjector {
     device: VirtualDevice,
     pacing_delay: Duration,
+    mode: InjectionMode,
 }
 
 impl UinputInjector {
@@ -285,10 +371,31 @@ impl UinputInjector {
 
     pub fn new(pacing_delay: Duration) -> Result<Self, String> {
         let device = create_virtual_device()?;
+        let mode = InjectionMode::Typewriter {
+            delay_ms: pacing_delay.as_millis() as u64,
+        };
         Ok(Self {
             device,
             pacing_delay,
+            mode,
         })
+    }
+
+    pub fn with_mode(mut self, mode: InjectionMode) -> Self {
+        self.set_mode(mode);
+        self
+    }
+
+    pub fn mode(&self) -> InjectionMode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: InjectionMode) {
+        self.mode = mode;
+        self.pacing_delay = match mode {
+            InjectionMode::Typewriter { delay_ms } => Duration::from_millis(delay_ms),
+            InjectionMode::Paste => Duration::ZERO,
+        };
     }
 
     pub fn settle_modifiers(&mut self) -> Result<(), String> {
@@ -339,15 +446,32 @@ impl TextInjector for UinputInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
         self.settle_modifiers()?;
 
-        for c in text.chars() {
-            if let Some((key, needs_shift)) = char_to_key(c) {
-                if needs_shift {
-                    self.emit_key(KeyCode::KEY_LEFTSHIFT, true)?;
-                }
-                self.emit_key(key, true)?;
-                self.emit_key(key, false)?;
-                if needs_shift {
-                    self.emit_key(KeyCode::KEY_LEFTSHIFT, false)?;
+        match self.mode {
+            InjectionMode::Paste => {
+                WaylandClipboardInjector::copy_to_clipboard(text)?;
+                thread::sleep(WaylandClipboardInjector::SETTLE_DELAY);
+                WaylandClipboardInjector::trigger_uinput_paste(&mut self.device)?;
+            }
+            InjectionMode::Typewriter { .. } => {
+                let segments = segment_text(text);
+                for segment in segments {
+                    match segment {
+                        TextSegment::Mapped(_c, key, needs_shift) => {
+                            if needs_shift {
+                                self.emit_key(KeyCode::KEY_LEFTSHIFT, true)?;
+                            }
+                            self.emit_key(key, true)?;
+                            self.emit_key(key, false)?;
+                            if needs_shift {
+                                self.emit_key(KeyCode::KEY_LEFTSHIFT, false)?;
+                            }
+                        }
+                        TextSegment::Unmapped(fallback_text) => {
+                            WaylandClipboardInjector::copy_to_clipboard(&fallback_text)?;
+                            thread::sleep(WaylandClipboardInjector::SETTLE_DELAY);
+                            WaylandClipboardInjector::trigger_uinput_paste(&mut self.device)?;
+                        }
+                    }
                 }
             }
         }
@@ -355,7 +479,10 @@ impl TextInjector for UinputInjector {
     }
 
     fn name(&self) -> &'static str {
-        "uinput virtual keyboard"
+        match self.mode {
+            InjectionMode::Typewriter { .. } => "uinput virtual keyboard (typewriter)",
+            InjectionMode::Paste => "uinput clipboard paste",
+        }
     }
 }
 
@@ -462,11 +589,23 @@ pub fn create_injector(config: &crate::config::Config) -> Result<Box<dyn TextInj
     let method = config.injector.method.to_lowercase();
 
     match method.as_str() {
-        "clipboard" | "wayland" => Ok(Box::new(WaylandClipboardInjector::new(pacing))),
+        "clipboard" | "wayland" | "paste" => Ok(Box::new(WaylandClipboardInjector::new(pacing))),
         "uinput" => {
             let inj = UinputInjector::new(pacing)?;
             Ok(Box::new(inj))
         }
+        "typewriter" => match UinputInjector::new(pacing) {
+            Ok(inj) => Ok(Box::new(inj.with_mode(InjectionMode::Typewriter {
+                delay_ms: config.pacing_delay_ms,
+            }))),
+            Err(e) => {
+                eprintln!(
+                    "UinputInjector initialization failed ({}); typewriter mode falling back to clipboard paste",
+                    e
+                );
+                Ok(Box::new(WaylandClipboardInjector::new(pacing)))
+            }
+        },
         "auto" => {
             let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
             if is_wayland {
@@ -485,7 +624,7 @@ pub fn create_injector(config: &crate::config::Config) -> Result<Box<dyn TextInj
             }
         }
         other => Err(format!(
-            "Unknown injector method '{}'. Supported: 'auto', 'uinput', 'clipboard'.",
+            "Unknown injector method '{}'. Supported: 'auto', 'typewriter', 'uinput', 'clipboard', 'paste'.",
             other
         )),
     }

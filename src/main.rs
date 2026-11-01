@@ -27,7 +27,20 @@ fn main() {
         Command::Model { action } => match action {
             speechyyy::cli::ModelAction::Download { model } => handle_model_download_command(model),
         },
-        Command::Start { foreground } => start_daemon(foreground, &paths),
+        Command::Start {
+            foreground,
+            provider,
+            mode,
+            injection,
+            typing_delay,
+        } => start_daemon(
+            foreground,
+            provider.as_deref(),
+            mode.as_deref(),
+            injection.as_deref(),
+            typing_delay,
+            &paths,
+        ),
         Command::Stop => stop_daemon(&paths),
         Command::Status => check_status(&paths),
     };

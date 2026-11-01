@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 pub const DEFAULT_SARVAM_ENDPOINT: &str = "https://api.sarvam.ai/speech-to-text";
 pub const DEFAULT_SARVAM_MODEL: &str = "saaras:v4";
-pub const DEFAULT_SARVAM_MODE: &str = "transcribe";
+pub const DEFAULT_SARVAM_MODE: &str = "translit";
 pub const DEFAULT_SARVAM_LANGUAGE: &str = "unknown";
 
 pub struct SarvamSpeechInference {
@@ -14,6 +14,7 @@ pub struct SarvamSpeechInference {
     pub language_code: String,
     pub mode: String,
     pub endpoint: String,
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl SarvamSpeechInference {
@@ -24,6 +25,7 @@ impl SarvamSpeechInference {
             language_code,
             mode,
             endpoint: DEFAULT_SARVAM_ENDPOINT.to_string(),
+            timeout: None,
         }
     }
 
@@ -41,6 +43,11 @@ impl SarvamSpeechInference {
 
     pub fn with_endpoint(mut self, endpoint: &str) -> Self {
         self.endpoint = endpoint.to_string();
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 }
@@ -118,7 +125,14 @@ impl SpeechInference for SarvamSpeechInference {
             &self.language_code,
         );
 
-        let response = ureq::post(&self.endpoint)
+        let mut agent_builder = ureq::builder();
+        if let Some(timeout) = self.timeout {
+            agent_builder = agent_builder.timeout(timeout);
+        }
+        let agent = agent_builder.build();
+
+        let response = agent
+            .post(&self.endpoint)
             .set("api-subscription-key", &self.api_key)
             .set(
                 "Content-Type",
@@ -130,12 +144,60 @@ impl SpeechInference for SarvamSpeechInference {
                     let msg = resp
                         .into_string()
                         .unwrap_or_else(|_| "Unknown HTTP error".into());
-                    InferenceError::Http {
-                        status,
-                        message: msg,
+                    match status {
+                        401 => {
+                            let details = if msg.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", msg)
+                            };
+                            InferenceError::Authentication(format!(
+                                "Invalid or expired Sarvam API key. Check 'speechyyy doctor' or replenish credentials at https://dashboard.sarvam.ai{}",
+                                details
+                            ))
+                        }
+                        429 => {
+                            let details = if msg.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", msg)
+                            };
+                            InferenceError::RateLimited(format!(
+                                "Sarvam AI rate limit exceeded or credit balance exhausted{}",
+                                details
+                            ))
+                        }
+                        _ => InferenceError::Http {
+                            status,
+                            message: msg,
+                        },
                     }
                 }
-                ureq::Error::Transport(e) => InferenceError::Network(e.to_string()),
+                ureq::Error::Transport(e) => {
+                    let msg = e.to_string();
+                    let lower = msg.to_lowercase();
+                    let is_timeout = lower.contains("timed out")
+                        || lower.contains("timeout")
+                        || lower.contains("deadline")
+                        || std::error::Error::source(&e)
+                            .and_then(|s| s.downcast_ref::<std::io::Error>())
+                            .map(|io| io.kind() == std::io::ErrorKind::TimedOut)
+                            .unwrap_or(false);
+
+                    if is_timeout {
+                        let details = if msg.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", msg)
+                        };
+                        InferenceError::Timeout(format!(
+                            "Sarvam AI connection timed out. Check network connectivity{}",
+                            details
+                        ))
+                    } else {
+                        InferenceError::Network(msg)
+                    }
+                }
             })?;
 
         let parsed: SarvamResponse = response

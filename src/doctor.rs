@@ -120,46 +120,7 @@ impl SysEnv for RealSysEnv {
 
     fn check_inference(&self) -> Result<String, String> {
         let config = crate::config::Config::load();
-        match config.inference.provider.to_lowercase().as_str() {
-            "sarvam" => {
-                if let Some(key) = config.inference.resolve_api_key() {
-                    let masked = if key.len() > 8 {
-                        format!("{}...{}", &key[..4], &key[key.len() - 4..])
-                    } else {
-                        "********".to_string()
-                    };
-                    Ok(format!(
-                        "Sarvam AI (key: {}, model: {})",
-                        masked, config.inference.model
-                    ))
-                } else {
-                    Err("SARVAM_API_KEY is not set (configure in config.toml or set environment variable)".into())
-                }
-            }
-            "mock" => Ok("Mock provider (mock)".into()),
-            "local" => {
-                let model_type = crate::model::LocalModelType::from_str_name(&config.inference.model)
-                    .unwrap_or(crate::model::LocalModelType::MoonshineTiny);
-                let model_dir = crate::model::ModelManager::model_dir(model_type);
-                match crate::model::ModelManager::verify_model_files(model_type, &model_dir) {
-                    Ok(info) => Ok(format!(
-                        "Local model: {} ({:.1} MB, {} files)",
-                        model_type.display_name(),
-                        info.total_mb(),
-                        info.file_count
-                    )),
-                    Err(err) => Err(format!(
-                        "Local model missing at {}: {}. Run 'speechyyy model download' to fetch weights.",
-                        model_dir.display(),
-                        err
-                    )),
-                }
-            }
-            other => Err(format!(
-                "Unknown inference provider '{}'. Supported providers are 'mock', 'sarvam', 'local'.",
-                other
-            )),
-        }
+        check_inference_for_config(&config)
     }
 
     fn is_wayland(&self) -> bool {
@@ -179,9 +140,53 @@ impl SysEnv for RealSysEnv {
     }
 }
 
+pub fn check_inference_for_config(config: &crate::config::Config) -> Result<String, String> {
+    match config.inference.provider.to_lowercase().as_str() {
+        "sarvam" => {
+            if let Some(key) = config.inference.resolve_api_key() {
+                let masked = if key.len() > 8 {
+                    format!("{}...{}", &key[..4], &key[key.len() - 4..])
+                } else {
+                    "********".to_string()
+                };
+                Ok(format!("Sarvam API Key: {} (configured)", masked))
+            } else {
+                Err(
+                    "Sarvam API Key missing. Set SARVAM_API_KEY in config.toml or environment."
+                        .into(),
+                )
+            }
+        }
+        "mock" => Ok("Mock provider (mock)".into()),
+        "local" => {
+            let model_type = crate::model::LocalModelType::from_str_name(&config.inference.model)
+                .unwrap_or(crate::model::LocalModelType::MoonshineTiny);
+            let model_dir = crate::model::ModelManager::model_dir(model_type);
+            match crate::model::ModelManager::verify_model_files(model_type, &model_dir) {
+                Ok(info) => Ok(format!(
+                    "Local model: {} ({:.1} MB, {} files)",
+                    model_type.display_name(),
+                    info.total_mb(),
+                    info.file_count
+                )),
+                Err(err) => Err(format!(
+                    "Local model missing at {}: {}. Run 'speechyyy model download' to fetch weights.",
+                    model_dir.display(),
+                    err
+                )),
+            }
+        }
+        other => Err(format!(
+            "Unknown inference provider '{}'. Supported providers are 'mock', 'sarvam', 'local'.",
+            other
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckStatus {
     Pass,
+    Warn(String),
     Fail(String),
 }
 
@@ -202,11 +207,16 @@ impl DoctorReport {
     pub fn is_ready(&self) -> bool {
         self.items
             .iter()
-            .all(|i| matches!(i.status, CheckStatus::Pass))
+            .all(|i| !matches!(i.status, CheckStatus::Fail(_)))
     }
 }
 
 pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
+    let config = crate::config::Config::load();
+    run_doctor_with_config(env, &config)
+}
+
+pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config) -> DoctorReport {
     let mut items = Vec::new();
     let mut fix_instructions = Vec::new();
     let username = env.current_username();
@@ -264,7 +274,8 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
 
     // 3. /dev/uinput write access or Wayland clipboard fallback
     let uinput_path = Path::new("/dev/uinput");
-    if env.can_write_path(uinput_path) {
+    let uinput_writable = env.can_write_path(uinput_path);
+    if uinput_writable {
         items.push(DiagnosticItem {
             name: "Virtual keyboard permissions (/dev/uinput)".into(),
             status: CheckStatus::Pass,
@@ -284,6 +295,27 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
             status: CheckStatus::Fail("Cannot write to /dev/uinput (permission denied)".into()),
         });
         fix_instructions.push("sudo cp /etc/udev/rules.d/99-speechyyy.rules (or generate below) && sudo udevadm control --reload-rules && sudo udevadm trigger".into());
+    }
+
+    // Typewriter specific check
+    let is_typewriter = config.injector.method.eq_ignore_ascii_case("typewriter");
+    if is_typewriter {
+        if uinput_writable {
+            items.push(DiagnosticItem {
+                name: "Typewriter Injection: /dev/uinput writable".into(),
+                status: CheckStatus::Pass,
+            });
+        } else {
+            items.push(DiagnosticItem {
+                name:
+                    "/dev/uinput not writable: typewriter mode will fall back to clipboard paste."
+                        .into(),
+                status: CheckStatus::Warn(String::new()),
+            });
+            fix_instructions.push(
+                "For hardware typewriter keystrokes, grant /dev/uinput write permissions (e.g. via udev rules). Currently falling back to clipboard paste.".into(),
+            );
+        }
     }
 
     // 4. Microphone audio input device check
@@ -308,15 +340,25 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
     // 5. Speech inference provider readiness check
     match env.check_inference() {
         Ok(info) => {
+            let name = if info.starts_with("Sarvam API Key") {
+                info
+            } else {
+                format!("Speech inference provider: {}", info)
+            };
             items.push(DiagnosticItem {
-                name: format!("Speech inference provider: {}", info),
+                name,
                 status: CheckStatus::Pass,
             });
         }
         Err(err) => {
+            let (name, status_err) = if err.starts_with("Sarvam API Key") {
+                (err.clone(), String::new())
+            } else {
+                ("Speech inference provider".to_string(), err)
+            };
             items.push(DiagnosticItem {
-                name: "Speech inference provider".into(),
-                status: CheckStatus::Fail(err),
+                name,
+                status: CheckStatus::Fail(status_err),
             });
             fix_instructions.push(
                 "Export SARVAM_API_KEY (e.g. 'export SARVAM_API_KEY=your_key') or run 'speechyyy model download' for offline local inference.".into(),
@@ -325,22 +367,37 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
     }
 
     // 6. Text injection pipeline verification
-    let config = crate::config::Config::load();
-    match crate::injector::create_injector(&config) {
-        Ok(inj) => {
-            items.push(DiagnosticItem {
-                name: format!("Text injector pipeline ({})", inj.name()),
-                status: CheckStatus::Pass,
-            });
-        }
-        Err(err) => {
-            items.push(DiagnosticItem {
-                name: "Text injector pipeline".into(),
-                status: CheckStatus::Fail(err),
-            });
-            fix_instructions.push(
-                "Ensure either /dev/uinput is writable or 'wl-copy' is installed for Wayland clipboard typing.".into(),
-            );
+    if uinput_writable || (env.is_wayland() && env.has_command("wl-copy")) {
+        let mode_desc = if is_typewriter {
+            if uinput_writable {
+                "Typewriter (uinput sequential)"
+            } else {
+                "Typewriter fallback (Wayland clipboard)"
+            }
+        } else {
+            "Text injector"
+        };
+        items.push(DiagnosticItem {
+            name: format!("Text injector pipeline ({})", mode_desc),
+            status: CheckStatus::Pass,
+        });
+    } else {
+        match crate::injector::create_injector(config) {
+            Ok(inj) => {
+                items.push(DiagnosticItem {
+                    name: format!("Text injector pipeline ({})", inj.name()),
+                    status: CheckStatus::Pass,
+                });
+            }
+            Err(err) => {
+                items.push(DiagnosticItem {
+                    name: "Text injector pipeline".into(),
+                    status: CheckStatus::Fail(err),
+                });
+                fix_instructions.push(
+                    "Ensure either /dev/uinput is writable or 'wl-copy' is installed for Wayland clipboard typing.".into(),
+                );
+            }
         }
     }
 
@@ -368,7 +425,20 @@ pub fn print_doctor_report(report: &DoctorReport) {
     for item in &report.items {
         match &item.status {
             CheckStatus::Pass => println!("  [PASS] {}", item.name),
-            CheckStatus::Fail(reason) => println!("  [FAIL] {}: {}", item.name, reason),
+            CheckStatus::Warn(reason) => {
+                if reason.is_empty() {
+                    println!("  [WARN] {}", item.name);
+                } else {
+                    println!("  [WARN] {}: {}", item.name, reason);
+                }
+            }
+            CheckStatus::Fail(reason) => {
+                if reason.is_empty() {
+                    println!("  [FAIL] {}", item.name);
+                } else {
+                    println!("  [FAIL] {}: {}", item.name, reason);
+                }
+            }
         }
     }
 
@@ -619,5 +689,122 @@ mod tests {
             .items
             .iter()
             .any(|i| i.name.contains("Wayland clipboard fallback")));
+    }
+
+    #[test]
+    fn test_doctor_sarvam_api_key_configured_passes() {
+        let env = MockEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into(), "uinput".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("PipeWire Source".into()),
+            inference_result: Ok("Sarvam API Key: sk_...1234 (configured)".into()),
+        };
+
+        let report = run_doctor(&env);
+        assert!(report.is_ready());
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name == "Sarvam API Key: sk_...1234 (configured)"
+                && matches!(i.status, CheckStatus::Pass)));
+    }
+
+    #[test]
+    fn test_doctor_sarvam_api_key_missing_fails() {
+        let env = MockEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into(), "uinput".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("PipeWire Source".into()),
+            inference_result: Err(
+                "Sarvam API Key missing. Set SARVAM_API_KEY in config.toml or environment.".into(),
+            ),
+        };
+
+        let report = run_doctor(&env);
+        assert!(!report.is_ready());
+        assert!(report.items.iter().any(|i| i.name
+            == "Sarvam API Key missing. Set SARVAM_API_KEY in config.toml or environment."
+            && matches!(i.status, CheckStatus::Fail(_))));
+        assert!(report
+            .fix_instructions
+            .iter()
+            .any(|f| f.contains("SARVAM_API_KEY")));
+    }
+
+    #[test]
+    fn test_doctor_typewriter_uinput_writable_passes() {
+        let env = MockEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into(), "uinput".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("PipeWire Source".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
+        };
+
+        let mut config = crate::config::Config::default();
+        config.injector.method = "typewriter".into();
+
+        let report = run_doctor_with_config(&env, &config);
+        assert!(report.is_ready());
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name == "Typewriter Injection: /dev/uinput writable"
+                && matches!(i.status, CheckStatus::Pass)));
+    }
+
+    #[test]
+    fn test_doctor_typewriter_uinput_unwritable_warns_and_stays_ready() {
+        let env = MockWaylandEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("PipeWire Source".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
+        };
+
+        let mut config = crate::config::Config::default();
+        config.injector.method = "typewriter".into();
+
+        let report = run_doctor_with_config(&env, &config);
+        assert!(
+            report.is_ready(),
+            "Doctor should stay ready because Wayland clipboard fallback handles text delivery"
+        );
+        assert!(report.items.iter().any(|i| i.name
+            == "/dev/uinput not writable: typewriter mode will fall back to clipboard paste."
+            && matches!(i.status, CheckStatus::Warn(_))));
+    }
+
+    #[test]
+    fn test_check_inference_for_config_sarvam_and_mock() {
+        let mut config = crate::config::Config::default();
+        config.inference.provider = "sarvam".into();
+        config.inference.api_key = "sk_test_1234567890abcdef".into();
+
+        let res = check_inference_for_config(&config).expect("should succeed with api key");
+        assert_eq!(res, "Sarvam API Key: sk_t...cdef (configured)");
+
+        config.inference.api_key.clear();
+        std::env::remove_var("SARVAM_API_KEY");
+
+        let err = check_inference_for_config(&config).expect_err("should fail without api key");
+        assert_eq!(
+            err,
+            "Sarvam API Key missing. Set SARVAM_API_KEY in config.toml or environment."
+        );
+
+        config.inference.provider = "mock".into();
+        let mock_res = check_inference_for_config(&config).expect("mock should succeed");
+        assert_eq!(mock_res, "Mock provider (mock)");
     }
 }

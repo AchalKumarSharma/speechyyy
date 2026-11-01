@@ -66,7 +66,14 @@ where
     Ok(())
 }
 
-pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String> {
+pub fn start_daemon(
+    foreground: bool,
+    provider: Option<&str>,
+    mode: Option<&str>,
+    injection: Option<&str>,
+    typing_delay: Option<u64>,
+    paths: &RuntimePaths,
+) -> Result<(), String> {
     if let Some(parent) = paths.pid_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -108,9 +115,22 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
         let current_exe = std::env::current_exe()
             .map_err(|e| format!("Failed to determine binary path: {}", e))?;
 
-        let mut child = ProcessCommand::new(current_exe)
-            .arg("start")
-            .arg("--foreground")
+        let mut cmd = ProcessCommand::new(current_exe);
+        cmd.arg("start").arg("--foreground");
+        if let Some(p) = provider {
+            cmd.arg("--provider").arg(p);
+        }
+        if let Some(m) = mode {
+            cmd.arg("--mode").arg(m);
+        }
+        if let Some(inj) = injection {
+            cmd.arg("--injection").arg(inj);
+        }
+        if let Some(d) = typing_delay {
+            cmd.arg("--typing-delay").arg(d.to_string());
+        }
+
+        let mut child = cmd
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -169,7 +189,8 @@ pub fn start_daemon(foreground: bool, paths: &RuntimePaths) -> Result<(), String
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let running = server.running_flag();
 
-        let config = Config::load();
+        let mut config = Config::load();
+        config.apply_cli_overrides(provider, mode, injection, typing_delay);
         let target_chord = config.to_target_chord();
 
         let mut injector = match create_injector(&config) {

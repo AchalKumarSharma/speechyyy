@@ -19,6 +19,18 @@ pub enum Command {
         /// Run in foreground instead of detaching as a daemon
         #[arg(short, long)]
         foreground: bool,
+        /// Speech-to-text inference provider ('local' or 'sarvam')
+        #[arg(long)]
+        provider: Option<String>,
+        /// Sarvam operating mode ('translit', 'transcribe', 'translate', 'codemix')
+        #[arg(long)]
+        mode: Option<String>,
+        /// Text injection mode ('typewriter' or 'paste')
+        #[arg(long)]
+        injection: Option<String>,
+        /// Keystroke typing delay in milliseconds for typewriter mode
+        #[arg(long)]
+        typing_delay: Option<u64>,
     },
     /// Stop a running Speechyyy daemon
     Stop,
@@ -68,14 +80,32 @@ mod tests {
     #[test]
     fn test_parse_start_default() {
         let cli = Cli::try_parse_from(["speechyyy", "start"]).expect("parse start");
-        assert_eq!(cli.command, Command::Start { foreground: false });
+        assert_eq!(
+            cli.command,
+            Command::Start {
+                foreground: false,
+                provider: None,
+                mode: None,
+                injection: None,
+                typing_delay: None,
+            }
+        );
     }
 
     #[test]
     fn test_parse_start_foreground() {
         let cli = Cli::try_parse_from(["speechyyy", "start", "--foreground"])
             .expect("parse start foreground");
-        assert_eq!(cli.command, Command::Start { foreground: true });
+        assert_eq!(
+            cli.command,
+            Command::Start {
+                foreground: true,
+                provider: None,
+                mode: None,
+                injection: None,
+                typing_delay: None,
+            }
+        );
     }
 
     #[test]
