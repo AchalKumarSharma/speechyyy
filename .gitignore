@@ -1,1 +1,37 @@
+# Build & heavy weights
 /target
+target/
+**/*.rs.bk
+*.onnx
+*.bin
+*.tar.gz
+*.zip
+models/
+downloads/
+
+# Local configuration & secrets (anchored to root to protect test fixtures)
+/config.toml
+/dictionary.toml
+.env*
+
+# Runtime state & audio recordings
+*.pid
+*.sock
+*.log
+logs/
+*.wav
+!tests/**/*.wav
+*.pcm
+*.raw
+audio_debug/
+
+# IDE & AI agent scratchpads
+.agent/
+.gemini/
+.skills/
+skills/
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*~
