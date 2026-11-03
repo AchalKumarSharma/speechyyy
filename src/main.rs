@@ -1,21 +1,26 @@
 use clap::Parser;
-use speechyyy::cli::{Cli, Command};
+use speechyyy::cli::{Cli, Command, ModelCommands};
 use speechyyy::daemon::{check_status, start_daemon, stop_daemon};
 use speechyyy::doctor::{print_doctor_report, run_doctor, RealSysEnv};
-use speechyyy::history::{handle_fix_command, handle_history_command};
+use speechyyy::history::{handle_fix_command_opts, handle_history_command};
 use speechyyy::ipc::RuntimePaths;
 use speechyyy::model::{
     handle_model_download_command, handle_model_list_command, handle_model_use_command,
 };
-use speechyyy::text::handle_learn_command;
+use speechyyy::text::{handle_learn_command_opts, handle_unlearn_command};
 
 fn main() {
     let cli = Cli::parse();
     let paths = RuntimePaths::new();
 
     let result = match cli.command {
-        Command::Learn { wrong, correct } => handle_learn_command(&wrong, &correct),
-        Command::Fix { corrected_phrase } => handle_fix_command(&corrected_phrase),
+        Command::Learn { wrong, correct } => {
+            handle_learn_command_opts(wrong.as_deref(), correct.as_deref())
+        }
+        Command::Fix { corrected_phrase } => {
+            handle_fix_command_opts(corrected_phrase.as_deref())
+        }
+        Command::Unlearn { key } => handle_unlearn_command(key.as_deref()),
         Command::History { limit } => handle_history_command(limit),
         Command::Doctor => {
             let env = RealSysEnv;
@@ -26,13 +31,19 @@ fn main() {
             }
             Ok(())
         }
-        Command::Model { action } => match action {
-            speechyyy::cli::ModelCommands::Download { model } => {
-                handle_model_download_command(model)
+        Command::Models { action } => match action {
+            Some(ModelCommands::Download { model, model_flag }) => {
+                let target = ModelCommands::resolved_download_model(model, model_flag);
+                handle_model_download_command(target)
             }
-            speechyyy::cli::ModelCommands::List => handle_model_list_command(),
-            speechyyy::cli::ModelCommands::Use { model } => handle_model_use_command(&model),
+            Some(ModelCommands::List) | None => handle_model_list_command(),
+            Some(ModelCommands::Use { model }) => handle_model_use_command(&model),
         },
+        Command::Download { model, model_flag } => {
+            let target = ModelCommands::resolved_download_model(model, model_flag);
+            handle_model_download_command(target)
+        }
+        Command::Use { model } => handle_model_use_command(&model),
         Command::Start {
             foreground,
             provider,

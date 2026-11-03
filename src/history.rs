@@ -246,6 +246,17 @@ pub fn handle_fix_command(corrected_phrase: &str) -> Result<(), String> {
     }
 }
 
+/// Handler for CLI `fix` command with optional argument.
+pub fn handle_fix_command_opts(corrected_phrase: Option<&str>) -> Result<(), String> {
+    match corrected_phrase {
+        Some(phrase) if !phrase.trim().is_empty() => handle_fix_command(phrase.trim()),
+        _ => {
+            println!("Usage: speechyyy fix <CORRECTED_PHRASE>\nExample: speechyyy fix 'The quick brown fox jumps over the lazy dog'");
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +352,13 @@ mod tests {
         assert_eq!(ts.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
         assert!(ts.ends_with('Z'));
         assert!(ts.contains('T'));
+    }
+
+    #[test]
+    fn test_handle_fix_command_opts_missing_prints_usage() {
+        let res_none = handle_fix_command_opts(None);
+        assert!(res_none.is_ok());
+        let res_empty = handle_fix_command_opts(Some("   "));
+        assert!(res_empty.is_ok());
     }
 }

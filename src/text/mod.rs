@@ -1,7 +1,10 @@
 pub mod dictionary;
 pub mod format;
 
-pub use dictionary::{handle_learn_command, LearningDictionary};
+pub use dictionary::{
+    handle_learn_command, handle_learn_command_opts, handle_unlearn_command,
+    handle_unlearn_command_internal, LearningDictionary,
+};
 pub use format::{capitalize_sentence, clean_hallucinations, TextFormatter};
 
 /// Unified text processing pipeline coordinating hallucination cleaning,

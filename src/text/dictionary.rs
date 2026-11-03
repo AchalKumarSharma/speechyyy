@@ -151,6 +151,31 @@ impl LearningDictionary {
         self.rules.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
     }
 
+    /// Removes a replacement rule by key (case-insensitive) and returns true if found.
+    pub fn remove_rule(&mut self, key: &str) -> bool {
+        let key_trimmed = key.trim();
+        if key_trimmed.is_empty() {
+            return false;
+        }
+        let key_lower = key_trimmed.to_lowercase();
+        let initial_len = self.rules.len();
+        self.rules.retain(|(k, orig_k, _)| k != &key_lower && orig_k != key_trimmed);
+        self.rules.len() < initial_len
+    }
+
+    /// Removes a replacement rule and persists changes to disk.
+    pub fn remove_rule_and_save(&mut self, key: &str) -> Result<bool, String> {
+        let removed = self.remove_rule(key);
+        if removed {
+            if let Some(ref path) = self.path {
+                self.save_to_path(path)?;
+            } else {
+                self.save()?;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Adds or updates a replacement rule and persists it immediately.
     pub fn add_rule_and_save(&mut self, wrong: &str, correct: &str) -> Result<(), String> {
         self.add_rule(wrong, correct);
@@ -188,6 +213,59 @@ pub fn handle_learn_command(wrong: &str, correct: &str) -> Result<(), String> {
     dict.add_rule_and_save(wrong, correct)?;
     println!("Learned replacement: \"{}\" -> \"{}\"", wrong, correct);
     Ok(())
+}
+
+/// Handler for CLI `learn` command with optional arguments.
+pub fn handle_learn_command_opts(
+    wrong: Option<&str>,
+    correct: Option<&str>,
+) -> Result<(), String> {
+    match (wrong, correct) {
+        (Some(w), Some(c)) if !w.trim().is_empty() && !c.trim().is_empty() => {
+            handle_learn_command(w.trim(), c.trim())
+        }
+        _ => {
+            println!("Usage: speechyyy learn <WRONG> <CORRECT>\nExample: speechyyy learn 'n8n' 'N8N'");
+            Ok(())
+        }
+    }
+}
+
+/// Handler for CLI `unlearn` command with path override for testing.
+pub fn handle_unlearn_command_internal(
+    key: Option<&str>,
+    dict_path: Option<&Path>,
+) -> Result<(), String> {
+    let key_str = match key {
+        Some(k) if !k.trim().is_empty() => k.trim(),
+        _ => {
+            println!("Usage: speechyyy unlearn <KEY>\nExample: speechyyy unlearn 'Speechy kya tum mujhe sun sakte ho'");
+            return Ok(());
+        }
+    };
+
+    let mut dict = match dict_path {
+        Some(p) => LearningDictionary::load_from_path(p)?,
+        None => LearningDictionary::load(),
+    };
+
+    if dict.remove_rule(key_str) {
+        if let Some(p) = dict_path {
+            dict.save_to_path(p)?;
+        } else {
+            dict.save()?;
+        }
+        println!("[✓] Removed replacement rule: \"{}\"", key_str);
+    } else {
+        println!("[!] Rule \"{}\" not found in dictionary", key_str);
+    }
+
+    Ok(())
+}
+
+/// Handler for CLI `unlearn` command.
+pub fn handle_unlearn_command(key: Option<&str>) -> Result<(), String> {
+    handle_unlearn_command_internal(key, None)
 }
 
 /// Replaces whole-word occurrences of `pattern_lower` in `text` with `replacement` (case-insensitive).
@@ -334,5 +412,45 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_dictionary_remove_rule_and_unlearn() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("dict_unlearn_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let dict_path = temp_dir.join("dictionary.toml");
+
+        let mut dict = LearningDictionary::load_from_path(&dict_path).unwrap();
+        dict.add_rule_and_save("n8n", "N8N").unwrap();
+        dict.add_rule_and_save("Speechy", "Speechyyy").unwrap();
+        assert_eq!(dict.len(), 2);
+
+        // Remove rule via unlearn command
+        let res = handle_unlearn_command_internal(Some("n8n"), Some(&dict_path));
+        assert!(res.is_ok());
+
+        let reloaded = LearningDictionary::load_from_path(&dict_path).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded.apply("testing n8n"), "testing n8n");
+        assert_eq!(reloaded.apply("testing Speechy"), "testing Speechyyy");
+
+        // Remove again -> not found (prints warning, succeeds)
+        let res_missing = handle_unlearn_command_internal(Some("n8n"), Some(&dict_path));
+        assert!(res_missing.is_ok());
+
+        // Missing argument -> prints usage
+        let res_bare = handle_unlearn_command_internal(None, Some(&dict_path));
+        assert!(res_bare.is_ok());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_handle_learn_command_opts() {
+        let res_bare = handle_learn_command_opts(None, None);
+        assert!(res_bare.is_ok());
+        let res_one = handle_learn_command_opts(Some("wrong"), None);
+        assert!(res_one.is_ok());
     }
 }

@@ -11,8 +11,8 @@ fn test_cli_parsing_model_subcommands() {
     let cli_list = Cli::try_parse_from(["speechyyy", "model", "list"]).expect("parse list");
     assert_eq!(
         cli_list.command,
-        Command::Model {
-            action: ModelCommands::List,
+        Command::Models {
+            action: Some(ModelCommands::List),
         }
     );
 
@@ -20,12 +20,60 @@ fn test_cli_parsing_model_subcommands() {
         .expect("parse use");
     assert_eq!(
         cli_use.command,
-        Command::Model {
-            action: ModelCommands::Use {
+        Command::Models {
+            action: Some(ModelCommands::Use {
                 model: "parakeet-tdt-v3".to_string(),
-            },
+            }),
         }
     );
+
+    let cli_models_bare = Cli::try_parse_from(["speechyyy", "models"]).expect("parse models");
+    assert_eq!(cli_models_bare.command, Command::Models { action: None });
+
+    let cli_model_bare = Cli::try_parse_from(["speechyyy", "model"]).expect("parse bare model");
+    assert_eq!(cli_model_bare.command, Command::Models { action: None });
+
+    let cli_download_pos =
+        Cli::try_parse_from(["speechyyy", "download", "parakeet-tdt-v3"]).expect("parse download");
+    assert_eq!(
+        cli_download_pos.command,
+        Command::Download {
+            model: Some(LocalModelType::ParakeetTdtV3),
+            model_flag: None,
+        }
+    );
+
+    let cli_download_flag =
+        Cli::try_parse_from(["speechyyy", "download", "-m", "whisper-small"]).expect("parse download -m");
+    assert_eq!(
+        cli_download_flag.command,
+        Command::Download {
+            model: None,
+            model_flag: Some(LocalModelType::WhisperSmall),
+        }
+    );
+
+    let cli_use_top =
+        Cli::try_parse_from(["speechyyy", "use", "parakeet-tdt-v3"]).expect("parse use top");
+    assert_eq!(
+        cli_use_top.command,
+        Command::Use {
+            model: "parakeet-tdt-v3".to_string(),
+        }
+    );
+
+    let cli_unlearn_key =
+        Cli::try_parse_from(["speechyyy", "unlearn", "Speechy"]).expect("parse unlearn key");
+    assert_eq!(
+        cli_unlearn_key.command,
+        Command::Unlearn {
+            key: Some("Speechy".to_string()),
+        }
+    );
+
+    let cli_unlearn_bare =
+        Cli::try_parse_from(["speechyyy", "unlearn"]).expect("parse unlearn bare");
+    assert_eq!(cli_unlearn_bare.command, Command::Unlearn { key: None });
 }
 
 #[test]
@@ -152,6 +200,36 @@ fn test_model_use_unsupported_model() {
     let err = res.unwrap_err();
     assert!(err.contains("Unsupported model 'whisper-tiny'"));
     assert!(err.contains("parakeet-tdt-v3"));
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn test_unlearn_command_lifecycle() {
+    use speechyyy::text::{handle_unlearn_command_internal, LearningDictionary};
+
+    let temp_dir = std::env::temp_dir().join(format!("test_unlearn_lifecycle_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let dict_path = temp_dir.join("dictionary.toml");
+
+    let mut dict = LearningDictionary::load_from_path(&dict_path).unwrap();
+    dict.add_rule_and_save("n8n", "N8N").unwrap();
+    assert_eq!(dict.len(), 1);
+
+    // 1. Remove existing rule
+    let res = handle_unlearn_command_internal(Some("n8n"), Some(&dict_path));
+    assert!(res.is_ok());
+
+    let reloaded = LearningDictionary::load_from_path(&dict_path).unwrap();
+    assert_eq!(reloaded.len(), 0);
+
+    // 2. Remove rule that does not exist
+    let res_missing = handle_unlearn_command_internal(Some("n8n"), Some(&dict_path));
+    assert!(res_missing.is_ok());
+
+    // 3. Remove with missing key argument
+    let res_none = handle_unlearn_command_internal(None, Some(&dict_path));
+    assert!(res_none.is_ok());
 
     let _ = fs::remove_dir_all(temp_dir);
 }

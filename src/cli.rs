@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug, PartialEq, Eq)]
 #[command(
     name = "speechyyy",
-    about = "Ultra-lightweight Linux desktop push-to-talk dictation daemon",
+    about = "You can type faster with your mouth now.",
+    after_help = "Hotkey:\n  Hold [RightAlt] to speak. Release to type anywhere.\n",
     version
 )]
 pub struct Cli {
@@ -14,7 +15,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
 pub enum Command {
-    /// Start the Speechyyy background daemon
+    /// Start the Speechyyy daemon (-f for foreground logs)
     Start {
         /// Run in foreground instead of detaching as a daemon
         #[arg(short, long)]
@@ -32,23 +33,48 @@ pub enum Command {
         #[arg(long)]
         typing_delay: Option<u64>,
     },
-    /// Stop a running Speechyyy daemon
+    /// Stop the running daemon
     Stop,
-    /// Inspect the status of the Speechyyy daemon
+    /// Inspect daemon process status
     Status,
-    /// Inspect system permissions and input device accessibility
+    /// Inspect system permissions, audio inputs, and model weights
     Doctor,
-    /// Add or update a dynamic vocabulary replacement rule in dictionary.toml
+    /// List available speech recognition models (alias: model)
+    #[command(alias = "model")]
+    Models {
+        #[command(subcommand)]
+        action: Option<ModelCommands>,
+    },
+    /// Download model weights (e.g. speechyyy download parakeet-tdt-v3)
+    Download {
+        /// Target model architecture ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
+        #[arg(value_name = "MODEL")]
+        model: Option<LocalModelType>,
+        /// Target model architecture flag (-m, --model)
+        #[arg(short = 'm', long = "model", value_name = "MODEL")]
+        model_flag: Option<LocalModelType>,
+    },
+    /// Switch active model (e.g. speechyyy use parakeet-tdt-v3)
+    Use {
+        /// Name of the model preset ('saaras:v4', 'parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
+        model: String,
+    },
+    /// Add a phonetic replacement rule to dictionary.toml
     Learn {
         /// The incorrect phrase heard by the speech model
-        wrong: String,
+        wrong: Option<String>,
         /// The correct replacement text
-        correct: String,
+        correct: Option<String>,
     },
-    /// Diff against the most recent utterance and save the correction rule
+    /// Diff against the most recent utterance and save correction rule
     Fix {
         /// The fully corrected phrase
-        corrected_phrase: String,
+        corrected_phrase: Option<String>,
+    },
+    /// Remove a replacement rule from dictionary.toml
+    Unlearn {
+        /// The replacement rule key to remove
+        key: Option<String>,
     },
     /// Inspect recent dictation history
     History {
@@ -56,20 +82,18 @@ pub enum Command {
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
     },
-    /// Manage local speech recognition models
-    Model {
-        #[command(subcommand)]
-        action: ModelCommands,
-    },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
 pub enum ModelCommands {
-    /// Download pre-converted INT8 quantized ONNX model weights
+    /// Download model weights (e.g. speechyyy download parakeet-tdt-v3)
     Download {
         /// Target model architecture ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
-        #[arg(short, long, default_value = "parakeet-tdt-v3")]
-        model: LocalModelType,
+        #[arg(value_name = "MODEL")]
+        model: Option<LocalModelType>,
+        /// Target model architecture flag (-m, --model)
+        #[arg(short = 'm', long = "model", value_name = "MODEL")]
+        model_flag: Option<LocalModelType>,
     },
     /// List supported speech models
     List,
@@ -80,6 +104,16 @@ pub enum ModelCommands {
     },
 }
 
+impl ModelCommands {
+    pub fn resolved_download_model(
+        model: Option<LocalModelType>,
+        model_flag: Option<LocalModelType>,
+    ) -> LocalModelType {
+        model.or(model_flag).unwrap_or(LocalModelType::ParakeetTdtV3)
+    }
+}
+
+pub type Commands = Command;
 pub type ModelAction = ModelCommands;
 
 #[cfg(test)]
@@ -142,8 +176,20 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Learn {
-                wrong: "post gress".into(),
-                correct: "PostgreSQL".into()
+                wrong: Some("post gress".into()),
+                correct: Some("PostgreSQL".into())
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_learn_bare() {
+        let cli = Cli::try_parse_from(["speechyyy", "learn"]).expect("parse bare learn");
+        assert_eq!(
+            cli.command,
+            Command::Learn {
+                wrong: None,
+                correct: None
             }
         );
     }
@@ -155,9 +201,38 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Fix {
-                corrected_phrase: "I love PostgreSQL".into()
+                corrected_phrase: Some("I love PostgreSQL".into())
             }
         );
+    }
+
+    #[test]
+    fn test_parse_fix_bare() {
+        let cli = Cli::try_parse_from(["speechyyy", "fix"]).expect("parse bare fix");
+        assert_eq!(
+            cli.command,
+            Command::Fix {
+                corrected_phrase: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_unlearn() {
+        let cli = Cli::try_parse_from(["speechyyy", "unlearn", "Speechy kya tum mujhe sun sakte ho"])
+            .expect("parse unlearn");
+        assert_eq!(
+            cli.command,
+            Command::Unlearn {
+                key: Some("Speechy kya tum mujhe sun sakte ho".into())
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_unlearn_bare() {
+        let cli = Cli::try_parse_from(["speechyyy", "unlearn"]).expect("parse bare unlearn");
+        assert_eq!(cli.command, Command::Unlearn { key: None });
     }
 
     #[test]
@@ -174,10 +249,11 @@ mod tests {
                 .expect("parse model download");
         assert_eq!(
             cli.command,
-            Command::Model {
-                action: ModelAction::Download {
-                    model: LocalModelType::ParakeetTdtV3,
-                }
+            Command::Models {
+                action: Some(ModelAction::Download {
+                    model: None,
+                    model_flag: Some(LocalModelType::ParakeetTdtV3),
+                })
             }
         );
     }
@@ -187,8 +263,8 @@ mod tests {
         let cli = Cli::try_parse_from(["speechyyy", "model", "list"]).expect("parse model list");
         assert_eq!(
             cli.command,
-            Command::Model {
-                action: ModelCommands::List,
+            Command::Models {
+                action: Some(ModelCommands::List),
             }
         );
     }
@@ -199,11 +275,79 @@ mod tests {
             .expect("parse model use");
         assert_eq!(
             cli.command,
-            Command::Model {
-                action: ModelCommands::Use {
+            Command::Models {
+                action: Some(ModelCommands::Use {
                     model: "parakeet-tdt-v3".to_string(),
-                }
+                })
             }
         );
+    }
+
+    #[test]
+    fn test_parse_top_level_models_and_bare_model() {
+        let cli_models =
+            Cli::try_parse_from(["speechyyy", "models"]).expect("parse models");
+        assert_eq!(
+            cli_models.command,
+            Command::Models { action: None }
+        );
+
+        let cli_model_bare =
+            Cli::try_parse_from(["speechyyy", "model"]).expect("parse bare model");
+        assert_eq!(
+            cli_model_bare.command,
+            Command::Models { action: None }
+        );
+    }
+
+    #[test]
+    fn test_parse_top_level_download() {
+        let cli_pos = Cli::try_parse_from(["speechyyy", "download", "parakeet-tdt-v3"])
+            .expect("parse download positional");
+        assert_eq!(
+            cli_pos.command,
+            Command::Download {
+                model: Some(LocalModelType::ParakeetTdtV3),
+                model_flag: None,
+            }
+        );
+
+        let cli_flag = Cli::try_parse_from(["speechyyy", "download", "-m", "whisper-small"])
+            .expect("parse download flag");
+        assert_eq!(
+            cli_flag.command,
+            Command::Download {
+                model: None,
+                model_flag: Some(LocalModelType::WhisperSmall),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_top_level_use() {
+        let cli = Cli::try_parse_from(["speechyyy", "use", "parakeet-tdt-v3"])
+            .expect("parse use");
+        assert_eq!(
+            cli.command,
+            Command::Use {
+                model: "parakeet-tdt-v3".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_help_metadata_tagline_and_hotkey_guidance() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        cmd.write_help(&mut buf).unwrap();
+        let help = String::from_utf8(buf).unwrap();
+
+        assert!(help.contains("You can type faster with your mouth now."));
+        assert!(help.contains("Hotkey:\n  Hold [RightAlt] to speak. Release to type anywhere."));
+        assert!(help.contains("models"));
+        assert!(help.contains("download"));
+        assert!(help.contains("use"));
+        assert!(help.contains("unlearn"));
     }
 }
