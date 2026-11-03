@@ -78,3 +78,4 @@ case ":$PATH:" in
         echo "    or append it to your ~/.bashrc or ~/.zshrc."
         ;;
 esac
+

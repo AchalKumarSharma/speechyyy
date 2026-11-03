@@ -45,3 +45,4 @@ jobs:
           files: |
             speechyyy-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
             speechyyy-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz.sha256
+
