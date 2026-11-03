@@ -17,28 +17,20 @@ Speechyyy is an open-source, ultra-lightweight desktop dictation engine written 
 
 ## Installation
 
-### Automated Installer (Linux)
+### One-Line Install (Recommended)
 
-Clone the repository and run the automated installer:
+Install the pre-compiled binary and set up system permissions automatically:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/achalkumarsharma/speechyyy/master/install.sh)"
+```
+
+### Build from Source
 
 ```bash
 git clone https://github.com/achalkumarsharma/speechyyy.git
 cd speechyyy
 ./install.sh
-```
-
-The installer builds the release binary, copies it to `~/.local/bin/speechyyy`, configures the uinput kernel module, installs the udev rule (`/etc/udev/rules.d/99-speechyyy-uinput.rules`), and runs diagnostics.
-
-### Build from Source
-
-Ensure you have Rust and system dependencies installed:
-
-```bash
-# Ubuntu/Debian
-sudo apt-get install -y libasound2-dev pkg-config cmake
-
-# Build release binary
-cargo build --release
 ```
 
 To configure `/dev/uinput` permissions manually:

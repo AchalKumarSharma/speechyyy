@@ -1,81 +1,100 @@
 #!/usr/bin/env bash
 set -e
 
-# Check if script is run in repository root containing Cargo.toml
-if [ ! -f "Cargo.toml" ]; then
-    echo "Error: install.sh must be run from the repository root containing Cargo.toml." >&2
-    exit 1
+REPO="achalkumarsharma/speechyyy"
+TARGET_DIR="${HOME}/.local/bin"
+mkdir -p "${TARGET_DIR}"
+
+UDEV_RULE_SRC=""
+
+if [ -f "Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    echo "==> Local repository detected. Compiling release binary via cargo..."
+    cargo build --release
+    cp "target/release/speechyyy" "${TARGET_DIR}/speechyyy"
+    chmod +x "${TARGET_DIR}/speechyyy"
+    UDEV_RULE_SRC="extra/99-speechyyy-uinput.rules"
+else
+    echo "==> Fetching latest pre-built release for Linux (x86_64)..."
+    ARCH="$(uname -m)"
+    if [ "$ARCH" != "x86_64" ]; then
+        echo "Error: Unsupported architecture: $ARCH. Pre-built binaries are currently only available for x86_64." >&2
+        exit 1
+    fi
+
+    LATEST_TAG=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/${REPO}/releases/latest" | tr '/' '\n' | tail -n 1)
+    if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "releases" ] || [[ "$LATEST_TAG" == *"releases"* ]]; then
+        echo "Error: Could not determine latest release tag for ${REPO}." >&2
+        echo "Please check https://github.com/${REPO}/releases manually." >&2
+        exit 1
+    fi
+
+    TMP_DIR=$(mktemp -d)
+    trap 'rm -rf "${TMP_DIR}"' EXIT
+
+    TARBALL_URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/speechyyy-${LATEST_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+    echo "==> Downloading pre-built release ${LATEST_TAG}..."
+    curl -fsSL "$TARBALL_URL" -o "${TMP_DIR}/speechyyy.tar.gz"
+
+    echo "==> Extracting release archive..."
+    tar -xzf "${TMP_DIR}/speechyyy.tar.gz" -C "${TMP_DIR}"
+
+    if [ -f "${TMP_DIR}/speechyyy" ]; then
+        cp "${TMP_DIR}/speechyyy" "${TARGET_DIR}/speechyyy"
+    elif [ -f "${TMP_DIR}/target/release/speechyyy" ]; then
+        cp "${TMP_DIR}/target/release/speechyyy" "${TARGET_DIR}/speechyyy"
+    else
+        BIN_FOUND=$(find "${TMP_DIR}" -type f -name "speechyyy" | head -n 1)
+        if [ -n "$BIN_FOUND" ]; then
+            cp "$BIN_FOUND" "${TARGET_DIR}/speechyyy"
+        else
+            echo "Error: Could not locate speechyyy binary in release archive." >&2
+            exit 1
+        fi
+    fi
+    chmod +x "${TARGET_DIR}/speechyyy"
+
+    if [ -f "${TMP_DIR}/extra/99-speechyyy-uinput.rules" ]; then
+        UDEV_RULE_SRC="${TMP_DIR}/extra/99-speechyyy-uinput.rules"
+    elif [ -f "${TMP_DIR}/99-speechyyy-uinput.rules" ]; then
+        UDEV_RULE_SRC="${TMP_DIR}/99-speechyyy-uinput.rules"
+    else
+        UDEV_RULE_SRC=$(find "${TMP_DIR}" -type f -name "99-speechyyy-uinput.rules" | head -n 1)
+    fi
 fi
 
-echo "==> Building Speechyyy in release mode..."
-cargo build --release
-
-# Copy binary to ~/.local/bin/speechyyy
-INSTALL_DIR="${HOME}/.local/bin"
-mkdir -p "${INSTALL_DIR}"
-cp "target/release/speechyyy" "${INSTALL_DIR}/speechyyy"
-chmod +x "${INSTALL_DIR}/speechyyy"
-echo "[✓] Installed speechyyy binary to ${INSTALL_DIR}/speechyyy"
-
-# Ensure uinput kernel module is active
-echo "==> Checking uinput kernel module..."
+# Kernel & Udev Configuration
+echo "==> Configuring uinput kernel module..."
 if [ ! -e "/dev/uinput" ]; then
-    echo "Notice: /dev/uinput does not exist. Loading module with sudo modprobe uinput..."
-    sudo modprobe uinput
+    echo "Notice: /dev/uinput does not exist. Loading module via sudo modprobe uinput..."
+    sudo modprobe uinput || true
 else
     echo "[✓] /dev/uinput is active."
 fi
 
-# Offer to persist uinput via /etc/modules-load.d/uinput.conf if not present
-if [ ! -f "/etc/modules-load.d/uinput.conf" ]; then
-    echo "Notice: /etc/modules-load.d/uinput.conf does not exist."
-    SHOULD_PERSIST="n"
-    if [ -t 0 ]; then
-        read -r -p "Persist uinput module across reboots (/etc/modules-load.d/uinput.conf)? [Y/n] " answer
-        case "${answer:-Y}" in
-            [yY][eE][sS]|[yY])
-                SHOULD_PERSIST="y"
-                ;;
-            *)
-                SHOULD_PERSIST="n"
-                ;;
-        esac
-    else
-        SHOULD_PERSIST="y"
-    fi
-
-    if [ "$SHOULD_PERSIST" = "y" ]; then
-        sudo mkdir -p /etc/modules-load.d
-        echo "uinput" | sudo tee /etc/modules-load.d/uinput.conf > /dev/null
-        echo "[✓] Persisted uinput in /etc/modules-load.d/uinput.conf"
-    fi
-else
-    echo "[✓] uinput module persistence already configured in /etc/modules-load.d/uinput.conf"
-fi
-
-# Install udev rule
-echo "==> Installing udev rule..."
-if [ -f "extra/99-speechyyy-uinput.rules" ]; then
-    sudo cp "extra/99-speechyyy-uinput.rules" "/etc/udev/rules.d/99-speechyyy-uinput.rules"
+if [ -n "$UDEV_RULE_SRC" ] && [ -f "$UDEV_RULE_SRC" ]; then
+    echo "==> Installing udev rule to /etc/udev/rules.d/99-speechyyy-uinput.rules..."
+    sudo cp "$UDEV_RULE_SRC" "/etc/udev/rules.d/99-speechyyy-uinput.rules"
     sudo udevadm control --reload-rules && sudo udevadm trigger
     echo "[✓] Udev rule installed and reloaded."
 else
-    echo "Error: extra/99-speechyyy-uinput.rules not found!" >&2
-    exit 1
+    echo "[!] Warning: Udev rule not found; skipping udev setup."
 fi
 
-# Run doctor diagnostic
-echo "==> Running system diagnostics (speechyyy doctor)..."
-"${INSTALL_DIR}/speechyyy" doctor || true
-
-echo ""
-echo "[✓] Speechyyy installation complete!"
+# PATH Notification
 case ":$PATH:" in
-    *:"$INSTALL_DIR":*) ;;
+    *:"${TARGET_DIR}":*) ;;
     *)
-        echo "[!] Notice: ${INSTALL_DIR} is not in your current PATH."
-        echo "    Add it by running: export PATH=\"\$HOME/.local/bin:\$PATH\""
-        echo "    or append it to your ~/.bashrc or ~/.zshrc."
+        echo ""
+        echo "[!] Notice: ${TARGET_DIR} is not in your current PATH."
+        echo "    Add it by placing this line in your ~/.bashrc or ~/.zshrc:"
+        echo "      export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo ""
         ;;
 esac
 
+# System Verification
+echo "==> Verifying system configuration (speechyyy doctor)..."
+"${TARGET_DIR}/speechyyy" doctor || true
+
+echo ""
+echo "[✓] Speechyyy installed successfully to ${TARGET_DIR}/speechyyy"
