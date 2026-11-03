@@ -22,7 +22,7 @@ Speechyyy is an open-source, ultra-lightweight desktop dictation engine written 
 Clone the repository and run the automated installer:
 
 ```bash
-git clone https://github.com/achalsharma669/speechyyy.git
+git clone https://github.com/achalkumarsharma/speechyyy.git
 cd speechyyy
 ./install.sh
 ```
@@ -120,3 +120,4 @@ pacing_delay_ms = 15
 ## License
 
 MIT License.
+
