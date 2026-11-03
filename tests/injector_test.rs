@@ -178,6 +178,7 @@ fn test_create_injector_respects_config_method() {
 }
 
 #[test]
+#[ignore = "touches real /dev/uinput device and injects keystrokes"]
 fn test_uinput_isolated_send_text_or_permission_error() {
     let pacing = Duration::from_millis(10);
     match speechyyy::injector::UinputInjector::new(pacing) {
@@ -460,6 +461,7 @@ fn test_typewriter_modifier_settle_releases_all_held_modifiers() {
 }
 
 #[test]
+#[ignore = "touches real /dev/uinput device and injects keystrokes"]
 fn test_create_injector_supports_typewriter_method() {
     let mut config = Config::default();
     config.injector.method = "typewriter".into();
