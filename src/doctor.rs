@@ -194,10 +194,16 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
                 }
             };
 
-            let valid_types = ["whisper", "transducer", "moonshine", "sensevoice"];
+            let valid_types = [
+                "whisper",
+                "transducer",
+                "nemo_transducer",
+                "moonshine",
+                "sensevoice",
+            ];
             if !valid_types.contains(&custom_cfg.r#type.to_lowercase().as_str()) {
                 return Err(format!(
-                    "Unsupported custom model type '{}'. Supported types: whisper, transducer, moonshine, sensevoice",
+                    "Unsupported custom model type '{}'. Supported types: whisper, transducer, nemo_transducer, moonshine, sensevoice",
                     custom_cfg.r#type
                 ));
             }
@@ -254,7 +260,9 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
                         joiner.display()
                     ));
                 }
-            } else if custom_cfg.r#type.to_lowercase() == "transducer" {
+            } else if custom_cfg.r#type.to_lowercase() == "transducer"
+                || custom_cfg.r#type.to_lowercase() == "nemo_transducer"
+            {
                 return Err("Custom transducer model requires 'joiner' in [inference.custom]".into());
             }
 
@@ -938,6 +946,17 @@ mod tests {
 
         let ok_res = check_inference_for_config(&config).unwrap();
         assert!(ok_res.contains("Custom model: type='transducer' (all model files verified)"));
+
+        // 4. Test nemo_transducer type
+        config.inference.custom = Some(crate::config::CustomModelConfig {
+            r#type: "nemo_transducer".into(),
+            encoder: enc_path.clone(),
+            decoder: dec_path.clone(),
+            joiner: Some(join_path.clone()),
+            tokens: tok_path.clone(),
+        });
+        let ok_nemo = check_inference_for_config(&config).unwrap();
+        assert!(ok_nemo.contains("Custom model: type='nemo_transducer' (all model files verified)"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }

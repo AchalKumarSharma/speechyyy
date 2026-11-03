@@ -75,6 +75,9 @@ impl LocalSpeechInference {
                 config.decoder = decoder.to_string_lossy().to_string();
                 config.joiner = joiner.to_string_lossy().to_string();
                 config.tokens = tokens.to_string_lossy().to_string();
+                config.model_type = "nemo_transducer".to_string();
+                config.feature_dim = 128;
+                config.sample_rate = 16000;
                 config.provider = Some("cpu".to_string());
                 config.num_threads = 2;
                 let recognizer = TransducerRecognizer::new(config).map_err(|e| {
@@ -269,17 +272,25 @@ impl CustomSpeechInference {
         }
 
         match self.config.r#type.to_lowercase().as_str() {
-            "transducer" => {
+            "transducer" | "nemo_transducer" => {
                 let joiner = self.config.joiner.as_ref().ok_or_else(|| {
                     InferenceError::NotConfigured(
                         "Joiner path is required for custom transducer model".into(),
                     )
                 })?;
+                let is_nemo = self.config.r#type.to_lowercase() == "nemo_transducer";
                 let mut cfg = TransducerConfig::default();
                 cfg.encoder = self.config.encoder.to_string_lossy().to_string();
                 cfg.decoder = self.config.decoder.to_string_lossy().to_string();
                 cfg.joiner = joiner.to_string_lossy().to_string();
                 cfg.tokens = self.config.tokens.to_string_lossy().to_string();
+                cfg.model_type = if is_nemo {
+                    "nemo_transducer".to_string()
+                } else {
+                    "transducer".to_string()
+                };
+                cfg.feature_dim = if is_nemo { 128 } else { 80 };
+                cfg.sample_rate = 16000;
                 cfg.provider = Some("cpu".to_string());
                 cfg.num_threads = 2;
                 let rec = TransducerRecognizer::new(cfg).map_err(|e| {
@@ -410,6 +421,26 @@ mod tests {
                 assert!(msg.contains("speechyyy model download"));
             }
             other => panic!("Expected NotConfigured, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_custom_transducer_joiner_required() {
+        let temp_dir = std::env::temp_dir().join(format!("custom_test_{}", std::process::id()));
+        let config = CustomModelConfig {
+            r#type: "nemo_transducer".into(),
+            encoder: temp_dir.join("enc.onnx"),
+            decoder: temp_dir.join("dec.onnx"),
+            joiner: None,
+            tokens: temp_dir.join("tok.txt"),
+        };
+        let mut custom = CustomSpeechInference::new(config);
+        let err = custom.init_recognizer().unwrap_err();
+        match err {
+            InferenceError::NotConfigured(msg) => {
+                assert!(msg.contains("Joiner path is required"));
+            }
+            other => panic!("Expected NotConfigured for missing joiner, got {:?}", other),
         }
     }
 }

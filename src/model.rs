@@ -1,3 +1,4 @@
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::{self};
 use std::path::{Path, PathBuf};
 
@@ -213,18 +214,69 @@ impl ModelManager {
             .call()
             .map_err(|e| format!("Download request failed for {}: {}", url, e))?;
 
-        let reader = resp.into_reader();
-        let decompressor = bzip2::read::BzDecoder::new(reader);
+        let total_bytes = resp
+            .header("content-length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let pb = ProgressBar::new(total_bytes);
+        let style = ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("##-");
+        pb.set_style(style);
+
+        let temp_archive_path = target_dir.join(format!("{}.tar.bz2.part", model_type.folder_name()));
+        if temp_archive_path.exists() {
+            let _ = fs::remove_file(&temp_archive_path);
+        }
+
+        let mut reader = pb.wrap_read(resp.into_reader());
+        let mut dest_file = fs::File::create(&temp_archive_path).map_err(|e| {
+            format!(
+                "Failed to create temp archive {}: {}",
+                temp_archive_path.display(),
+                e
+            )
+        })?;
+
+        std::io::copy(&mut reader, &mut dest_file).map_err(|e| {
+            let _ = fs::remove_file(&temp_archive_path);
+            format!("Failed to download archive: {}", e)
+        })?;
+        drop(dest_file);
+
+        pb.set_message("Extracting archive...");
+
+        let archive_file = fs::File::open(&temp_archive_path).map_err(|e| {
+            let _ = fs::remove_file(&temp_archive_path);
+            format!(
+                "Failed to open downloaded archive {}: {}",
+                temp_archive_path.display(),
+                e
+            )
+        })?;
+        let decompressor = bzip2::read::BzDecoder::new(archive_file);
         let mut archive = tar::Archive::new(decompressor);
 
         for entry in archive
             .entries()
-            .map_err(|e| format!("Failed to read tar archive: {}", e))?
+            .map_err(|e| {
+                let _ = fs::remove_file(&temp_archive_path);
+                format!("Failed to read tar archive: {}", e)
+            })?
         {
-            let mut entry = entry.map_err(|e| format!("Failed to read tar entry: {}", e))?;
+            let mut entry = entry.map_err(|e| {
+                let _ = fs::remove_file(&temp_archive_path);
+                format!("Failed to read tar entry: {}", e)
+            })?;
             let path = entry
                 .path()
-                .map_err(|e| format!("Invalid path in tar: {}", e))?;
+                .map_err(|e| {
+                    let _ = fs::remove_file(&temp_archive_path);
+                    format!("Invalid path in tar: {}", e)
+                })?;
             let components: Vec<_> = path.components().collect();
             let relative_path: PathBuf = if components.len() > 1 {
                 components[1..].iter().collect()
@@ -243,17 +295,23 @@ impl ModelManager {
                 }
                 entry
                     .unpack(&dest)
-                    .map_err(|e| format!("Failed to extract file {}: {}", dest.display(), e))?;
+                    .map_err(|e| {
+                        let _ = fs::remove_file(&temp_archive_path);
+                        format!("Failed to extract file {}: {}", dest.display(), e)
+                    })?;
             }
         }
 
+        let _ = fs::remove_file(&temp_archive_path);
+
         let info = Self::verify_model_files(model_type, target_dir)?;
-        println!(
-            "Successfully verified {} ({:.1} MB, {} files).",
-            model_type.display_name(),
-            info.total_mb(),
-            info.file_count
+        let completion_msg = format!(
+            "[✓] Successfully installed {} to {}",
+            model_type.folder_name(),
+            target_dir.display()
         );
+        pb.finish_with_message(completion_msg.clone());
+        println!("{}", completion_msg);
 
         Ok(info)
     }
@@ -688,6 +746,95 @@ mod tests {
         let cfg = crate::config::Config::load_from_path(&config_file);
         assert_eq!(cfg.inference.provider, "local");
         assert_eq!(cfg.inference.model, "whisper-small");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_download_progress_bar_style_and_transitions() {
+        let template =
+            "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}";
+        let style = ProgressStyle::with_template(template).expect("valid template");
+        let pb = ProgressBar::new(1024);
+        pb.set_style(style);
+        pb.set_message("Downloading...");
+        pb.inc(512);
+
+        // Transition to extraction
+        pb.set_message("Extracting archive...");
+        assert_eq!(pb.message(), "Extracting archive...");
+
+        // Transition to completion
+        let completion = format!(
+            "[✓] Successfully installed {} to /tmp/path",
+            LocalModelType::ParakeetTdtV3.folder_name()
+        );
+        pb.finish_with_message(completion.clone());
+        assert_eq!(pb.message(), completion);
+    }
+
+    #[test]
+    fn test_archive_extraction_and_cleanup() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("model_archive_extract_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Build an in-memory tar.bz2 containing the Parakeet files
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        for filename in &["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"] {
+            let data = b"dummy onnx weights or tokens";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, format!("nested_root/{}", filename), &data[..])
+                .unwrap();
+        }
+        let tar_bytes = tar_builder.into_inner().unwrap();
+        let mut bz2_encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        std::io::Write::write_all(&mut bz2_encoder, &tar_bytes).unwrap();
+        let compressed_bytes = bz2_encoder.finish().unwrap();
+
+        // Write as .tar.bz2.part
+        let part_file = temp_dir.join(format!("{}.tar.bz2.part", LocalModelType::ParakeetTdtV3.folder_name()));
+        fs::write(&part_file, &compressed_bytes).unwrap();
+        assert!(part_file.exists());
+
+        // Perform decompression & unpacking loop like in download_model
+        let archive_file = fs::File::open(&part_file).unwrap();
+        let decompressor = bzip2::read::BzDecoder::new(archive_file);
+        let mut archive = tar::Archive::new(decompressor);
+
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap();
+            let components: Vec<_> = path.components().collect();
+            let relative_path: PathBuf = if components.len() > 1 {
+                components[1..].iter().collect()
+            } else {
+                path.to_path_buf()
+            };
+            if relative_path.as_os_str().is_empty() {
+                continue;
+            }
+            let dest = temp_dir.join(relative_path);
+            if entry.header().entry_type().is_dir() {
+                let _ = fs::create_dir_all(&dest);
+            } else {
+                if let Some(parent) = dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                entry.unpack(&dest).unwrap();
+            }
+        }
+
+        let _ = fs::remove_file(&part_file);
+        assert!(!part_file.exists());
+
+        let info = ModelManager::verify_model_files(LocalModelType::ParakeetTdtV3, &temp_dir).unwrap();
+        assert_eq!(info.file_count, 4);
 
         let _ = fs::remove_dir_all(temp_dir);
     }
