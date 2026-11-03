@@ -59,19 +59,28 @@ pub enum Command {
     /// Manage local speech recognition models
     Model {
         #[command(subcommand)]
-        action: ModelAction,
+        action: ModelCommands,
     },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
-pub enum ModelAction {
+pub enum ModelCommands {
     /// Download pre-converted INT8 quantized ONNX model weights
     Download {
         /// Target model architecture ('moonshine-tiny' or 'whisper-tiny')
         #[arg(short, long, default_value = "moonshine-tiny")]
         model: LocalModelType,
     },
+    /// List supported speech models
+    List,
+    /// Set the active speech model
+    Use {
+        /// Name of the model ('saaras:v4', 'moonshine-tiny', 'whisper-tiny')
+        model: String,
+    },
 }
+
+pub type ModelAction = ModelCommands;
 
 #[cfg(test)]
 mod tests {
@@ -168,6 +177,31 @@ mod tests {
             Command::Model {
                 action: ModelAction::Download {
                     model: LocalModelType::WhisperTiny,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_model_list() {
+        let cli = Cli::try_parse_from(["speechyyy", "model", "list"]).expect("parse model list");
+        assert_eq!(
+            cli.command,
+            Command::Model {
+                action: ModelCommands::List,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_model_use() {
+        let cli = Cli::try_parse_from(["speechyyy", "model", "use", "moonshine-tiny"])
+            .expect("parse model use");
+        assert_eq!(
+            cli.command,
+            Command::Model {
+                action: ModelCommands::Use {
+                    model: "moonshine-tiny".to_string(),
                 }
             }
         );

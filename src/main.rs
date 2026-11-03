@@ -4,7 +4,9 @@ use speechyyy::daemon::{check_status, start_daemon, stop_daemon};
 use speechyyy::doctor::{print_doctor_report, run_doctor, RealSysEnv};
 use speechyyy::history::{handle_fix_command, handle_history_command};
 use speechyyy::ipc::RuntimePaths;
-use speechyyy::model::handle_model_download_command;
+use speechyyy::model::{
+    handle_model_download_command, handle_model_list_command, handle_model_use_command,
+};
 use speechyyy::text::handle_learn_command;
 
 fn main() {
@@ -25,7 +27,11 @@ fn main() {
             Ok(())
         }
         Command::Model { action } => match action {
-            speechyyy::cli::ModelAction::Download { model } => handle_model_download_command(model),
+            speechyyy::cli::ModelCommands::Download { model } => {
+                handle_model_download_command(model)
+            }
+            speechyyy::cli::ModelCommands::List => handle_model_list_command(),
+            speechyyy::cli::ModelCommands::Use { model } => handle_model_use_command(&model),
         },
         Command::Start {
             foreground,
