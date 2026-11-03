@@ -22,7 +22,7 @@ Speechyyy is an open-source, ultra-lightweight desktop dictation engine written 
 Install the pre-compiled binary and set up system permissions automatically:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/achalkumarsharma/speechyyy/master/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/AchalKumarSharma/speechyyy/main/install.sh)"
 ```
 
 ### Build from Source
