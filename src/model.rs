@@ -575,6 +575,81 @@ pub fn handle_model_use_command(model_arg: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                total += dir_size(&p);
+            } else if let Ok(meta) = p.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+pub fn handle_model_remove_internal(
+    model_name: &str,
+    models_dir: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<(), String> {
+    let trimmed = model_name.trim();
+    if trimmed.is_empty() {
+        return Err("Model name cannot be empty".to_string());
+    }
+
+    let base_dir = models_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(ModelManager::default_models_dir);
+
+    let target_dir = if let Some(lt) = LocalModelType::from_str_name(trimmed) {
+        let preset_dir = base_dir.join(lt.folder_name());
+        if preset_dir.exists() {
+            preset_dir
+        } else {
+            base_dir.join(trimmed)
+        }
+    } else {
+        base_dir.join(trimmed)
+    };
+
+    if !target_dir.exists() {
+        println!("[!] Model '{}' is not installed locally.", trimmed);
+        return Ok(());
+    }
+
+    let size_bytes = dir_size(&target_dir);
+    let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
+
+    let cfg = match config_path {
+        Some(cp) => crate::config::Config::load_from_path(cp),
+        None => crate::config::Config::load(),
+    };
+
+    if is_model_active(&cfg, trimmed) {
+        println!(
+            "[!] Notice: '{}' is currently your active model. Run 'speechyyy use <OTHER_MODEL>' before starting the daemon.",
+            trimmed
+        );
+    }
+
+    fs::remove_dir_all(&target_dir)
+        .map_err(|e| format!("Failed to remove model directory {}: {}", target_dir.display(), e))?;
+
+    println!(
+        "[✓] Successfully removed '{}' (freed {:.1} MB)",
+        trimmed, size_mb
+    );
+
+    Ok(())
+}
+
+pub fn handle_model_remove(model_name: &str) -> Result<(), String> {
+    handle_model_remove_internal(model_name, None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

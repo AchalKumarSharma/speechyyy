@@ -1,8 +1,11 @@
 use clap::Parser;
 use speechyyy::cli::{Cli, Command, ModelCommands};
 use speechyyy::config::Config;
+use speechyyy::daemon::handle_uninstall_command_internal;
+use speechyyy::ipc::RuntimePaths;
 use speechyyy::model::{
-    format_model_list_with_models_dir, handle_model_use_command_internal, LocalModelType,
+    format_model_list_with_models_dir, handle_model_remove_internal,
+    handle_model_use_command_internal, LocalModelType,
 };
 use std::fs;
 
@@ -230,6 +233,86 @@ fn test_unlearn_command_lifecycle() {
     // 3. Remove with missing key argument
     let res_none = handle_unlearn_command_internal(None, Some(&dict_path));
     assert!(res_none.is_ok());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn test_model_remove_lifecycle() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("test_model_remove_lifecycle_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let models_dir = temp_dir.join("models");
+    let config_path = temp_dir.join("config.toml");
+
+    let parakeet_dir = models_dir.join("parakeet-tdt-v3");
+    fs::create_dir_all(&parakeet_dir).unwrap();
+    fs::write(parakeet_dir.join("encoder.int8.onnx"), vec![0u8; 1024 * 1024]).unwrap();
+
+    Config::update_active_model_in_file(&config_path, "local", "parakeet-tdt-v3").unwrap();
+
+    // 1. Remove active model
+    let res = handle_model_remove_internal("parakeet-tdt-v3", Some(&models_dir), Some(&config_path));
+    assert!(res.is_ok());
+    assert!(!parakeet_dir.exists());
+
+    // 2. Remove already removed / non-existent model
+    let res_missing =
+        handle_model_remove_internal("parakeet-tdt-v3", Some(&models_dir), Some(&config_path));
+    assert!(res_missing.is_ok());
+
+    // 3. Remove using alias
+    let turbo_dir = models_dir.join("whisper-large-v3-turbo");
+    fs::create_dir_all(&turbo_dir).unwrap();
+    fs::write(turbo_dir.join("turbo-encoder.int8.onnx"), b"turbo").unwrap();
+    assert!(turbo_dir.exists());
+
+    let res_alias =
+        handle_model_remove_internal("whisper-turbo", Some(&models_dir), Some(&config_path));
+    assert!(res_alias.is_ok());
+    assert!(!turbo_dir.exists());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn test_uninstall_command_lifecycle() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("test_uninstall_lifecycle_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let home_dir = temp_dir.join("mock_home");
+    let config_dir = home_dir.join(".config").join("speechyyy");
+    let share_dir = home_dir.join(".local").join("share").join("speechyyy");
+    let cargo_bin = home_dir.join(".cargo").join("bin").join("speechyyy");
+    let local_bin = home_dir.join(".local").join("bin").join("speechyyy");
+
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("config.toml"), b"# config").unwrap();
+    fs::create_dir_all(&share_dir).unwrap();
+    fs::write(share_dir.join("dummy.dat"), b"data").unwrap();
+    fs::create_dir_all(cargo_bin.parent().unwrap()).unwrap();
+    fs::write(&cargo_bin, b"binary").unwrap();
+    fs::create_dir_all(local_bin.parent().unwrap()).unwrap();
+    fs::write(&local_bin, b"binary").unwrap();
+
+    let paths = RuntimePaths::with_dir(temp_dir.join("runtime"));
+
+    // 1. Uninstall without purge: nothing is deleted
+    let res_no_purge = handle_uninstall_command_internal(false, &paths, Some(&home_dir));
+    assert!(res_no_purge.is_ok());
+    assert!(config_dir.exists());
+    assert!(share_dir.exists());
+    assert!(cargo_bin.exists());
+    assert!(local_bin.exists());
+
+    // 2. Uninstall with purge: everything is purged
+    let res_purge = handle_uninstall_command_internal(true, &paths, Some(&home_dir));
+    assert!(res_purge.is_ok());
+    assert!(!config_dir.exists());
+    assert!(!share_dir.exists());
+    assert!(!cargo_bin.exists());
+    assert!(!local_bin.exists());
 
     let _ = fs::remove_dir_all(temp_dir);
 }

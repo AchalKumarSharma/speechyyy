@@ -59,6 +59,18 @@ pub enum Command {
         /// Name of the model preset ('saaras:v4', 'parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
         model: String,
     },
+    /// Delete local model weights to free disk space (alias: rm)
+    #[command(alias = "rm", alias = "delete")]
+    Remove {
+        /// Name of the model to remove ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
+        model: String,
+    },
+    /// Stop daemon and clean up local data/configuration
+    Uninstall {
+        /// Purge all models, configs, dictionaries, and user-space binaries
+        #[arg(long)]
+        purge: bool,
+    },
     /// Add a phonetic replacement rule to dictionary.toml
     Learn {
         /// The incorrect phrase heard by the speech model
@@ -100,6 +112,12 @@ pub enum ModelCommands {
     /// Set the active speech model
     Use {
         /// Name of the model preset ('saaras:v4', 'parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
+        model: String,
+    },
+    /// Delete local model weights to free disk space (alias: rm)
+    #[command(alias = "rm", alias = "delete")]
+    Remove {
+        /// Name of the model to remove ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
         model: String,
     },
 }
@@ -336,6 +354,58 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_remove_and_aliases() {
+        let cli_remove =
+            Cli::try_parse_from(["speechyyy", "remove", "parakeet-tdt-v3"]).expect("parse remove");
+        assert_eq!(
+            cli_remove.command,
+            Command::Remove {
+                model: "parakeet-tdt-v3".to_string(),
+            }
+        );
+
+        let cli_rm =
+            Cli::try_parse_from(["speechyyy", "rm", "whisper-small"]).expect("parse rm");
+        assert_eq!(
+            cli_rm.command,
+            Command::Remove {
+                model: "whisper-small".to_string(),
+            }
+        );
+
+        let cli_delete =
+            Cli::try_parse_from(["speechyyy", "delete", "moonshine-base"]).expect("parse delete");
+        assert_eq!(
+            cli_delete.command,
+            Command::Remove {
+                model: "moonshine-base".to_string(),
+            }
+        );
+
+        let cli_model_rm =
+            Cli::try_parse_from(["speechyyy", "model", "remove", "parakeet-tdt-v3"])
+                .expect("parse model remove");
+        assert_eq!(
+            cli_model_rm.command,
+            Command::Models {
+                action: Some(ModelCommands::Remove {
+                    model: "parakeet-tdt-v3".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_uninstall() {
+        let cli = Cli::try_parse_from(["speechyyy", "uninstall"]).expect("parse uninstall");
+        assert_eq!(cli.command, Command::Uninstall { purge: false });
+
+        let cli_purge =
+            Cli::try_parse_from(["speechyyy", "uninstall", "--purge"]).expect("parse uninstall purge");
+        assert_eq!(cli_purge.command, Command::Uninstall { purge: true });
+    }
+
+    #[test]
     fn test_help_metadata_tagline_and_hotkey_guidance() {
         use clap::CommandFactory;
         let mut cmd = Cli::command();
@@ -348,6 +418,8 @@ mod tests {
         assert!(help.contains("models"));
         assert!(help.contains("download"));
         assert!(help.contains("use"));
+        assert!(help.contains("remove"));
+        assert!(help.contains("uninstall"));
         assert!(help.contains("unlearn"));
     }
 }

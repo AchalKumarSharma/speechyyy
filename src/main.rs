@@ -1,11 +1,12 @@
 use clap::Parser;
 use speechyyy::cli::{Cli, Command, ModelCommands};
-use speechyyy::daemon::{check_status, start_daemon, stop_daemon};
+use speechyyy::daemon::{check_status, handle_uninstall_command, start_daemon, stop_daemon};
 use speechyyy::doctor::{print_doctor_report, run_doctor, RealSysEnv};
 use speechyyy::history::{handle_fix_command_opts, handle_history_command};
 use speechyyy::ipc::RuntimePaths;
 use speechyyy::model::{
-    handle_model_download_command, handle_model_list_command, handle_model_use_command,
+    handle_model_download_command, handle_model_list_command, handle_model_remove,
+    handle_model_use_command,
 };
 use speechyyy::text::{handle_learn_command_opts, handle_unlearn_command};
 
@@ -38,12 +39,15 @@ fn main() {
             }
             Some(ModelCommands::List) | None => handle_model_list_command(),
             Some(ModelCommands::Use { model }) => handle_model_use_command(&model),
+            Some(ModelCommands::Remove { model }) => handle_model_remove(&model),
         },
         Command::Download { model, model_flag } => {
             let target = ModelCommands::resolved_download_model(model, model_flag);
             handle_model_download_command(target)
         }
         Command::Use { model } => handle_model_use_command(&model),
+        Command::Remove { model } => handle_model_remove(&model),
+        Command::Uninstall { purge } => handle_uninstall_command(purge),
         Command::Start {
             foreground,
             provider,

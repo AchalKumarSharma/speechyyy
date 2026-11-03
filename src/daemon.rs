@@ -9,7 +9,9 @@ use crate::injector::{create_injector, TextInjector};
 use crate::input::{EvdevListener, InputEventSource};
 use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, PidFile, RuntimePaths};
 use crate::text::{LearningDictionary, TextFormatter, TextPipeline};
+use std::fs;
 use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -345,4 +347,63 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
 
     println!("[INACTIVE] Speechyyy daemon is not running.");
     Ok(())
+}
+
+pub fn handle_uninstall_command_internal(
+    purge: bool,
+    paths: &RuntimePaths,
+    home_dir: Option<&Path>,
+) -> Result<(), String> {
+    let pid = PidFile::read_pid(&paths.pid_path);
+    let is_running = paths.socket_path.exists() || pid.map_or(false, PidFile::is_process_running);
+    if is_running {
+        println!("Stopping running Speechyyy daemon...");
+        let _ = stop_daemon(paths);
+    }
+
+    if purge {
+        let home = match home_dir {
+            Some(h) => h.to_path_buf(),
+            None => {
+                let h = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                PathBuf::from(h)
+            }
+        };
+
+        // 1. Remove ~/.local/share/speechyyy/
+        let data_dir = home.join(".local").join("share").join("speechyyy");
+        if data_dir.exists() {
+            let _ = fs::remove_dir_all(&data_dir);
+        }
+
+        // 2. Remove ~/.config/speechyyy/
+        let config_dir = home.join(".config").join("speechyyy");
+        if config_dir.exists() {
+            let _ = fs::remove_dir_all(&config_dir);
+        }
+
+        // 3. User-space binaries
+        let cargo_bin = home.join(".cargo").join("bin").join("speechyyy");
+        if cargo_bin.exists() {
+            let _ = fs::remove_file(&cargo_bin);
+        }
+        let local_bin = home.join(".local").join("bin").join("speechyyy");
+        if local_bin.exists() {
+            let _ = fs::remove_file(&local_bin);
+        }
+
+        paths.cleanup();
+        println!("[✓] Purged all Speechyyy models, configuration, and data.");
+    } else {
+        println!(
+            "Speechyyy cleanup options:\n - Free space from a model: speechyyy remove <MODEL>\n - Purge all models, configs, and dictionaries: speechyyy uninstall --purge\n - Remove binary: cargo uninstall speechyyy (or rm $(which speechyyy))"
+        );
+    }
+
+    Ok(())
+}
+
+pub fn handle_uninstall_command(purge: bool) -> Result<(), String> {
+    let paths = RuntimePaths::new();
+    handle_uninstall_command_internal(purge, &paths, None)
 }
