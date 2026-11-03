@@ -67,15 +67,15 @@ pub enum Command {
 pub enum ModelCommands {
     /// Download pre-converted INT8 quantized ONNX model weights
     Download {
-        /// Target model architecture ('moonshine-tiny' or 'whisper-tiny')
-        #[arg(short, long, default_value = "moonshine-tiny")]
+        /// Target model architecture ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
+        #[arg(short, long, default_value = "parakeet-tdt-v3")]
         model: LocalModelType,
     },
     /// List supported speech models
     List,
     /// Set the active speech model
     Use {
-        /// Name of the model ('saaras:v4', 'moonshine-tiny', 'whisper-tiny')
+        /// Name of the model preset ('saaras:v4', 'parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
         model: String,
     },
 }
@@ -170,13 +170,13 @@ mod tests {
     #[test]
     fn test_parse_model_download() {
         let cli =
-            Cli::try_parse_from(["speechyyy", "model", "download", "--model", "whisper-tiny"])
+            Cli::try_parse_from(["speechyyy", "model", "download", "--model", "parakeet-tdt-v3"])
                 .expect("parse model download");
         assert_eq!(
             cli.command,
             Command::Model {
                 action: ModelAction::Download {
-                    model: LocalModelType::WhisperTiny,
+                    model: LocalModelType::ParakeetTdtV3,
                 }
             }
         );
@@ -195,13 +195,13 @@ mod tests {
 
     #[test]
     fn test_parse_model_use() {
-        let cli = Cli::try_parse_from(["speechyyy", "model", "use", "moonshine-tiny"])
+        let cli = Cli::try_parse_from(["speechyyy", "model", "use", "parakeet-tdt-v3"])
             .expect("parse model use");
         assert_eq!(
             cli.command,
             Command::Model {
                 action: ModelCommands::Use {
-                    model: "moonshine-tiny".to_string(),
+                    model: "parakeet-tdt-v3".to_string(),
                 }
             }
         );

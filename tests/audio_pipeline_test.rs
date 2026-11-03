@@ -267,7 +267,7 @@ fn test_audio_pipeline_e2e_micro_tap_rejected() {
 
 #[test]
 fn test_audio_pipeline_differential_mic_and_dc_offset_repro() {
-    let model_dir = ModelManager::model_dir(LocalModelType::MoonshineTiny);
+    let model_dir = ModelManager::model_dir(LocalModelType::MoonshineBase);
     let wav_path = Path::new("tests/test_data/0.wav");
     if !model_dir.exists() || !wav_path.exists() {
         eprintln!("Skipping repro test: model or test wav not found");
@@ -304,7 +304,7 @@ fn test_audio_pipeline_differential_mic_and_dc_offset_repro() {
     assert!(metrics.rms > 0.01);
 
     // Decoder must transcribe valid speech rather than returning an empty string
-    let mut local = LocalSpeechInference::new(LocalModelType::MoonshineTiny, model_dir);
+    let mut local = LocalSpeechInference::new(LocalModelType::MoonshineBase, model_dir);
     let transcript = local
         .transcribe(&processed_chunk)
         .expect("Transcription must succeed");

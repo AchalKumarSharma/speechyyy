@@ -65,7 +65,7 @@ fn test_local_dictation_pipeline_e2e_with_dictionary_and_history() {
     };
 
     // 1. Point to real Moonshine model assets
-    let model_dir = speechyyy::model::ModelManager::model_dir(LocalModelType::MoonshineTiny);
+    let model_dir = speechyyy::model::ModelManager::model_dir(LocalModelType::MoonshineBase);
     if !model_dir.exists() {
         eprintln!(
             "Skipping e2e local test: Moonshine model not found at {}",
@@ -90,7 +90,7 @@ fn test_local_dictation_pipeline_e2e_with_dictionary_and_history() {
     let speech_chunk = AudioChunk::new(samples);
     let capture = MockAudioCapture::with_queued_chunk(speech_chunk);
     let vad = EnergyVad::default();
-    let inference = LocalSpeechInference::new(LocalModelType::MoonshineTiny, model_dir);
+    let inference = LocalSpeechInference::new(LocalModelType::MoonshineBase, model_dir);
 
     let engine = AudioDictationEngine::with_pipeline_and_history(
         capture,

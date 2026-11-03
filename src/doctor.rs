@@ -159,8 +159,15 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
         }
         "mock" => Ok("Mock provider (mock)".into()),
         "local" => {
-            let model_type = crate::model::LocalModelType::from_str_name(&config.inference.model)
-                .unwrap_or(crate::model::LocalModelType::MoonshineTiny);
+            let model_type = match crate::model::LocalModelType::from_str_name(&config.inference.model) {
+                Some(m) => m,
+                None => {
+                    return Err(format!(
+                        "Unknown local model '{}'. Supported models: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base",
+                        config.inference.model
+                    ));
+                }
+            };
             let model_dir = crate::model::ModelManager::model_dir(model_type);
             match crate::model::ModelManager::verify_model_files(model_type, &model_dir) {
                 Ok(info) => Ok(format!(
@@ -170,15 +177,100 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
                     info.file_count
                 )),
                 Err(err) => Err(format!(
-                    "Local model missing at {}: {}. Run 'speechyyy model download' to fetch weights.",
+                    "Local model missing at {}: {}. Run 'speechyyy model download -m {}' to fetch weights.",
                     model_dir.display(),
-                    err
+                    err,
+                    model_type.folder_name()
                 )),
             }
         }
+        "custom" => {
+            let custom_cfg = match &config.inference.custom {
+                Some(c) => c,
+                None => {
+                    return Err(
+                        "Inference provider is 'custom' but [inference.custom] is missing in config.toml".into()
+                    );
+                }
+            };
+
+            let valid_types = ["whisper", "transducer", "moonshine", "sensevoice"];
+            if !valid_types.contains(&custom_cfg.r#type.to_lowercase().as_str()) {
+                return Err(format!(
+                    "Unsupported custom model type '{}'. Supported types: whisper, transducer, moonshine, sensevoice",
+                    custom_cfg.r#type
+                ));
+            }
+
+            if !custom_cfg.encoder.exists() {
+                return Err(format!(
+                    "Custom model encoder file not found: {}",
+                    custom_cfg.encoder.display()
+                ));
+            }
+            if fs::File::open(&custom_cfg.encoder).is_err() {
+                return Err(format!(
+                    "Custom model encoder file unreadable: {}",
+                    custom_cfg.encoder.display()
+                ));
+            }
+
+            if !custom_cfg.decoder.exists() {
+                return Err(format!(
+                    "Custom model decoder file not found: {}",
+                    custom_cfg.decoder.display()
+                ));
+            }
+            if fs::File::open(&custom_cfg.decoder).is_err() {
+                return Err(format!(
+                    "Custom model decoder file unreadable: {}",
+                    custom_cfg.decoder.display()
+                ));
+            }
+
+            if !custom_cfg.tokens.exists() {
+                return Err(format!(
+                    "Custom model tokens file not found: {}",
+                    custom_cfg.tokens.display()
+                ));
+            }
+            if fs::File::open(&custom_cfg.tokens).is_err() {
+                return Err(format!(
+                    "Custom model tokens file unreadable: {}",
+                    custom_cfg.tokens.display()
+                ));
+            }
+
+            if let Some(ref joiner) = custom_cfg.joiner {
+                if !joiner.exists() {
+                    return Err(format!(
+                        "Custom model joiner file not found: {}",
+                        joiner.display()
+                    ));
+                }
+                if fs::File::open(joiner).is_err() {
+                    return Err(format!(
+                        "Custom model joiner file unreadable: {}",
+                        joiner.display()
+                    ));
+                }
+            } else if custom_cfg.r#type.to_lowercase() == "transducer" {
+                return Err("Custom transducer model requires 'joiner' in [inference.custom]".into());
+            }
+
+            Ok(format!(
+                "Custom model: type='{}' (all model files verified)",
+                custom_cfg.r#type
+            ))
+        }
+        #[cfg(target_os = "macos")]
+        "apple" => Ok("Apple Speech Native (apple-speech)".into()),
+        #[cfg(not(target_os = "macos"))]
+        "apple" => Err("Apple Speech provider is only supported on macOS".into()),
         other => Err(format!(
-            "Unknown inference provider '{}'. Supported providers are 'mock', 'sarvam', 'local'.",
-            other
+            "Unknown inference provider '{}'. Supported providers are 'mock', 'sarvam', 'local', 'custom'{}.",
+            other,
+            if cfg!(target_os = "macos") { ", 'apple'" } else { "" }
         )),
     }
 }
@@ -806,5 +898,62 @@ mod tests {
         config.inference.provider = "mock".into();
         let mock_res = check_inference_for_config(&config).expect("mock should succeed");
         assert_eq!(mock_res, "Mock provider (mock)");
+    }
+
+    #[test]
+    fn test_check_inference_for_config_custom_valid_and_missing_paths() {
+        let temp_dir = std::env::temp_dir().join(format!("doctor_custom_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.inference.provider = "custom".into();
+
+        // 1. Missing [inference.custom]
+        let err1 = check_inference_for_config(&config).unwrap_err();
+        assert!(err1.contains("[inference.custom] is missing"));
+
+        // 2. Paths missing on disk
+        let enc_path = temp_dir.join("encoder.onnx");
+        let dec_path = temp_dir.join("decoder.onnx");
+        let tok_path = temp_dir.join("tokens.txt");
+        let join_path = temp_dir.join("joiner.onnx");
+
+        config.inference.custom = Some(crate::config::CustomModelConfig {
+            r#type: "transducer".into(),
+            encoder: enc_path.clone(),
+            decoder: dec_path.clone(),
+            joiner: Some(join_path.clone()),
+            tokens: tok_path.clone(),
+        });
+
+        let err2 = check_inference_for_config(&config).unwrap_err();
+        assert!(err2.contains("encoder file not found"));
+
+        // 3. Create all files -> passes
+        fs::write(&enc_path, b"model data").unwrap();
+        fs::write(&dec_path, b"model data").unwrap();
+        fs::write(&tok_path, b"model data").unwrap();
+        fs::write(&join_path, b"model data").unwrap();
+
+        let ok_res = check_inference_for_config(&config).unwrap();
+        assert!(ok_res.contains("Custom model: type='transducer' (all model files verified)"));
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_check_inference_for_config_local_curated_models() {
+        let mut config = crate::config::Config::default();
+        config.inference.provider = "local".into();
+        config.inference.model = "non-existent-model".into();
+
+        let err = check_inference_for_config(&config).unwrap_err();
+        assert!(err.contains("Unknown local model 'non-existent-model'"));
+        assert!(err.contains("parakeet-tdt-v3"));
+
+        config.inference.model = "parakeet-tdt-v3".into();
+        let err_missing = check_inference_for_config(&config).unwrap_err();
+        assert!(err_missing.contains("speechyyy model download -m parakeet-tdt-v3"));
     }
 }

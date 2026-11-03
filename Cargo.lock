@@ -1521,6 +1521,7 @@ dependencies = [
 name = "speechyyy"
 version = "0.1.0"
 dependencies = [
+ "bzip2",
  "clap",
  "cpal",
  "evdev",
@@ -1530,6 +1531,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sherpa-rs",
+ "tar",
  "toml",
  "ureq",
 ]

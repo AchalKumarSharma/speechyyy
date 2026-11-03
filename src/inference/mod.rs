@@ -69,15 +69,26 @@ pub fn create_inference_provider(
         }
         "local" => {
             let model_type = crate::model::LocalModelType::from_str_name(&config.model)
-                .unwrap_or(crate::model::LocalModelType::MoonshineTiny);
+                .unwrap_or(crate::model::LocalModelType::ParakeetTdtV3);
             let model_dir = crate::model::ModelManager::model_dir(model_type);
             Ok(Box::new(local::LocalSpeechInference::new(
                 model_type, model_dir,
             )))
         }
+        "custom" => {
+            let custom_cfg = config.custom.as_ref().ok_or_else(|| {
+                "Inference provider is 'custom' but [inference.custom] is not configured in config.toml".to_string()
+            })?;
+            Ok(Box::new(local::CustomSpeechInference::new(custom_cfg.clone())))
+        }
+        #[cfg(target_os = "macos")]
+        "apple" => {
+            Ok(Box::new(mock::MockSpeechInference::new()))
+        }
         other => Err(format!(
-            "Unknown inference provider '{}'. Supported providers are: 'mock', 'sarvam', 'local'.",
-            other
+            "Unknown inference provider '{}'. Supported providers are: 'mock', 'sarvam', 'local', 'custom'{}.",
+            other,
+            if cfg!(target_os = "macos") { ", 'apple'" } else { "" }
         )),
     }
 }

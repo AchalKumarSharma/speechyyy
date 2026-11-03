@@ -65,6 +65,15 @@ fn default_mode() -> String {
     "translit".to_string()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomModelConfig {
+    pub r#type: String, // "whisper", "transducer", "moonshine", "sensevoice"
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub joiner: Option<PathBuf>,
+    pub tokens: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferenceConfig {
     #[serde(default = "default_provider")]
@@ -77,6 +86,8 @@ pub struct InferenceConfig {
     pub language_code: String,
     #[serde(default = "default_mode", alias = "sarvam_mode")]
     pub mode: String,
+    #[serde(default)]
+    pub custom: Option<CustomModelConfig>,
 }
 
 impl Default for InferenceConfig {
@@ -87,6 +98,7 @@ impl Default for InferenceConfig {
             model: default_model(),
             language_code: default_language_code(),
             mode: default_mode(),
+            custom: None,
         }
     }
 }
@@ -445,6 +457,29 @@ mode = "codemix"
     }
 
     #[test]
+    fn test_custom_model_config_deserialization() {
+        let toml_data = r#"
+[inference]
+provider = "custom"
+
+[inference.custom]
+type = "transducer"
+encoder = "/path/to/encoder.onnx"
+decoder = "/path/to/decoder.onnx"
+joiner = "/path/to/joiner.onnx"
+tokens = "/path/to/tokens.txt"
+"#;
+        let cfg: Config = toml::from_str(toml_data).expect("parse custom config");
+        assert_eq!(cfg.inference.provider, "custom");
+        let custom = cfg.inference.custom.expect("custom config present");
+        assert_eq!(custom.r#type, "transducer");
+        assert_eq!(custom.encoder, PathBuf::from("/path/to/encoder.onnx"));
+        assert_eq!(custom.decoder, PathBuf::from("/path/to/decoder.onnx"));
+        assert_eq!(custom.joiner, Some(PathBuf::from("/path/to/joiner.onnx")));
+        assert_eq!(custom.tokens, PathBuf::from("/path/to/tokens.txt"));
+    }
+
+    #[test]
     fn test_update_active_model_in_config_file() {
         let temp_dir = std::env::temp_dir().join(format!("speechyyy_cfg_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&temp_dir);
@@ -474,11 +509,11 @@ model = "saaras:v4"
 "#;
         fs::write(&config_file, custom_toml).unwrap();
 
-        Config::update_active_model_in_file(&config_file, "local", "moonshine-tiny")
+        Config::update_active_model_in_file(&config_file, "local", "parakeet-tdt-v3")
             .expect("update existing config file");
         let updated = Config::load_from_path(&config_file);
         assert_eq!(updated.inference.provider, "local");
-        assert_eq!(updated.inference.model, "moonshine-tiny");
+        assert_eq!(updated.inference.model, "parakeet-tdt-v3");
         assert_eq!(updated.hotkey, "Ctrl+Space");
         assert_eq!(updated.pacing_delay_ms, 42);
         assert_eq!(updated.audio.sample_rate, 48000);

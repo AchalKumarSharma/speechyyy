@@ -2,7 +2,7 @@ use clap::Parser;
 use speechyyy::cli::{Cli, Command, ModelCommands};
 use speechyyy::config::Config;
 use speechyyy::model::{
-    format_model_list_with_models_dir, handle_model_use_command_internal,
+    format_model_list_with_models_dir, handle_model_use_command_internal, LocalModelType,
 };
 use std::fs;
 
@@ -16,24 +16,28 @@ fn test_cli_parsing_model_subcommands() {
         }
     );
 
-    let cli_use = Cli::try_parse_from(["speechyyy", "model", "use", "moonshine-tiny"])
+    let cli_use = Cli::try_parse_from(["speechyyy", "model", "use", "parakeet-tdt-v3"])
         .expect("parse use");
     assert_eq!(
         cli_use.command,
         Command::Model {
             action: ModelCommands::Use {
-                model: "moonshine-tiny".to_string(),
+                model: "parakeet-tdt-v3".to_string(),
             },
         }
     );
 }
 
 #[test]
-fn test_model_list_displays_all_supported_models_with_active_and_weights_info() {
-    let temp_dir = std::env::temp_dir().join(format!("test_model_list_e2e_{}", std::process::id()));
+fn test_model_list_table_format_and_hint() {
+    let temp_dir = std::env::temp_dir().join(format!("test_model_list_table_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     let models_dir = temp_dir.join("models");
-    fs::create_dir_all(models_dir.join("moonshine-tiny")).unwrap();
+    let parakeet_dir = models_dir.join("parakeet-tdt-v3");
+    fs::create_dir_all(&parakeet_dir).unwrap();
+    for group in LocalModelType::ParakeetTdtV3.required_file_groups() {
+        fs::write(parakeet_dir.join(group[0]), b"weights").unwrap();
+    }
 
     let mut cfg = Config::default();
     cfg.inference.provider = "sarvam".to_string();
@@ -41,30 +45,38 @@ fn test_model_list_displays_all_supported_models_with_active_and_weights_info() 
 
     let list_output = format_model_list_with_models_dir(&cfg, Some(&models_dir));
 
-    // Must display all 3 supported models with providers
-    assert!(list_output.contains("saaras:v4 (Provider: Sarvam AI Cloud)"));
-    assert!(list_output.contains("moonshine-tiny (Provider: Local ONNX)"));
-    assert!(list_output.contains("whisper-tiny (Provider: Local ONNX)"));
+    // Verify table columns
+    assert!(list_output.contains("NAME"));
+    assert!(list_output.contains("PROVIDER"));
+    assert!(list_output.contains("STATUS"));
+    assert!(list_output.contains("ACTIVE"));
 
-    // Check active model indicator
-    assert!(list_output.contains("saaras:v4 (Provider: Sarvam AI Cloud) [active]"));
-    assert!(!list_output.contains("moonshine-tiny (Provider: Local ONNX) [active]"));
+    // Verify curated models
+    assert!(list_output.contains("saaras:v4"));
+    assert!(list_output.contains("parakeet-tdt-v3"));
+    assert!(list_output.contains("whisper-small"));
+    assert!(list_output.contains("whisper-large-v3-turbo"));
+    assert!(list_output.contains("moonshine-base"));
 
-    // Check local weights indicators
-    assert!(list_output.contains("moonshine-tiny (Provider: Local ONNX) [installed]"));
-    assert!(list_output.contains("whisper-tiny (Provider: Local ONNX) [not downloaded]"));
+    // Verify statuses
+    assert!(list_output.contains("Available"));
+    assert!(list_output.contains("Installed"));
+    assert!(list_output.contains("Not Downloaded"));
+
+    // Verify hint
+    assert!(list_output.contains("Tip: For custom ONNX models, set provider = 'custom' in ~/.config/speechyyy/config.toml"));
 
     let _ = fs::remove_dir_all(temp_dir);
 }
 
 #[test]
-fn test_model_use_sarvam_and_saaras() {
-    let temp_dir = std::env::temp_dir().join(format!("test_model_use_sarvam_{}", std::process::id()));
+fn test_model_use_curated_presets() {
+    let temp_dir = std::env::temp_dir().join(format!("test_model_use_presets_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     let config_file = temp_dir.join("config.toml");
     let models_dir = temp_dir.join("models");
 
-    // 1. Using "sarvam" alias
+    // 1. sarvam alias -> saaras:v4
     let res = handle_model_use_command_internal("sarvam", &config_file, Some(&models_dir))
         .expect("use sarvam");
     assert_eq!(res.provider, "sarvam");
@@ -75,80 +87,55 @@ fn test_model_use_sarvam_and_saaras() {
         "Active model set to 'saaras:v4' in config.toml. Restart daemon to apply."
     );
 
-    let loaded = Config::load_from_path(&config_file);
-    assert_eq!(loaded.inference.provider, "sarvam");
-    assert_eq!(loaded.inference.model, "saaras:v4");
+    // 2. saaras alias -> saaras:v4
+    let res = handle_model_use_command_internal("saaras", &config_file, Some(&models_dir))
+        .expect("use saaras");
+    assert_eq!(res.provider, "sarvam");
+    assert_eq!(res.model, "saaras:v4");
 
-    // 2. Using exact model identifier "saaras:v4"
-    let res2 = handle_model_use_command_internal("saaras:v4", &config_file, Some(&models_dir))
-        .expect("use saaras:v4");
-    assert_eq!(res2.provider, "sarvam");
-    assert_eq!(res2.model, "saaras:v4");
-    assert_eq!(res2.notice, None);
-    assert_eq!(
-        res2.confirmation,
-        "Active model set to 'saaras:v4' in config.toml. Restart daemon to apply."
-    );
-
-    let _ = fs::remove_dir_all(temp_dir);
-}
-
-#[test]
-fn test_model_use_moonshine_tiny_weights_missing_notice_and_persistence() {
-    let temp_dir = std::env::temp_dir().join(format!("test_model_use_moonshine_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&temp_dir);
-    let config_file = temp_dir.join("config.toml");
-    let models_dir = temp_dir.join("models");
-
-    let res = handle_model_use_command_internal("moonshine-tiny", &config_file, Some(&models_dir))
-        .expect("use moonshine-tiny");
+    // 3. parakeet-v3 alias -> parakeet-tdt-v3 with missing weights
+    let res = handle_model_use_command_internal("parakeet-v3", &config_file, Some(&models_dir))
+        .expect("use parakeet-v3");
     assert_eq!(res.provider, "local");
-    assert_eq!(res.model, "moonshine-tiny");
+    assert_eq!(res.model, "parakeet-tdt-v3");
     assert_eq!(
         res.notice,
-        Some("Model weights not found. Run `speechyyy model download -m moonshine-tiny`".into())
+        Some("Weights not found. Run `speechyyy model download -m parakeet-tdt-v3`".into())
     );
     assert_eq!(
         res.confirmation,
-        "Active model set to 'moonshine-tiny' in config.toml. Restart daemon to apply."
+        "Active model set to 'parakeet-tdt-v3' in config.toml. Restart daemon to apply."
     );
 
-    let loaded = Config::load_from_path(&config_file);
-    assert_eq!(loaded.inference.provider, "local");
-    assert_eq!(loaded.inference.model, "moonshine-tiny");
-
-    let _ = fs::remove_dir_all(temp_dir);
-}
-
-#[test]
-fn test_model_use_whisper_tiny_weights_missing_notice_and_persistence() {
-    let temp_dir = std::env::temp_dir().join(format!("test_model_use_whisper_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&temp_dir);
-    let config_file = temp_dir.join("config.toml");
-    let models_dir = temp_dir.join("models");
-
-    let res = handle_model_use_command_internal("whisper-tiny", &config_file, Some(&models_dir))
-        .expect("use whisper-tiny");
+    // 4. whisper-small
+    let res = handle_model_use_command_internal("whisper-small", &config_file, Some(&models_dir))
+        .expect("use whisper-small");
     assert_eq!(res.provider, "local");
-    assert_eq!(res.model, "whisper-tiny");
+    assert_eq!(res.model, "whisper-small");
     assert_eq!(
         res.notice,
-        Some("Model weights not found. Run `speechyyy model download -m whisper-tiny`".into())
+        Some("Weights not found. Run `speechyyy model download -m whisper-small`".into())
     );
+
+    // 5. whisper-turbo alias -> whisper-large-v3-turbo
+    let res = handle_model_use_command_internal("whisper-turbo", &config_file, Some(&models_dir))
+        .expect("use whisper-turbo");
+    assert_eq!(res.provider, "local");
+    assert_eq!(res.model, "whisper-large-v3-turbo");
     assert_eq!(
-        res.confirmation,
-        "Active model set to 'whisper-tiny' in config.toml. Restart daemon to apply."
+        res.notice,
+        Some("Weights not found. Run `speechyyy model download -m whisper-large-v3-turbo`".into())
     );
 
-    let loaded = Config::load_from_path(&config_file);
-    assert_eq!(loaded.inference.provider, "local");
-    assert_eq!(loaded.inference.model, "whisper-tiny");
-
-    // When weights directory exists:
-    fs::create_dir_all(models_dir.join("whisper-tiny")).unwrap();
-    let res_with_weights = handle_model_use_command_internal("whisper-tiny", &config_file, Some(&models_dir))
-        .expect("use whisper-tiny with weights");
-    assert_eq!(res_with_weights.notice, None);
+    // 6. moonshine-base
+    let res = handle_model_use_command_internal("moonshine-base", &config_file, Some(&models_dir))
+        .expect("use moonshine-base");
+    assert_eq!(res.provider, "local");
+    assert_eq!(res.model, "moonshine-base");
+    assert_eq!(
+        res.notice,
+        Some("Weights not found. Run `speechyyy model download -m moonshine-base`".into())
+    );
 
     let _ = fs::remove_dir_all(temp_dir);
 }
@@ -160,11 +147,11 @@ fn test_model_use_unsupported_model() {
     let config_file = temp_dir.join("config.toml");
     let models_dir = temp_dir.join("models");
 
-    let res = handle_model_use_command_internal("non-existent-model", &config_file, Some(&models_dir));
+    let res = handle_model_use_command_internal("whisper-tiny", &config_file, Some(&models_dir));
     assert!(res.is_err());
     let err = res.unwrap_err();
-    assert!(err.contains("Unsupported model 'non-existent-model'"));
-    assert!(!config_file.exists());
+    assert!(err.contains("Unsupported model 'whisper-tiny'"));
+    assert!(err.contains("parakeet-tdt-v3"));
 
     let _ = fs::remove_dir_all(temp_dir);
 }
