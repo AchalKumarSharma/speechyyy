@@ -307,6 +307,55 @@ impl Config {
         Ok(())
     }
 
+    pub fn save_sarvam_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "Failed to create config directory {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+
+        let mut table = if path.exists() {
+            let content = fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            match toml::from_str::<toml::Value>(&content) {
+                Ok(toml::Value::Table(t)) => t,
+                _ => toml::Table::new(),
+            }
+        } else {
+            toml::Table::new()
+        };
+
+        let inf_val = table
+            .entry("inference")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+
+        if let toml::Value::Table(ref mut inf_table) = inf_val {
+            inf_table.insert("provider".into(), toml::Value::String("sarvam".to_string()));
+            inf_table.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
+        } else {
+            let mut inf_table = toml::Table::new();
+            inf_table.insert("provider".into(), toml::Value::String("sarvam".to_string()));
+            inf_table.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
+            table.insert("inference".into(), toml::Value::Table(inf_table));
+        }
+
+        table.remove("provider");
+        table.remove("sarvam_api_key");
+        table.remove("sarvam_model");
+
+        let serialized = toml::to_string_pretty(&toml::Value::Table(table))
+            .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
+
+        fs::write(path, serialized)
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+
+        Ok(())
+    }
+
     pub fn to_target_chord(&self) -> TargetChord {
         parse_hotkey(&self.hotkey).unwrap_or_else(TargetChord::right_alt)
     }
@@ -518,6 +567,41 @@ model = "saaras:v4"
         assert_eq!(updated.pacing_delay_ms, 42);
         assert_eq!(updated.audio.sample_rate, 48000);
         assert_eq!(updated.inference.api_key, "my_secret_token");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_save_sarvam_credentials_in_config_file() {
+        let temp_dir = std::env::temp_dir().join(format!("speechyyy_sarvam_cfg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let config_file = temp_dir.join("speechyyy").join("config.toml");
+
+        // 1. File does not exist -> creates config with provider = sarvam, api_key, model = saaras:v4
+        Config::save_sarvam_credentials_in_file(&config_file, "sarvam_test_token_abc")
+            .expect("save credentials to new config");
+        assert!(config_file.exists());
+        let loaded = Config::load_from_path(&config_file);
+        assert_eq!(loaded.inference.provider, "sarvam");
+        assert_eq!(loaded.inference.api_key, "sarvam_test_token_abc");
+        assert_eq!(loaded.inference.model, "saaras:v4");
+
+        // 2. Existing file -> updates provider and api_key, preserves existing model and other configs
+        let custom_toml = r#"
+hotkey = "LeftAlt"
+[inference]
+provider = "local"
+model = "whisper-small"
+"#;
+        fs::write(&config_file, custom_toml).unwrap();
+
+        Config::save_sarvam_credentials_in_file(&config_file, "updated_token_xyz")
+            .expect("update credentials in existing config");
+        let reloaded = Config::load_from_path(&config_file);
+        assert_eq!(reloaded.inference.provider, "sarvam");
+        assert_eq!(reloaded.inference.api_key, "updated_token_xyz");
+        assert_eq!(reloaded.inference.model, "whisper-small");
+        assert_eq!(reloaded.hotkey, "LeftAlt");
 
         let _ = fs::remove_dir_all(temp_dir);
     }

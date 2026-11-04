@@ -317,10 +317,77 @@ impl ModelManager {
     }
 }
 
+/// Checks if a model identifier refers to the Sarvam AI cloud provider.
+pub fn is_sarvam_cloud_model(name: &str) -> bool {
+    match name.trim().to_lowercase().replace('_', "-").as_str() {
+        "saaras:v4" | "sarvam:saaras-v4" | "sarvam" | "saaras" => true,
+        _ => false,
+    }
+}
+
+/// Generates a descriptive error message listing all supported local and cloud models.
+pub fn unsupported_model_error(model: &str) -> String {
+    #[cfg(target_os = "macos")]
+    let supported = "Cloud: saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base, apple-speech.";
+    #[cfg(not(target_os = "macos"))]
+    let supported = "Cloud: saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base.";
+    format!(
+        "Unsupported model '{}'. Supported models: {}",
+        model, supported
+    )
+}
+
 /// Handler for the CLI `model download` command.
-pub fn handle_model_download_command(model: LocalModelType) -> Result<(), String> {
-    let target_dir = ModelManager::model_dir(model);
-    ModelManager::download_model(model, &target_dir).map(|_| ())
+pub fn handle_model_download_command(model_name: &str) -> Result<(), String> {
+    handle_model_download_internal(
+        model_name,
+        &crate::config::Config::config_path(),
+        None,
+        &mut || {
+            rpassword::prompt_password("Enter your Sarvam API Key: ")
+                .map_err(|e| format!("Failed to read API key: {}", e))
+        },
+    )
+}
+
+/// Internal handler for model downloading with dependency injection for prompting and paths.
+pub fn handle_model_download_internal<F>(
+    model_name: &str,
+    config_path: &Path,
+    models_dir: Option<&Path>,
+    prompt_key_fn: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Result<String, String>,
+{
+    let trimmed = model_name.trim();
+    if is_sarvam_cloud_model(trimmed) {
+        let cfg = crate::config::Config::load_from_path(config_path);
+        if let Some(key) = cfg.inference.resolve_api_key() {
+            if !key.trim().is_empty() {
+                println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
+                return Ok(());
+            }
+        }
+
+        let raw_key = prompt_key_fn()?;
+        let key = raw_key.trim();
+        if key.is_empty() {
+            return Err("Sarvam API key cannot be empty.".to_string());
+        }
+
+        crate::config::Config::save_sarvam_credentials_in_file(config_path, key)?;
+        println!("[✓] Sarvam API key configured successfully. saaras:v4 is ready to use.");
+        Ok(())
+    } else if let Some(local_type) = LocalModelType::from_str_name(trimmed) {
+        let target_dir = match models_dir {
+            Some(d) => d.join(local_type.folder_name()),
+            None => ModelManager::model_dir(local_type),
+        };
+        ModelManager::download_model(local_type, &target_dir).map(|_| ())
+    } else {
+        Err(unsupported_model_error(trimmed))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,7 +459,12 @@ pub fn check_local_model_exists(model_type: LocalModelType, base_dir: Option<&Pa
 
 pub fn is_model_active(cfg: &crate::config::Config, model_id: &str) -> bool {
     match model_id {
-        "saaras:v4" => cfg.inference.provider.eq_ignore_ascii_case("sarvam"),
+        "saaras:v4" => {
+            cfg.inference.provider.eq_ignore_ascii_case("sarvam")
+                && (cfg.inference.model.eq_ignore_ascii_case("saaras:v4")
+                    || cfg.inference.model.eq_ignore_ascii_case("sarvam:saaras-v4")
+                    || cfg.inference.model.is_empty())
+        }
         #[cfg(target_os = "macos")]
         "apple-speech" => cfg.inference.provider.eq_ignore_ascii_case("apple"),
         preset => {
@@ -474,11 +546,27 @@ pub struct ModelUseResult {
 pub fn resolve_model_use(
     model_arg: &str,
     models_dir: Option<&Path>,
+    config_path: Option<&Path>,
 ) -> Result<(String, String, Option<String>), String> {
     let lower = model_arg.trim().to_lowercase().replace('_', "-");
     match lower.as_str() {
-        "saaras:v4" | "sarvam" | "saaras" => {
-            Ok(("sarvam".to_string(), "saaras:v4".to_string(), None))
+        s if is_sarvam_cloud_model(s) => {
+            let cfg = match config_path {
+                Some(p) => crate::config::Config::load_from_path(p),
+                None => crate::config::Config::load(),
+            };
+            let has_key = cfg
+                .inference
+                .resolve_api_key()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false);
+
+            let notice = if !has_key {
+                Some("[!] No API key found. Run 'speechyyy download saaras:v4' first to configure.".to_string())
+            } else {
+                None
+            };
+            Ok(("sarvam".to_string(), "saaras:v4".to_string(), notice))
         }
         "parakeet-tdt-v3" | "parakeet-v3" => {
             let lt = LocalModelType::ParakeetTdtV3;
@@ -526,16 +614,7 @@ pub fn resolve_model_use(
         }
         #[cfg(target_os = "macos")]
         "apple-speech" => Ok(("apple".to_string(), "apple-speech".to_string(), None)),
-        _ => {
-            #[cfg(target_os = "macos")]
-            let presets = "saaras:v4, parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base, apple-speech";
-            #[cfg(not(target_os = "macos"))]
-            let presets = "saaras:v4, parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base";
-            Err(format!(
-                "Unsupported model '{}'. Supported presets: {}",
-                model_arg, presets
-            ))
-        }
+        _ => Err(unsupported_model_error(model_arg)),
     }
 }
 
@@ -544,7 +623,8 @@ pub fn handle_model_use_command_internal(
     config_path: &Path,
     models_dir: Option<&Path>,
 ) -> Result<ModelUseResult, String> {
-    let (provider, target_model, notice) = resolve_model_use(model_arg, models_dir)?;
+    let (provider, target_model, notice) =
+        resolve_model_use(model_arg, models_dir, Some(config_path))?;
 
     crate::config::Config::update_active_model_in_file(config_path, &provider, &target_model)?;
 
@@ -772,12 +852,15 @@ mod tests {
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("Unsupported model"));
 
-        // 2. saaras:v4 or sarvam -> provider sarvam, model saaras:v4, no notice
+        // 2. saaras:v4 or sarvam -> provider sarvam, model saaras:v4, warns if no API key
         let res_sarvam = handle_model_use_command_internal("sarvam", &config_file, Some(&models_dir))
             .expect("use sarvam");
         assert_eq!(res_sarvam.provider, "sarvam");
         assert_eq!(res_sarvam.model, "saaras:v4");
-        assert_eq!(res_sarvam.notice, None);
+        assert_eq!(
+            res_sarvam.notice,
+            Some("[!] No API key found. Run 'speechyyy download saaras:v4' first to configure.".to_string())
+        );
         assert_eq!(
             res_sarvam.confirmation,
             "Active model set to 'saaras:v4' in config.toml. Restart daemon to apply."
@@ -785,6 +868,14 @@ mod tests {
         let cfg = crate::config::Config::load_from_path(&config_file);
         assert_eq!(cfg.inference.provider, "sarvam");
         assert_eq!(cfg.inference.model, "saaras:v4");
+
+        // 2b. saaras:v4 with configured API key -> no notice
+        crate::config::Config::save_sarvam_credentials_in_file(&config_file, "key_abc123").unwrap();
+        let res_sarvam_keyed = handle_model_use_command_internal("saaras:v4", &config_file, Some(&models_dir))
+            .expect("use saaras:v4 with key");
+        assert_eq!(res_sarvam_keyed.provider, "sarvam");
+        assert_eq!(res_sarvam_keyed.model, "saaras:v4");
+        assert_eq!(res_sarvam_keyed.notice, None);
 
         // 3. parakeet-tdt-v3 when weights don't exist -> notice printed, config updated
         let res_parakeet = handle_model_use_command_internal("parakeet-tdt-v3", &config_file, Some(&models_dir))
@@ -910,6 +1001,79 @@ mod tests {
 
         let info = ModelManager::verify_model_files(LocalModelType::ParakeetTdtV3, &temp_dir).unwrap();
         assert_eq!(info.file_count, 4);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_handle_model_download_flow() {
+        let temp_dir = std::env::temp_dir().join(format!("model_download_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let config_file = temp_dir.join("config.toml");
+        let models_dir = temp_dir.join("models");
+
+        // 1. saaras:v4 when no key is configured -> prompts for key, writes config
+        let mut prompt_called = false;
+        let mut prompter = || {
+            prompt_called = true;
+            Ok("my_entered_sarvam_key_999".to_string())
+        };
+        let res = handle_model_download_internal(
+            "saaras:v4",
+            &config_file,
+            Some(&models_dir),
+            &mut prompter,
+        );
+        assert!(res.is_ok());
+        assert!(prompt_called);
+        let cfg = crate::config::Config::load_from_path(&config_file);
+        assert_eq!(cfg.inference.provider, "sarvam");
+        assert_eq!(cfg.inference.api_key, "my_entered_sarvam_key_999");
+        assert_eq!(cfg.inference.model, "saaras:v4");
+
+        // 2. sarvam:saaras-v4 when key is already configured -> returns Ok without calling prompt
+        let mut prompt_called2 = false;
+        let mut prompter2 = || {
+            prompt_called2 = true;
+            Ok("should_not_be_called".to_string())
+        };
+        let res2 = handle_model_download_internal(
+            "sarvam:saaras-v4",
+            &config_file,
+            Some(&models_dir),
+            &mut prompter2,
+        );
+        assert!(res2.is_ok());
+        assert!(!prompt_called2);
+
+        // 3. saaras:v4 when user enters empty key -> returns error
+        let empty_cfg_file = temp_dir.join("empty_config.toml");
+        let mut empty_prompter = || Ok("   ".to_string());
+        let res_empty = handle_model_download_internal(
+            "saaras:v4",
+            &empty_cfg_file,
+            Some(&models_dir),
+            &mut empty_prompter,
+        );
+        assert!(res_empty.is_err());
+        assert_eq!(
+            res_empty.unwrap_err(),
+            "Sarvam API key cannot be empty."
+        );
+
+        // 4. unsupported model -> returns clear error listing models
+        let mut dummy_prompter = || Ok("dummy".to_string());
+        let res_unsupported = handle_model_download_internal(
+            "nonexistent-model",
+            &config_file,
+            Some(&models_dir),
+            &mut dummy_prompter,
+        );
+        assert!(res_unsupported.is_err());
+        let err_msg = res_unsupported.unwrap_err();
+        assert!(err_msg.contains("Unsupported model 'nonexistent-model'"));
+        assert!(err_msg.contains("saaras:v4"));
+        assert!(err_msg.contains("parakeet-tdt-v3"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }

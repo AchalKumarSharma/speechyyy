@@ -51,7 +51,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
    speechyyy doctor
    ```
 
-2. **Manage Models**:
+2. **Manage Models (Local & Cloud BYOK)**:
    ```bash
    # List available presets
    speechyyy models
@@ -59,8 +59,11 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
    # Download local weights (e.g. Parakeet TDT v3)
    speechyyy download parakeet-tdt-v3
 
+   # Or configure cloud models (interactively prompts for API key if not set)
+   speechyyy download saaras:v4
+
    # Activate the model
-   speechyyy use parakeet-tdt-v3
+   speechyyy use parakeet-tdt-v3  # or: speechyyy use saaras:v4
    ```
 
 3. **Start the Daemon**:
@@ -82,7 +85,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | `speechyyy status` | Inspect daemon process status |
 | `speechyyy doctor` | Inspect system permissions, audio inputs, and model weights |
 | `speechyyy models` | List available models and active status (alias: `model`) |
-| `speechyyy download <MODEL>` | Download local model weights |
+| `speechyyy download <MODEL>` | Download local model weights or configure cloud BYOK (`saaras:v4`) |
 | `speechyyy use <MODEL>` | Switch active model (`saaras:v4`, `parakeet-tdt-v3`, etc.) |
 | `speechyyy remove <MODEL>` | Delete local model weights to free disk space (alias: `rm`) |
 | `speechyyy uninstall [--purge]`| Stop daemon and remove local configuration/data |

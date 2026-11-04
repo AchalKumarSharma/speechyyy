@@ -1,4 +1,3 @@
-use crate::model::LocalModelType;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug, PartialEq, Eq)]
@@ -47,12 +46,12 @@ pub enum Command {
     },
     /// Download model weights (e.g. speechyyy download parakeet-tdt-v3)
     Download {
-        /// Target model architecture ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
+        /// Target model architecture ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base', 'saaras:v4', 'sarvam:saaras-v4')
         #[arg(value_name = "MODEL")]
-        model: Option<LocalModelType>,
+        model: Option<String>,
         /// Target model architecture flag (-m, --model)
         #[arg(short = 'm', long = "model", value_name = "MODEL")]
-        model_flag: Option<LocalModelType>,
+        model_flag: Option<String>,
     },
     /// Switch active model (e.g. speechyyy use parakeet-tdt-v3)
     Use {
@@ -100,12 +99,12 @@ pub enum Command {
 pub enum ModelCommands {
     /// Download model weights (e.g. speechyyy download parakeet-tdt-v3)
     Download {
-        /// Target model architecture ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
+        /// Target model architecture ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base', 'saaras:v4', 'sarvam:saaras-v4')
         #[arg(value_name = "MODEL")]
-        model: Option<LocalModelType>,
+        model: Option<String>,
         /// Target model architecture flag (-m, --model)
         #[arg(short = 'm', long = "model", value_name = "MODEL")]
-        model_flag: Option<LocalModelType>,
+        model_flag: Option<String>,
     },
     /// List supported speech models
     List,
@@ -124,10 +123,10 @@ pub enum ModelCommands {
 
 impl ModelCommands {
     pub fn resolved_download_model(
-        model: Option<LocalModelType>,
-        model_flag: Option<LocalModelType>,
-    ) -> LocalModelType {
-        model.or(model_flag).unwrap_or(LocalModelType::ParakeetTdtV3)
+        model: Option<String>,
+        model_flag: Option<String>,
+    ) -> String {
+        model.or(model_flag).unwrap_or_else(|| "parakeet-tdt-v3".to_string())
     }
 }
 
@@ -270,7 +269,7 @@ mod tests {
             Command::Models {
                 action: Some(ModelAction::Download {
                     model: None,
-                    model_flag: Some(LocalModelType::ParakeetTdtV3),
+                    model_flag: Some("parakeet-tdt-v3".to_string()),
                 })
             }
         );
@@ -325,7 +324,7 @@ mod tests {
         assert_eq!(
             cli_pos.command,
             Command::Download {
-                model: Some(LocalModelType::ParakeetTdtV3),
+                model: Some("parakeet-tdt-v3".to_string()),
                 model_flag: None,
             }
         );
@@ -336,7 +335,27 @@ mod tests {
             cli_flag.command,
             Command::Download {
                 model: None,
-                model_flag: Some(LocalModelType::WhisperSmall),
+                model_flag: Some("whisper-small".to_string()),
+            }
+        );
+
+        let cli_cloud = Cli::try_parse_from(["speechyyy", "download", "saaras:v4"])
+            .expect("parse download cloud saaras");
+        assert_eq!(
+            cli_cloud.command,
+            Command::Download {
+                model: Some("saaras:v4".to_string()),
+                model_flag: None,
+            }
+        );
+
+        let cli_cloud_sarvam = Cli::try_parse_from(["speechyyy", "download", "sarvam:saaras-v4"])
+            .expect("parse download cloud sarvam");
+        assert_eq!(
+            cli_cloud_sarvam.command,
+            Command::Download {
+                model: Some("sarvam:saaras-v4".to_string()),
+                model_flag: None,
             }
         );
     }

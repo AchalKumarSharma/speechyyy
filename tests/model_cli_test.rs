@@ -4,8 +4,8 @@ use speechyyy::config::Config;
 use speechyyy::daemon::handle_uninstall_command_internal;
 use speechyyy::ipc::RuntimePaths;
 use speechyyy::model::{
-    format_model_list_with_models_dir, handle_model_remove_internal,
-    handle_model_use_command_internal, LocalModelType,
+    format_model_list_with_models_dir, handle_model_download_internal,
+    handle_model_remove_internal, handle_model_use_command_internal, LocalModelType,
 };
 use std::fs;
 
@@ -41,7 +41,7 @@ fn test_cli_parsing_model_subcommands() {
     assert_eq!(
         cli_download_pos.command,
         Command::Download {
-            model: Some(LocalModelType::ParakeetTdtV3),
+            model: Some("parakeet-tdt-v3".to_string()),
             model_flag: None,
         }
     );
@@ -52,7 +52,27 @@ fn test_cli_parsing_model_subcommands() {
         cli_download_flag.command,
         Command::Download {
             model: None,
-            model_flag: Some(LocalModelType::WhisperSmall),
+            model_flag: Some("whisper-small".to_string()),
+        }
+    );
+
+    let cli_download_cloud =
+        Cli::try_parse_from(["speechyyy", "download", "saaras:v4"]).expect("parse download saaras:v4");
+    assert_eq!(
+        cli_download_cloud.command,
+        Command::Download {
+            model: Some("saaras:v4".to_string()),
+            model_flag: None,
+        }
+    );
+
+    let cli_download_cloud_full =
+        Cli::try_parse_from(["speechyyy", "download", "sarvam:saaras-v4"]).expect("parse download sarvam:saaras-v4");
+    assert_eq!(
+        cli_download_cloud_full.command,
+        Command::Download {
+            model: Some("sarvam:saaras-v4".to_string()),
+            model_flag: None,
         }
     );
 
@@ -127,22 +147,27 @@ fn test_model_use_curated_presets() {
     let config_file = temp_dir.join("config.toml");
     let models_dir = temp_dir.join("models");
 
-    // 1. sarvam alias -> saaras:v4
+    // 1. sarvam alias -> saaras:v4 (warns when no API key is configured)
     let res = handle_model_use_command_internal("sarvam", &config_file, Some(&models_dir))
         .expect("use sarvam");
     assert_eq!(res.provider, "sarvam");
     assert_eq!(res.model, "saaras:v4");
-    assert_eq!(res.notice, None);
+    assert_eq!(
+        res.notice,
+        Some("[!] No API key found. Run 'speechyyy download saaras:v4' first to configure.".into())
+    );
     assert_eq!(
         res.confirmation,
         "Active model set to 'saaras:v4' in config.toml. Restart daemon to apply."
     );
 
-    // 2. saaras alias -> saaras:v4
-    let res = handle_model_use_command_internal("saaras", &config_file, Some(&models_dir))
-        .expect("use saaras");
-    assert_eq!(res.provider, "sarvam");
-    assert_eq!(res.model, "saaras:v4");
+    // 2. saaras:v4 with configured API key -> no warning notice
+    Config::save_sarvam_credentials_in_file(&config_file, "mock_test_key_123").unwrap();
+    let res_with_key = handle_model_use_command_internal("saaras:v4", &config_file, Some(&models_dir))
+        .expect("use saaras:v4 with key");
+    assert_eq!(res_with_key.provider, "sarvam");
+    assert_eq!(res_with_key.model, "saaras:v4");
+    assert_eq!(res_with_key.notice, None);
 
     // 3. parakeet-v3 alias -> parakeet-tdt-v3 with missing weights
     let res = handle_model_use_command_internal("parakeet-v3", &config_file, Some(&models_dir))
@@ -313,6 +338,93 @@ fn test_uninstall_command_lifecycle() {
     assert!(!share_dir.exists());
     assert!(!cargo_bin.exists());
     assert!(!local_bin.exists());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn test_download_workflow_cloud_and_local() {
+    let temp_dir = std::env::temp_dir().join(format!("test_download_flow_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let config_file = temp_dir.join("config.toml");
+    let models_dir = temp_dir.join("models");
+
+    // 1. Download saaras:v4 when no key is configured -> prompts for key
+    let mut prompter_called = false;
+    let mut prompter = || {
+        prompter_called = true;
+        Ok("sk_sarvam_live_key_555".to_string())
+    };
+    let res = handle_model_download_internal(
+        "saaras:v4",
+        &config_file,
+        Some(&models_dir),
+        &mut prompter,
+    );
+    assert!(res.is_ok());
+    assert!(prompter_called);
+
+    // Verify written config.toml has provider = "sarvam" and api_key
+    let cfg = Config::load_from_path(&config_file);
+    assert_eq!(cfg.inference.provider, "sarvam");
+    assert_eq!(cfg.inference.api_key, "sk_sarvam_live_key_555");
+    assert_eq!(cfg.inference.model, "saaras:v4");
+
+    // 2. Download saaras:v4 again when key is already configured -> does not prompt
+    let mut prompter_called_again = false;
+    let mut prompter_again = || {
+        prompter_called_again = true;
+        Ok("should_not_prompt".to_string())
+    };
+    let res_again = handle_model_download_internal(
+        "saaras:v4",
+        &config_file,
+        Some(&models_dir),
+        &mut prompter_again,
+    );
+    assert!(res_again.is_ok());
+    assert!(!prompter_called_again);
+
+    // 3. Download sarvam:saaras-v4 tag when key is already configured -> does not prompt
+    let mut prompter_called_full = false;
+    let mut prompter_full = || {
+        prompter_called_full = true;
+        Ok("should_not_prompt".to_string())
+    };
+    let res_full = handle_model_download_internal(
+        "sarvam:saaras-v4",
+        &config_file,
+        Some(&models_dir),
+        &mut prompter_full,
+    );
+    assert!(res_full.is_ok());
+    assert!(!prompter_called_full);
+
+    // 4. Download with empty API key input -> fails validation
+    let empty_cfg_path = temp_dir.join("empty_cfg.toml");
+    let mut empty_prompter = || Ok("   \t  ".to_string());
+    let res_empty = handle_model_download_internal(
+        "saaras:v4",
+        &empty_cfg_path,
+        Some(&models_dir),
+        &mut empty_prompter,
+    );
+    assert!(res_empty.is_err());
+    assert_eq!(res_empty.unwrap_err(), "Sarvam API key cannot be empty.");
+
+    // 5. Download unsupported model -> outputs clear error listing models
+    let mut dummy_prompter = || Ok("dummy".to_string());
+    let res_unsupported = handle_model_download_internal(
+        "whisper-nano",
+        &config_file,
+        Some(&models_dir),
+        &mut dummy_prompter,
+    );
+    assert!(res_unsupported.is_err());
+    let err_msg = res_unsupported.unwrap_err();
+    assert!(err_msg.contains("Unsupported model 'whisper-nano'"));
+    assert!(err_msg.contains("saaras:v4"));
+    assert!(err_msg.contains("parakeet-tdt-v3"));
 
     let _ = fs::remove_dir_all(temp_dir);
 }
