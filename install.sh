@@ -11,6 +11,7 @@ if [ -f "Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     echo "==> Local repository detected. Compiling release binary via cargo..."
     cargo build --release
     cp "target/release/speechyyy" "${TARGET_DIR}/speechyyy"
+    find target/release/ -maxdepth 1 -name "*.so*" -exec cp -d {} "${TARGET_DIR}/" \; 2>/dev/null || true
     chmod +x "${TARGET_DIR}/speechyyy"
     UDEV_RULE_SRC="extra/99-speechyyy-uinput.rules"
 else
@@ -51,6 +52,7 @@ else
             exit 1
         fi
     fi
+    find "${TMP_DIR}" -maxdepth 1 -name "*.so*" -exec cp -d {} "${TARGET_DIR}/" \; 2>/dev/null || true
     chmod +x "${TARGET_DIR}/speechyyy"
 
     if [ -f "${TMP_DIR}/extra/99-speechyyy-uinput.rules" ]; then

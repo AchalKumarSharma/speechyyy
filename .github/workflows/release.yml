@@ -33,10 +33,14 @@ jobs:
       - name: Package release archive
         run: |
           ARCHIVE_NAME="speechyyy-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz"
-          FILES=("target/release/speechyyy" "extra/99-speechyyy-uinput.rules")
-          [ -f "README.md" ] && FILES+=("README.md")
-          [ -f "LICENSE" ] && FILES+=("LICENSE")
-          tar -czvf "$ARCHIVE_NAME" "${FILES[@]}"
+          mkdir -p package_staging
+          cp target/release/speechyyy package_staging/
+          find target/release/ -maxdepth 1 -name "*.so*" -exec cp -d {} package_staging/ \; 2>/dev/null || true
+          mkdir -p package_staging/extra
+          cp extra/99-speechyyy-uinput.rules package_staging/extra/
+          [ -f "README.md" ] && cp README.md package_staging/
+          [ -f "LICENSE" ] && cp LICENSE package_staging/
+          tar -czvf "$ARCHIVE_NAME" -C package_staging .
           sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
 
       - name: Publish to GitHub Releases
