@@ -355,21 +355,44 @@ pub fn handle_uninstall_command_internal(
     home_dir: Option<&Path>,
 ) -> Result<(), String> {
     let pid = PidFile::read_pid(&paths.pid_path);
-    let is_running = paths.socket_path.exists() || pid.map_or(false, PidFile::is_process_running);
+    let is_running = paths.socket_path.exists() || pid.is_some_and(PidFile::is_process_running);
     if is_running {
         println!("Stopping running Speechyyy daemon...");
         let _ = stop_daemon(paths);
     }
 
-    if purge {
-        let home = match home_dir {
-            Some(h) => h.to_path_buf(),
-            None => {
-                let h = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                PathBuf::from(h)
-            }
-        };
+    let home = match home_dir {
+        Some(h) => h.to_path_buf(),
+        None => {
+            let h = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(h)
+        }
+    };
 
+    let companion_libs = [
+        "libsherpa-onnx-c-api.so",
+        "libsherpa-onnx-cxx-api.so",
+        "libonnxruntime.so",
+    ];
+
+    // Unlink binaries and companion libraries unconditionally (both with and without --purge)
+    let cargo_bin = home.join(".cargo").join("bin").join("speechyyy");
+    if cargo_bin.exists() {
+        let _ = fs::remove_file(&cargo_bin);
+    }
+    let local_bin = home.join(".local").join("bin").join("speechyyy");
+    if local_bin.exists() {
+        let _ = fs::remove_file(&local_bin);
+    }
+    let local_bin_dir = home.join(".local").join("bin");
+    for lib in &companion_libs {
+        let lib_path = local_bin_dir.join(lib);
+        if lib_path.exists() {
+            let _ = fs::remove_file(&lib_path);
+        }
+    }
+
+    if purge {
         // 1. Remove ~/.local/share/speechyyy/
         let data_dir = home.join(".local").join("share").join("speechyyy");
         if data_dir.exists() {
@@ -382,22 +405,12 @@ pub fn handle_uninstall_command_internal(
             let _ = fs::remove_dir_all(&config_dir);
         }
 
-        // 3. User-space binaries
-        let cargo_bin = home.join(".cargo").join("bin").join("speechyyy");
-        if cargo_bin.exists() {
-            let _ = fs::remove_file(&cargo_bin);
-        }
-        let local_bin = home.join(".local").join("bin").join("speechyyy");
-        if local_bin.exists() {
-            let _ = fs::remove_file(&local_bin);
-        }
-
         paths.cleanup();
-        println!("[✓] Purged all Speechyyy models, configuration, and data.");
+        println!("[✓] Purged all Speechyyy models, configuration, binaries, and data.");
     } else {
-        println!(
-            "Speechyyy cleanup options:\n - Free space from a model: speechyyy remove <MODEL>\n - Purge all models, configs, and dictionaries: speechyyy uninstall --purge\n - Remove binary: cargo uninstall speechyyy (or rm $(which speechyyy))"
-        );
+        println!("[✓] Speechyyy binary and runtime libraries uninstalled.");
+        println!("    Note: Models and configuration files were retained.");
+        println!("    To remove all models and cached data, run: speechyyy uninstall --purge");
     }
 
     Ok(())

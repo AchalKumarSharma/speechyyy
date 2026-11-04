@@ -315,6 +315,8 @@ fn test_uninstall_command_lifecycle() {
     let share_dir = home_dir.join(".local").join("share").join("speechyyy");
     let cargo_bin = home_dir.join(".cargo").join("bin").join("speechyyy");
     let local_bin = home_dir.join(".local").join("bin").join("speechyyy");
+    let sherpa_lib = home_dir.join(".local").join("bin").join("libsherpa-onnx-c-api.so");
+    let onnx_lib = home_dir.join(".local").join("bin").join("libonnxruntime.so");
 
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(config_dir.join("config.toml"), b"# config").unwrap();
@@ -324,24 +326,33 @@ fn test_uninstall_command_lifecycle() {
     fs::write(&cargo_bin, b"binary").unwrap();
     fs::create_dir_all(local_bin.parent().unwrap()).unwrap();
     fs::write(&local_bin, b"binary").unwrap();
+    fs::write(&sherpa_lib, b"so").unwrap();
+    fs::write(&onnx_lib, b"so").unwrap();
 
     let paths = RuntimePaths::with_dir(temp_dir.join("runtime"));
 
-    // 1. Uninstall without purge: nothing is deleted
+    // 1. Uninstall without purge: binaries and companion libs removed, configs & models retained
     let res_no_purge = handle_uninstall_command_internal(false, &paths, Some(&home_dir));
     assert!(res_no_purge.is_ok());
     assert!(config_dir.exists());
     assert!(share_dir.exists());
-    assert!(cargo_bin.exists());
-    assert!(local_bin.exists());
+    assert!(!cargo_bin.exists());
+    assert!(!local_bin.exists());
+    assert!(!sherpa_lib.exists());
+    assert!(!onnx_lib.exists());
 
-    // 2. Uninstall with purge: everything is purged
+    // 2. Uninstall with purge: re-create binaries to test purge phase
+    fs::write(&cargo_bin, b"binary").unwrap();
+    fs::write(&local_bin, b"binary").unwrap();
+    fs::write(&sherpa_lib, b"so").unwrap();
+
     let res_purge = handle_uninstall_command_internal(true, &paths, Some(&home_dir));
     assert!(res_purge.is_ok());
     assert!(!config_dir.exists());
     assert!(!share_dir.exists());
     assert!(!cargo_bin.exists());
     assert!(!local_bin.exists());
+    assert!(!sherpa_lib.exists());
 
     let _ = fs::remove_dir_all(temp_dir);
 }
