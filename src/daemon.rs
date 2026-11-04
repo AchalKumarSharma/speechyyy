@@ -409,8 +409,8 @@ pub fn handle_uninstall_command_internal(
         println!("[✓] Purged all Speechyyy models, configuration, binaries, and data.");
     } else {
         println!("[✓] Speechyyy binary and runtime libraries uninstalled.");
-        println!("    Note: Models and configuration files were retained.");
-        println!("    To remove all models and cached data, run: speechyyy uninstall --purge");
+        println!("    Note: Models and configurations were retained in ~/.local/share/speechyyy and ~/.config/speechyyy.");
+        println!("    To remove them manually, run: rm -rf ~/.local/share/speechyyy ~/.config/speechyyy");
     }
 
     Ok(())
