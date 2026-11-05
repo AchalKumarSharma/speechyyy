@@ -378,10 +378,9 @@ fn test_download_workflow_cloud_and_local() {
 
     let cfg = Config::load_from_path(&config_file);
     if prompter_called {
-        // Verify written config.toml has provider = "sarvam" and api_key
-        assert_eq!(cfg.inference.provider, "sarvam");
+        // Verify written config.toml has api_key, but download does not activate sarvam provider
+        assert_eq!(cfg.inference.provider, "local");
         assert_eq!(cfg.inference.api_key, "sk_sarvam_live_key_555");
-        assert_eq!(cfg.inference.model, "saaras:v4");
     } else {
         // If prompter was not called, a key was already resolved on the machine/environment
         assert!(cfg.inference.resolve_api_key().is_some());

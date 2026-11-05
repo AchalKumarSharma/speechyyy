@@ -371,11 +371,9 @@ impl Config {
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
 
         if let toml::Value::Table(ref mut inf_table) = inf_val {
-            inf_table.insert("provider".into(), toml::Value::String("sarvam".to_string()));
             inf_table.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
         } else {
             let mut inf_table = toml::Table::new();
-            inf_table.insert("provider".into(), toml::Value::String("sarvam".to_string()));
             inf_table.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
             table.insert("inference".into(), toml::Value::Table(inf_table));
         }
@@ -614,16 +612,16 @@ model = "saaras:v4"
         let _ = fs::remove_dir_all(&temp_dir);
         let config_file = temp_dir.join("speechyyy").join("config.toml");
 
-        // 1. File does not exist -> creates config with provider = sarvam, api_key, model = saaras:v4
+        // 1. File does not exist -> creates config with api_key without setting provider
         Config::save_sarvam_credentials_in_file(&config_file, "sarvam_test_token_abc")
             .expect("save credentials to new config");
         assert!(config_file.exists());
         let loaded = Config::load_from_path(&config_file);
-        assert_eq!(loaded.inference.provider, "sarvam");
+        assert_eq!(loaded.inference.provider, "local");
         assert_eq!(loaded.inference.api_key, "sarvam_test_token_abc");
         assert_eq!(loaded.inference.model, "saaras:v4");
 
-        // 2. Existing file -> updates provider and api_key, preserves existing model and other configs
+        // 2. Existing file -> updates api_key, preserves existing provider, model and other configs
         let custom_toml = r#"
 hotkey = "LeftAlt"
 [inference]
@@ -635,7 +633,7 @@ model = "whisper-small"
         Config::save_sarvam_credentials_in_file(&config_file, "updated_token_xyz")
             .expect("update credentials in existing config");
         let reloaded = Config::load_from_path(&config_file);
-        assert_eq!(reloaded.inference.provider, "sarvam");
+        assert_eq!(reloaded.inference.provider, "local");
         assert_eq!(reloaded.inference.api_key, "updated_token_xyz");
         assert_eq!(reloaded.inference.model, "whisper-small");
         assert_eq!(reloaded.hotkey, "LeftAlt");

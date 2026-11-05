@@ -141,3 +141,4 @@ pub fn handle_uninstall_command_internal(
     );
     Ok(())
 }
+

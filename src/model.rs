@@ -367,9 +367,8 @@ where
         if let Some(key) = cfg.inference.resolve_api_key() {
             if !key.trim().is_empty() {
                 println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
-                crate::config::Config::update_active_model_in_file(config_path, "sarvam", "saaras:v4")?;
                 println!(
-                    "[✓] Model 'saaras:v4' downloaded and set as active for you, {}.",
+                    "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
                     nickname
                 );
                 return Ok(());
@@ -383,10 +382,9 @@ where
         }
 
         crate::config::Config::save_sarvam_credentials_in_file(config_path, key)?;
-        crate::config::Config::update_active_model_in_file(config_path, "sarvam", "saaras:v4")?;
         println!("[✓] Sarvam API key configured successfully. saaras:v4 is ready to use.");
         println!(
-            "[✓] Model 'saaras:v4' downloaded and set as active for you, {}.",
+            "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
             nickname
         );
         Ok(())
@@ -396,15 +394,11 @@ where
             None => ModelManager::model_dir(local_type),
         };
         ModelManager::download_model(local_type, &target_dir)?;
-        crate::config::Config::update_active_model_in_file(
-            config_path,
-            "local",
-            local_type.folder_name(),
-        )?;
         println!(
-            "[✓] Model '{}' downloaded and set as active for you, {}.",
+            "[✓] Model '{}' is all yours, {}! Run 'speechyyy use {}' whenever you want me to speak it.",
             local_type.folder_name(),
-            nickname
+            nickname,
+            local_type.folder_name()
         );
         Ok(())
     } else {
@@ -1085,9 +1079,8 @@ mod tests {
         assert!(res.is_ok());
         assert!(prompt_called);
         let cfg = crate::config::Config::load_from_path(&config_file);
-        assert_eq!(cfg.inference.provider, "sarvam");
+        assert_eq!(cfg.inference.provider, "local");
         assert_eq!(cfg.inference.api_key, "my_entered_sarvam_key_999");
-        assert_eq!(cfg.inference.model, "saaras:v4");
 
         // 2. sarvam:saaras-v4 when key is already configured -> returns Ok without calling prompt
         let mut prompt_called2 = false;
