@@ -51,7 +51,20 @@ fn copy_companion_libs(src_dir: &Path, dest_dir: &Path) {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if name.starts_with("lib") && name.contains(".so") {
                         let dest = dest_dir.join(name);
-                        let _ = fs::copy(&path, &dest);
+                        let tmp_dest = dest_dir.join(format!("{}.tmp", name));
+                        let _ = fs::remove_file(&tmp_dest);
+                        if fs::copy(&path, &tmp_dest).is_ok() {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = fs::set_permissions(
+                                    &tmp_dest,
+                                    fs::Permissions::from_mode(0o755),
+                                );
+                            }
+                            let _ = fs::remove_file(&dest);
+                            let _ = fs::rename(&tmp_dest, &dest);
+                        }
                     }
                 }
             } else if path.is_dir() {
@@ -85,6 +98,7 @@ pub fn install_from_extracted_dir(
 
     // Prevent ETXTBSY by writing to a temporary file and atomically renaming
     let tmp_bin = target_dir.join("speechyyy.tmp");
+    let _ = fs::remove_file(&tmp_bin);
     fs::copy(&binary_src, &tmp_bin)
         .map_err(|e| format!("Failed to stage binary to {}: {}", tmp_bin.display(), e))?;
 
@@ -95,20 +109,21 @@ pub fn install_from_extracted_dir(
     }
 
     let final_bin = target_dir.join("speechyyy");
+    let _ = fs::remove_file(&final_bin);
     fs::rename(&tmp_bin, &final_bin)
         .map_err(|e| format!("Failed to install binary to {}: {}", final_bin.display(), e))?;
 
-    // Copy companion dynamic libraries (*.so)
+    // Copy companion dynamic libraries (*.so) safely without in-place overwrite
     copy_companion_libs(extracted_dir, target_dir);
 
-    // If daemon was running prior to update, restart it
+    // If Speechyyy was running prior to update, restart it
     if let Some(p) = paths {
         let was_running = PidFile::read_pid(&p.pid_path)
             .is_some_and(PidFile::is_process_running);
         if was_running {
-            println!("Restarting Speechyyy daemon with updated binary...");
+            println!("Restarting Speechyyy with updated binary...");
             let new_pid = crate::daemon::restart_daemon_process(p, Some(&final_bin))?;
-            println!("Speechyyy daemon restarted (PID: {}).", new_pid);
+            println!("Speechyyy restarted (PID: {}).", new_pid);
         }
     }
 
@@ -127,9 +142,12 @@ pub fn handle_update_command(force: bool) -> Result<(), String> {
     let latest_version = tag_name.trim_start_matches('v');
 
     if latest_version == current_version && !force {
+        let config = crate::config::Config::load();
+        let nickname = config.nickname();
+        let version_str = current_version.trim_start_matches('v');
         println!(
-            "Speechyyy is already up to date ({}, release {}).",
-            current_version, tag_name
+            "[✓] We're on the latest and greatest already, {} (v{}).",
+            nickname, version_str
         );
         return Ok(());
     }
@@ -196,7 +214,8 @@ pub fn handle_update_command(force: bool) -> Result<(), String> {
         install_from_extracted_dir(&temp_dir, &target_dir, Some(&paths), tag_name);
 
     let _ = fs::remove_dir_all(&temp_dir);
-    install_result
+    install_result?;
+    std::process::exit(0);
 }
 
 #[cfg(test)]

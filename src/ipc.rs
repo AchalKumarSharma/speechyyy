@@ -38,6 +38,7 @@ pub struct RuntimePaths {
     pub dir: PathBuf,
     pub socket_path: PathBuf,
     pub pid_path: PathBuf,
+    pub binary_path: Option<PathBuf>,
 }
 
 impl RuntimePaths {
@@ -49,7 +50,9 @@ impl RuntimePaths {
                 PathBuf::from(format!("/tmp/speechyyy-{}", uid))
             });
         let dir = base.join("speechyyy");
-        Self::with_dir(dir)
+        let mut paths = Self::with_dir(dir);
+        paths.binary_path = std::env::current_exe().ok();
+        paths
     }
 }
 
@@ -67,7 +70,19 @@ impl RuntimePaths {
             dir,
             socket_path,
             pid_path,
+            binary_path: None,
         }
+    }
+
+    pub fn binary_path(&self) -> Option<PathBuf> {
+        self.binary_path
+            .clone()
+            .or_else(|| std::env::current_exe().ok())
+    }
+
+    pub fn with_binary_path(mut self, path: PathBuf) -> Self {
+        self.binary_path = Some(path);
+        self
     }
 
     pub fn ensure_dir(&self) -> std::io::Result<()> {
@@ -100,7 +115,7 @@ impl PidFile {
         if let Some(existing_pid) = Self::read_pid(path) {
             if Self::is_process_running(existing_pid) {
                 return Err(format!(
-                    "Daemon is already running with PID {}",
+                    "Speechyyy is already running with PID {}",
                     existing_pid
                 ));
             }
@@ -123,7 +138,7 @@ impl IpcClient {
     pub fn send_request(socket_path: &Path, req: &IpcRequest) -> Result<IpcResponse, String> {
         let mut stream = UnixStream::connect(socket_path).map_err(|e| {
             format!(
-                "Failed to connect to daemon socket at {}: {}",
+                "Failed to connect to Speechyyy socket at {}: {}",
                 socket_path.display(),
                 e
             )
@@ -197,7 +212,7 @@ impl IpcServer {
             Ok(IpcRequest::Stop) => {
                 running.store(false, Ordering::SeqCst);
                 IpcResponse::Ok {
-                    message: "Daemon stopping".into(),
+                    message: "Speechyyy stopping".into(),
                 }
             }
             Err(e) => IpcResponse::Error {

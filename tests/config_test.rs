@@ -2,6 +2,9 @@ use clap::Parser;
 use speechyyy::cli::{Cli, Command};
 use speechyyy::config::Config;
 use speechyyy::inference::create_inference_provider;
+use std::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_config_defaults() {
@@ -32,6 +35,10 @@ fn test_config_defaults() {
         cfg.pacing_delay_ms, 15,
         "Default typing pacing delay must be 15ms"
     );
+
+    // Default nickname must be "babe"
+    assert_eq!(cfg.nickname(), "babe");
+    assert_eq!(cfg.ui.nickname, "babe");
 }
 
 #[test]
@@ -71,6 +78,7 @@ typing_delay_ms = 20
 
 #[test]
 fn test_sarvam_api_key_env_var_fallback_and_precedence() {
+    let _guard = ENV_LOCK.lock().unwrap();
     let toml_without_key = r#"
 [inference]
 provider = "sarvam"
@@ -181,6 +189,7 @@ method = "paste"
 
 #[test]
 fn test_missing_sarvam_api_key_returns_explicit_actionable_error() {
+    let _guard = ENV_LOCK.lock().unwrap();
     std::env::remove_var("SARVAM_API_KEY");
 
     let toml_data = r#"
@@ -207,4 +216,40 @@ api_key = ""
         "Error message must provide actionable doctor command, got: {}",
         err_msg
     );
+}
+
+#[test]
+fn test_ui_config_and_nickname_fallback() {
+    // 1. Explicit nickname in TOML
+    let toml_custom = r#"
+[ui]
+nickname = "darling"
+"#;
+    let cfg_custom: Config = toml::from_str(toml_custom).expect("parse custom ui config");
+    assert_eq!(cfg_custom.nickname(), "darling");
+    assert_eq!(cfg_custom.ui.nickname, "darling");
+
+    // 2. Empty string nickname in TOML falls back to "babe"
+    let toml_empty = r#"
+[ui]
+nickname = ""
+"#;
+    let cfg_empty: Config = toml::from_str(toml_empty).expect("parse empty nickname ui config");
+    assert_eq!(cfg_empty.nickname(), "babe");
+
+    // 3. Whitespace nickname in TOML falls back to "babe"
+    let toml_whitespace = r#"
+[ui]
+nickname = "   "
+"#;
+    let cfg_ws: Config = toml::from_str(toml_whitespace).expect("parse ws nickname ui config");
+    assert_eq!(cfg_ws.nickname(), "babe");
+
+    // 4. UiConfig default has fallback
+    let ui_def = speechyyy::config::UiConfig::default();
+    let cfg_with_ui = Config {
+        ui: ui_def,
+        ..Default::default()
+    };
+    assert_eq!(cfg_with_ui.nickname(), "babe");
 }

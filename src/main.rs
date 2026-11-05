@@ -47,7 +47,7 @@ fn main() {
         }
         Command::Use { model } => handle_model_use_command(&model),
         Command::Remove { model } => handle_model_remove(&model),
-        Command::Uninstall { purge } => handle_uninstall_command(purge),
+        Command::Uninstall { purge: _, yes } => handle_uninstall_command(yes),
         Command::Start {
             foreground,
             provider,

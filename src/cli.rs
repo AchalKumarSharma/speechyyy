@@ -14,9 +14,9 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
 pub enum Command {
-    /// Start the Speechyyy daemon (-f for foreground logs)
+    /// Start Speechyyy (-f for foreground logs)
     Start {
-        /// Run in foreground instead of detaching as a daemon
+        /// Run in foreground instead of detaching in background
         #[arg(short, long)]
         foreground: bool,
         /// Speech-to-text inference provider ('local' or 'sarvam')
@@ -32,9 +32,9 @@ pub enum Command {
         #[arg(long)]
         typing_delay: Option<u64>,
     },
-    /// Stop the running daemon
+    /// Stop running Speechyyy
     Stop,
-    /// Inspect daemon process status
+    /// Inspect Speechyyy status
     Status,
     /// Inspect system permissions, audio inputs, and model weights
     Doctor,
@@ -64,11 +64,14 @@ pub enum Command {
         /// Name of the model to remove ('parakeet-tdt-v3', 'whisper-small', 'whisper-large-v3-turbo', 'moonshine-base')
         model: String,
     },
-    /// Stop daemon and clean up local data/configuration
+    /// Completely uninstall Speechyyy
     Uninstall {
         /// Purge all models, configs, dictionaries, and user-space binaries
         #[arg(long)]
         purge: bool,
+        /// Automatic yes to prompts; run non-interactively
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
     },
     /// Add a phonetic replacement rule to dictionary.toml
     Learn {
@@ -423,11 +426,43 @@ mod tests {
     #[test]
     fn test_parse_uninstall() {
         let cli = Cli::try_parse_from(["speechyyy", "uninstall"]).expect("parse uninstall");
-        assert_eq!(cli.command, Command::Uninstall { purge: false });
+        assert_eq!(
+            cli.command,
+            Command::Uninstall {
+                purge: false,
+                yes: false
+            }
+        );
 
         let cli_purge =
             Cli::try_parse_from(["speechyyy", "uninstall", "--purge"]).expect("parse uninstall purge");
-        assert_eq!(cli_purge.command, Command::Uninstall { purge: true });
+        assert_eq!(
+            cli_purge.command,
+            Command::Uninstall {
+                purge: true,
+                yes: false
+            }
+        );
+
+        let cli_yes =
+            Cli::try_parse_from(["speechyyy", "uninstall", "-y"]).expect("parse uninstall yes");
+        assert_eq!(
+            cli_yes.command,
+            Command::Uninstall {
+                purge: false,
+                yes: true
+            }
+        );
+
+        let cli_yes_long =
+            Cli::try_parse_from(["speechyyy", "uninstall", "--yes"]).expect("parse uninstall yes long");
+        assert_eq!(
+            cli_yes_long.command,
+            Command::Uninstall {
+                purge: false,
+                yes: true
+            }
+        );
     }
 
     #[test]

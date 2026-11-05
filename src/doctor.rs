@@ -545,7 +545,12 @@ pub fn print_doctor_report(report: &DoctorReport) {
     }
 
     if report.is_ready() {
-        println!("\nAll pre-flight checks passed! Speechyyy is ready to run.\n");
+        let config = crate::config::Config::load();
+        let nickname = config.nickname();
+        println!(
+            "\n[✓] Everything looks gorgeous, {}. Audio and permissions are golden.\n",
+            nickname
+        );
     } else {
         println!("\nRecommended Remediation Steps:\n");
         for (idx, step) in report.fix_instructions.iter().enumerate() {

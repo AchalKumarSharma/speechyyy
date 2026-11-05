@@ -135,6 +135,22 @@ impl Default for AudioConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct UiConfig {
+    #[serde(default = "default_nickname")]
+    pub nickname: String,
+}
+
+fn default_nickname() -> String {
+    "babe".to_string()
+}
+
+fn default_ui_config() -> UiConfig {
+    UiConfig {
+        nickname: default_nickname(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(from = "RawConfig")]
 pub struct Config {
@@ -143,6 +159,7 @@ pub struct Config {
     pub audio: AudioConfig,
     pub inference: InferenceConfig,
     pub injector: InjectorConfig,
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,6 +176,8 @@ struct RawConfig {
     inference: InferenceConfig,
     #[serde(default)]
     injector: InjectorConfig,
+    #[serde(default = "default_ui_config")]
+    ui: UiConfig,
 
     #[serde(default)]
     provider: Option<String>,
@@ -207,12 +226,18 @@ impl From<RawConfig> for Config {
 
         injector.pacing_delay_ms = delay;
 
+        let mut ui = raw.ui;
+        if ui.nickname.trim().is_empty() {
+            ui.nickname = default_nickname();
+        }
+
         Config {
             hotkey: raw.hotkey,
             pacing_delay_ms: delay,
             audio: raw.audio,
             inference,
             injector,
+            ui,
         }
     }
 }
@@ -225,11 +250,23 @@ impl Default for Config {
             audio: AudioConfig::default(),
             inference: InferenceConfig::default(),
             injector: InjectorConfig::default(),
+            ui: UiConfig {
+                nickname: default_nickname(),
+            },
         }
     }
 }
 
 impl Config {
+    pub fn nickname(&self) -> &str {
+        let n = self.ui.nickname.trim();
+        if n.is_empty() {
+            "babe"
+        } else {
+            n
+        }
+    }
+
     pub fn config_path() -> PathBuf {
         let base = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)

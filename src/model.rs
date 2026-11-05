@@ -319,10 +319,10 @@ impl ModelManager {
 
 /// Checks if a model identifier refers to the Sarvam AI cloud provider.
 pub fn is_sarvam_cloud_model(name: &str) -> bool {
-    match name.trim().to_lowercase().replace('_', "-").as_str() {
-        "saaras:v4" | "sarvam:saaras-v4" | "sarvam" | "saaras" => true,
-        _ => false,
-    }
+    matches!(
+        name.trim().to_lowercase().replace('_', "-").as_str(),
+        "saaras:v4" | "sarvam:saaras-v4" | "sarvam" | "saaras"
+    )
 }
 
 /// Generates a descriptive error message listing all supported local and cloud models.
@@ -361,13 +361,17 @@ where
     F: FnMut() -> Result<String, String>,
 {
     let trimmed = model_name.trim();
+    let cfg = crate::config::Config::load_from_path(config_path);
+    let nickname = cfg.nickname();
     if is_sarvam_cloud_model(trimmed) {
-        let cfg = crate::config::Config::load_from_path(config_path);
         if let Some(key) = cfg.inference.resolve_api_key() {
             if !key.trim().is_empty() {
                 println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
                 crate::config::Config::update_active_model_in_file(config_path, "sarvam", "saaras:v4")?;
-                println!("[✓] Model 'saaras:v4' downloaded and set as active.");
+                println!(
+                    "[✓] Model 'saaras:v4' downloaded and set as active for you, {}.",
+                    nickname
+                );
                 return Ok(());
             }
         }
@@ -381,7 +385,10 @@ where
         crate::config::Config::save_sarvam_credentials_in_file(config_path, key)?;
         crate::config::Config::update_active_model_in_file(config_path, "sarvam", "saaras:v4")?;
         println!("[✓] Sarvam API key configured successfully. saaras:v4 is ready to use.");
-        println!("[✓] Model 'saaras:v4' downloaded and set as active.");
+        println!(
+            "[✓] Model 'saaras:v4' downloaded and set as active for you, {}.",
+            nickname
+        );
         Ok(())
     } else if let Some(local_type) = LocalModelType::from_str_name(trimmed) {
         let target_dir = match models_dir {
@@ -395,8 +402,9 @@ where
             local_type.folder_name(),
         )?;
         println!(
-            "[✓] Model '{}' downloaded and set as active.",
-            local_type.folder_name()
+            "[✓] Model '{}' downloaded and set as active for you, {}.",
+            local_type.folder_name(),
+            nickname
         );
         Ok(())
     } else {
@@ -651,7 +659,7 @@ pub fn handle_model_use_command_internal(
     crate::config::Config::update_active_model_in_file(config_path, &provider, &target_model)?;
 
     let confirmation = format!(
-        "Active model set to '{}' in config.toml. Restart daemon to apply.",
+        "Active model set to '{}' in config.toml. Restart Speechyyy to apply.",
         target_model
     );
 
@@ -664,15 +672,19 @@ pub fn handle_model_use_command_internal(
 }
 
 pub fn handle_model_use_command(model_arg: &str) -> Result<(), String> {
+    let config_path = crate::config::Config::config_path();
     let result = handle_model_use_command_internal(
         model_arg,
-        &crate::config::Config::config_path(),
+        &config_path,
         None,
     )?;
 
     if let Some(notice) = result.notice {
         println!("{}", notice);
     }
+
+    let config = crate::config::Config::load_from_path(&config_path);
+    let nickname = config.nickname();
 
     let paths = crate::ipc::RuntimePaths::new();
     let is_running = crate::ipc::PidFile::read_pid(&paths.pid_path)
@@ -681,13 +693,13 @@ pub fn handle_model_use_command(model_arg: &str) -> Result<(), String> {
     if is_running {
         let new_pid = crate::daemon::restart_daemon_process(&paths, None)?;
         println!(
-            "[✓] Switched active model to '{}' and restarted daemon (PID: {}).",
-            result.model, new_pid
+            "[✓] Switched to '{}' for you, {}. Speechyyy reloaded (PID: {}).",
+            result.model, nickname, new_pid
         );
     } else {
         println!(
-            "[✓] Switched active model to '{}'. Run 'speechyyy start' to begin.",
-            result.model
+            "[✓] Switched to '{}' for you, {}. Run 'speechyyy start' to wake me up.",
+            result.model, nickname
         );
     }
 
@@ -749,7 +761,7 @@ pub fn handle_model_remove_internal(
 
     if is_model_active(&cfg, trimmed) {
         println!(
-            "[!] Notice: '{}' is currently your active model. Run 'speechyyy use <OTHER_MODEL>' before starting the daemon.",
+            "[!] Notice: '{}' is currently your active model. Run 'speechyyy use <OTHER_MODEL>' before starting Speechyyy.",
             trimmed
         );
     }
@@ -757,9 +769,11 @@ pub fn handle_model_remove_internal(
     fs::remove_dir_all(&target_dir)
         .map_err(|e| format!("Failed to remove model directory {}: {}", target_dir.display(), e))?;
 
+    let nickname = cfg.nickname();
+    let size_str = format!("{:.1} MB", size_mb);
     println!(
-        "[✓] Successfully removed '{}' (freed {:.1} MB)",
-        trimmed, size_mb
+        "[✓] Removed '{}', {}. Reclaimed {} for you.",
+        trimmed, nickname, size_str
     );
 
     Ok(())
@@ -907,7 +921,7 @@ mod tests {
         );
         assert_eq!(
             res_sarvam.confirmation,
-            "Active model set to 'saaras:v4' in config.toml. Restart daemon to apply."
+            "Active model set to 'saaras:v4' in config.toml. Restart Speechyyy to apply."
         );
         let cfg = crate::config::Config::load_from_path(&config_file);
         assert_eq!(cfg.inference.provider, "sarvam");
@@ -932,7 +946,7 @@ mod tests {
         );
         assert_eq!(
             res_parakeet.confirmation,
-            "Active model set to 'parakeet-tdt-v3' in config.toml. Restart daemon to apply."
+            "Active model set to 'parakeet-tdt-v3' in config.toml. Restart Speechyyy to apply."
         );
         let cfg = crate::config::Config::load_from_path(&config_file);
         assert_eq!(cfg.inference.provider, "local");
@@ -951,7 +965,7 @@ mod tests {
         assert_eq!(res_whisper.notice, None);
         assert_eq!(
             res_whisper.confirmation,
-            "Active model set to 'whisper-small' in config.toml. Restart daemon to apply."
+            "Active model set to 'whisper-small' in config.toml. Restart Speechyyy to apply."
         );
         let cfg = crate::config::Config::load_from_path(&config_file);
         assert_eq!(cfg.inference.provider, "local");

@@ -170,7 +170,7 @@ fn test_model_use_curated_presets() {
     );
     assert_eq!(
         res.confirmation,
-        "Active model set to 'saaras:v4' in config.toml. Restart daemon to apply."
+        "Active model set to 'saaras:v4' in config.toml. Restart Speechyyy to apply."
     );
 
     // 2. saaras:v4 with configured API key -> no warning notice
@@ -192,7 +192,7 @@ fn test_model_use_curated_presets() {
     );
     assert_eq!(
         res.confirmation,
-        "Active model set to 'parakeet-tdt-v3' in config.toml. Restart daemon to apply."
+        "Active model set to 'parakeet-tdt-v3' in config.toml. Restart Speechyyy to apply."
     );
 
     // 4. whisper-small
@@ -327,7 +327,7 @@ fn test_uninstall_command_lifecycle() {
     let onnx_lib = home_dir.join(".local").join("bin").join("libonnxruntime.so");
 
     fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("config.toml"), b"# config").unwrap();
+    fs::write(config_dir.join("config.toml"), b"# config\n[ui]\nnickname = \"sweetheart\"\n").unwrap();
     fs::create_dir_all(&share_dir).unwrap();
     fs::write(share_dir.join("dummy.dat"), b"data").unwrap();
     fs::create_dir_all(cargo_bin.parent().unwrap()).unwrap();
@@ -338,29 +338,19 @@ fn test_uninstall_command_lifecycle() {
     fs::write(&onnx_lib, b"so").unwrap();
 
     let paths = RuntimePaths::with_dir(temp_dir.join("runtime"));
+    fs::create_dir_all(&paths.dir).unwrap();
+    fs::write(&paths.socket_path, b"mock socket").unwrap();
 
-    // 1. Uninstall without purge: binaries and companion libs removed, configs & models retained
-    let res_no_purge = handle_uninstall_command_internal(false, &paths, Some(&home_dir));
-    assert!(res_no_purge.is_ok());
-    assert!(config_dir.exists());
-    assert!(share_dir.exists());
-    assert!(!cargo_bin.exists());
-    assert!(!local_bin.exists());
-    assert!(!sherpa_lib.exists());
-    assert!(!onnx_lib.exists());
-
-    // 2. Uninstall with purge: re-create binaries to test purge phase
-    fs::write(&cargo_bin, b"binary").unwrap();
-    fs::write(&local_bin, b"binary").unwrap();
-    fs::write(&sherpa_lib, b"so").unwrap();
-
-    let res_purge = handle_uninstall_command_internal(true, &paths, Some(&home_dir));
-    assert!(res_purge.is_ok());
+    // Autonomous True Uninstall cleanly unlinks binaries, companion libs, config, models, and IPC socket
+    let res = handle_uninstall_command_internal(&paths, Some(&home_dir));
+    assert!(res.is_ok());
     assert!(!config_dir.exists());
     assert!(!share_dir.exists());
     assert!(!cargo_bin.exists());
     assert!(!local_bin.exists());
     assert!(!sherpa_lib.exists());
+    assert!(!onnx_lib.exists());
+    assert!(!paths.socket_path.exists());
 
     let _ = fs::remove_dir_all(temp_dir);
 }

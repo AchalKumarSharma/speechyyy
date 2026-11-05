@@ -9,7 +9,6 @@ use crate::injector::{create_injector, TextInjector};
 use crate::input::{EvdevListener, InputEventSource};
 use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, PidFile, RuntimePaths};
 use crate::text::{LearningDictionary, TextFormatter, TextPipeline};
-use std::fs;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -107,9 +106,11 @@ pub fn start_daemon(
     if !foreground {
         if let Some(pid) = PidFile::read_pid(&paths.pid_path) {
             if PidFile::is_process_running(pid) {
+                let config = Config::load();
+                let nickname = config.nickname();
                 return Err(format!(
-                    "Speechyyy daemon is already running with PID {}",
-                    pid
+                    "Speechyyy is already active and listening for you, {} (PID: {})",
+                    nickname, pid
                 ));
             }
         }
@@ -137,7 +138,7 @@ pub fn start_daemon(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| format!("Failed to spawn daemon process: {}", e))?;
+            .map_err(|e| format!("Failed to spawn Speechyyy process: {}", e))?;
 
         let child_pid = child.id();
 
@@ -156,20 +157,22 @@ pub fn start_daemon(
         }
 
         if ready {
+            let config = Config::load();
+            let nickname = config.nickname();
             println!(
-                "Speechyyy daemon started successfully (PID: {}).",
-                child_pid
+                "[✓] I'm all ears, {}. Speechyyy is active and listening (PID: {}).",
+                nickname, child_pid
             );
             Ok(())
         } else {
             if let Ok(Some(status)) = child.try_wait() {
                 Err(format!(
-                    "Daemon process exited immediately with status: {}",
+                    "Speechyyy process exited immediately with status: {}",
                     status
                 ))
             } else {
                 let _ = child.kill();
-                Err("Daemon process timed out waiting for socket initialization".into())
+                Err("Speechyyy process timed out waiting for socket initialization".into())
             }
         }
     } else {
@@ -181,7 +184,7 @@ pub fn start_daemon(
             Err(e) => {
                 paths.cleanup();
                 return Err(format!(
-                    "Failed to bind daemon socket at {}: {:?}",
+                    "Failed to bind Speechyyy socket at {}: {:?}",
                     paths.socket_path.display(),
                     e
                 ));
@@ -230,7 +233,7 @@ pub fn start_daemon(
         let mut controller = StateMachineController::new(target_chord, engine);
 
         println!(
-            "Speechyyy daemon running in foreground (PID: {}).",
+            "Speechyyy running in foreground (PID: {}).",
             std::process::id()
         );
         println!("Push-to-Talk Hotkey: {:?}", config.hotkey);
@@ -252,25 +255,26 @@ pub fn start_daemon(
             config.pacing_delay_ms,
         );
 
-        println!("Shutting down Speechyyy daemon...");
+        println!("Shutting down Speechyyy...");
         paths.cleanup();
         Ok(())
     }
 }
 
 pub fn stop_daemon(paths: &RuntimePaths) -> Result<(), String> {
+    let config = Config::load();
+    let nickname = config.nickname();
     if !paths.socket_path.exists() && !paths.pid_path.exists() {
-        println!("Speechyyy daemon is not running.");
+        println!("[✓] Resting now, {}. Speechyyy stopped.", nickname);
         return Ok(());
     }
 
     let existing_pid = PidFile::read_pid(&paths.pid_path);
 
     if paths.socket_path.exists() {
-        if let Ok(IpcResponse::Ok { message }) =
+        if let Ok(IpcResponse::Ok { .. }) =
             IpcClient::send_request(&paths.socket_path, &IpcRequest::Stop)
         {
-            println!("{}", message);
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(2) {
                 if let Some(pid) = existing_pid {
@@ -283,7 +287,7 @@ pub fn stop_daemon(paths: &RuntimePaths) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(50));
             }
             paths.cleanup();
-            println!("Speechyyy daemon stopped.");
+            println!("[✓] Resting now, {}. Speechyyy stopped.", nickname);
             return Ok(());
         }
     }
@@ -291,19 +295,19 @@ pub fn stop_daemon(paths: &RuntimePaths) -> Result<(), String> {
     if let Some(pid) = existing_pid {
         let current_pid = std::process::id();
         if pid != current_pid && PidFile::is_process_running(pid) {
-            println!("Sending SIGTERM to PID {}...", pid);
+            println!("Stopping Speechyyy (PID: {})...", pid);
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
             std::thread::sleep(Duration::from_millis(100));
             paths.cleanup();
-            println!("Speechyyy daemon stopped.");
+            println!("[✓] Resting now, {}. Speechyyy stopped.", nickname);
             return Ok(());
         }
     }
 
     paths.cleanup();
-    println!("Cleaned up stale daemon files. Daemon was not running.");
+    println!("[✓] Resting now, {}. Speechyyy stopped.", nickname);
     Ok(())
 }
 
@@ -338,7 +342,7 @@ pub fn restart_daemon_process(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to spawn daemon process: {}", e))?;
+        .map_err(|e| format!("Failed to spawn Speechyyy process: {}", e))?;
 
     let child_pid = child.id();
 
@@ -347,7 +351,7 @@ pub fn restart_daemon_process(
     while start.elapsed() < Duration::from_secs(2) {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
-                "Daemon process exited prematurely with status: {}",
+                "Speechyyy process exited prematurely with status: {}",
                 status
             ));
         }
@@ -364,13 +368,15 @@ pub fn restart_daemon_process(
 
     if !ready {
         let _ = child.kill();
-        return Err("Timed out waiting for restarted Speechyyy daemon to initialize.".into());
+        return Err("Timed out waiting for restarted Speechyyy to initialize.".into());
     }
 
     Ok(child_pid)
 }
 
 pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
+    let config = Config::load();
+    let nickname = config.nickname();
     if paths.socket_path.exists() {
         match IpcClient::send_request(&paths.socket_path, &IpcRequest::Status) {
             Ok(IpcResponse::Status {
@@ -379,7 +385,10 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
                 hotkey,
                 pacing_delay_ms,
             }) => {
-                println!("[ACTIVE] Speechyyy daemon is running.");
+                println!(
+                    "[ACTIVE] Speechyyy is active and ready for you, {} (PID: {}).",
+                    nickname, pid
+                );
                 println!("  PID:          {}", pid);
                 println!("  State:        {}", state);
                 println!("  Hotkey:       {}", hotkey);
@@ -389,7 +398,7 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
             }
             Ok(other) => {
                 println!(
-                    "[WARN] Daemon returned unexpected status response: {:?}",
+                    "[WARN] Speechyyy returned unexpected status response: {:?}",
                     other
                 );
                 return Ok(());
@@ -401,85 +410,18 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
     if let Some(pid) = PidFile::read_pid(&paths.pid_path) {
         if PidFile::is_process_running(pid) {
             println!(
-                "[ACTIVE] Daemon process found (PID: {}), but socket is unresponsive.",
-                pid
+                "[ACTIVE] Speechyyy is active and ready for you, {} (PID: {}).",
+                nickname, pid
             );
             return Ok(());
         }
     }
 
-    println!("[INACTIVE] Speechyyy daemon is not running.");
+    println!(
+        "[INACTIVE] Speechyyy is sleeping, {}. Run 'speechyyy start' to wake me up.",
+        nickname
+    );
     Ok(())
 }
 
-pub fn handle_uninstall_command_internal(
-    purge: bool,
-    paths: &RuntimePaths,
-    home_dir: Option<&Path>,
-) -> Result<(), String> {
-    let pid = PidFile::read_pid(&paths.pid_path);
-    let is_running = paths.socket_path.exists() || pid.is_some_and(PidFile::is_process_running);
-    if is_running {
-        println!("Stopping running Speechyyy daemon...");
-        let _ = stop_daemon(paths);
-    }
-
-    let home = match home_dir {
-        Some(h) => h.to_path_buf(),
-        None => {
-            let h = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(h)
-        }
-    };
-
-    let companion_libs = [
-        "libsherpa-onnx-c-api.so",
-        "libsherpa-onnx-cxx-api.so",
-        "libonnxruntime.so",
-    ];
-
-    // Unlink binaries and companion libraries unconditionally (both with and without --purge)
-    let cargo_bin = home.join(".cargo").join("bin").join("speechyyy");
-    if cargo_bin.exists() {
-        let _ = fs::remove_file(&cargo_bin);
-    }
-    let local_bin = home.join(".local").join("bin").join("speechyyy");
-    if local_bin.exists() {
-        let _ = fs::remove_file(&local_bin);
-    }
-    let local_bin_dir = home.join(".local").join("bin");
-    for lib in &companion_libs {
-        let lib_path = local_bin_dir.join(lib);
-        if lib_path.exists() {
-            let _ = fs::remove_file(&lib_path);
-        }
-    }
-
-    if purge {
-        // 1. Remove ~/.local/share/speechyyy/
-        let data_dir = home.join(".local").join("share").join("speechyyy");
-        if data_dir.exists() {
-            let _ = fs::remove_dir_all(&data_dir);
-        }
-
-        // 2. Remove ~/.config/speechyyy/
-        let config_dir = home.join(".config").join("speechyyy");
-        if config_dir.exists() {
-            let _ = fs::remove_dir_all(&config_dir);
-        }
-
-        paths.cleanup();
-        println!("[✓] Purged all Speechyyy models, configuration, binaries, and data.");
-    } else {
-        println!("[✓] Speechyyy binary and runtime libraries uninstalled.");
-        println!("    Note: Models and configurations were retained in ~/.local/share/speechyyy and ~/.config/speechyyy.");
-        println!("    To remove them manually, run: rm -rf ~/.local/share/speechyyy ~/.config/speechyyy");
-    }
-
-    Ok(())
-}
-
-pub fn handle_uninstall_command(purge: bool) -> Result<(), String> {
-    let paths = RuntimePaths::new();
-    handle_uninstall_command_internal(purge, &paths, None)
-}
+pub use crate::uninstall::{handle_uninstall_command, handle_uninstall_command_internal};
