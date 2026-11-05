@@ -95,6 +95,17 @@ pub fn start_daemon(
     }
 
     // Pre-flight check
+    let mut check_config = Config::load();
+    check_config.apply_cli_overrides(provider, mode, injection, typing_delay);
+    if check_config.inference.provider != "mock"
+        && check_config.inference.provider != "custom"
+        && check_config.inference.model.trim().is_empty()
+    {
+        return Err(
+            "No active model configured. Run 'speechyyy use <model>' to activate a model before starting Speechyyy.".into(),
+        );
+    }
+
     let env = RealSysEnv;
     let report = run_doctor(&env);
     if !report.is_ready() {

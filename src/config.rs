@@ -344,6 +344,51 @@ impl Config {
         Ok(())
     }
 
+    pub fn deactivate_model_in_file(path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "Failed to create config directory {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+
+        let mut table = if path.exists() {
+            let content = fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            match toml::from_str::<toml::Value>(&content) {
+                Ok(toml::Value::Table(t)) => t,
+                _ => toml::Table::new(),
+            }
+        } else {
+            toml::Table::new()
+        };
+
+        let inf_val = table
+            .entry("inference")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+
+        if let toml::Value::Table(ref mut inf_table) = inf_val {
+            inf_table.insert("model".into(), toml::Value::String("".to_string()));
+        } else {
+            let mut inf_table = toml::Table::new();
+            inf_table.insert("model".into(), toml::Value::String("".to_string()));
+            table.insert("inference".into(), toml::Value::Table(inf_table));
+        }
+
+        table.remove("sarvam_model");
+
+        let serialized = toml::to_string_pretty(&toml::Value::Table(table))
+            .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
+
+        fs::write(path, serialized)
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+
+        Ok(())
+    }
+
     pub fn save_sarvam_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -637,6 +682,33 @@ model = "whisper-small"
         assert_eq!(reloaded.inference.api_key, "updated_token_xyz");
         assert_eq!(reloaded.inference.model, "whisper-small");
         assert_eq!(reloaded.hotkey, "LeftAlt");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_deactivate_model_in_config_file() {
+        let temp_dir = std::env::temp_dir().join(format!("speechyyy_deactivate_cfg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let config_file = temp_dir.join("speechyyy").join("config.toml");
+
+        let custom_toml = r#"
+hotkey = "RightAlt"
+[inference]
+provider = "local"
+model = "parakeet-tdt-v3"
+"#;
+        fs::create_dir_all(config_file.parent().unwrap()).unwrap();
+        fs::write(&config_file, custom_toml).unwrap();
+
+        let loaded = Config::load_from_path(&config_file);
+        assert_eq!(loaded.inference.model, "parakeet-tdt-v3");
+
+        Config::deactivate_model_in_file(&config_file).expect("deactivate model in file");
+
+        let reloaded = Config::load_from_path(&config_file);
+        assert_eq!(reloaded.inference.provider, "local");
+        assert_eq!(reloaded.inference.model, "");
 
         let _ = fs::remove_dir_all(temp_dir);
     }

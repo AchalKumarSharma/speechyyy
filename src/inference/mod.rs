@@ -54,6 +54,14 @@ impl SpeechInference for Box<dyn SpeechInference> {
 pub fn create_inference_provider(
     config: &crate::config::InferenceConfig,
 ) -> Result<Box<dyn SpeechInference>, String> {
+    if config.provider != "mock"
+        && config.provider != "custom"
+        && config.model.trim().is_empty()
+    {
+        return Err(
+            "No active model configured. Run 'speechyyy use <model>' to activate a model.".to_string(),
+        );
+    }
     match config.provider.to_lowercase().as_str() {
         "mock" => Ok(Box::new(mock::MockSpeechInference::new())),
         "sarvam" => {

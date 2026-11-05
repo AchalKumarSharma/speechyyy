@@ -5,7 +5,8 @@ use speechyyy::daemon::handle_uninstall_command_internal;
 use speechyyy::ipc::RuntimePaths;
 use speechyyy::model::{
     format_model_list_with_models_dir, handle_model_download_internal,
-    handle_model_remove_internal, handle_model_use_command_internal, LocalModelType,
+    handle_model_remove_full, handle_model_remove_internal, handle_model_use_command_internal,
+    LocalModelType,
 };
 use std::fs;
 
@@ -281,17 +282,35 @@ fn test_model_remove_lifecycle() {
     let _ = fs::remove_dir_all(&temp_dir);
     let models_dir = temp_dir.join("models");
     let config_path = temp_dir.join("config.toml");
+    let runtime_dir = temp_dir.join("runtime");
 
     let parakeet_dir = models_dir.join("parakeet-tdt-v3");
     fs::create_dir_all(&parakeet_dir).unwrap();
     fs::write(parakeet_dir.join("encoder.int8.onnx"), vec![0u8; 1024 * 1024]).unwrap();
 
+    let paths = RuntimePaths::with_dir(runtime_dir);
+    fs::create_dir_all(&paths.dir).unwrap();
+    fs::write(&paths.socket_path, b"mock socket").unwrap();
+
     Config::update_active_model_in_file(&config_path, "local", "parakeet-tdt-v3").unwrap();
 
-    // 1. Remove active model
-    let res = handle_model_remove_internal("parakeet-tdt-v3", Some(&models_dir), Some(&config_path));
+    // 1. Remove active model while running: stops running process, deactivates in config, unlinks files
+    let res = handle_model_remove_full("parakeet-tdt-v3", Some(&models_dir), Some(&config_path), Some(&paths));
     assert!(res.is_ok());
-    assert!(!parakeet_dir.exists());
+    assert!(!parakeet_dir.exists(), "Model directory should be removed");
+    assert!(!paths.socket_path.exists(), "Running daemon socket should be cleaned up on active model removal");
+
+    // Verify config is deactivated
+    let reloaded_cfg = Config::load_from_path(&config_path);
+    assert_eq!(reloaded_cfg.inference.model, "", "Active model should be empty/deactivated");
+
+    // Verify model list shows ACTIVE: no across all models
+    let list_output = format_model_list_with_models_dir(&reloaded_cfg, Some(&models_dir));
+    for line in list_output.lines().skip(1) {
+        if line.contains("Sarvam") || line.contains("Local") {
+            assert!(line.ends_with("no"), "All models should display ACTIVE: no, got: {}", line);
+        }
+    }
 
     // 2. Remove already removed / non-existent model
     let res_missing =

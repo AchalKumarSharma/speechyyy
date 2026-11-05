@@ -141,6 +141,14 @@ impl SysEnv for RealSysEnv {
 }
 
 pub fn check_inference_for_config(config: &crate::config::Config) -> Result<String, String> {
+    if config.inference.provider != "mock"
+        && config.inference.provider != "custom"
+        && config.inference.model.trim().is_empty()
+    {
+        return Err(
+            "No active model configured. Run 'speechyyy use <model>' to choose one.".to_string(),
+        );
+    }
     match config.inference.provider.to_lowercase().as_str() {
         "sarvam" => {
             if let Some(key) = config.inference.resolve_api_key() {
@@ -1009,5 +1017,10 @@ mod tests {
                 );
             }
         }
+
+        // Empty active model returns clean actionable error
+        config.inference.model = "".into();
+        let err_empty = check_inference_for_config(&config).unwrap_err();
+        assert!(err_empty.contains("speechyyy use <model>"));
     }
 }

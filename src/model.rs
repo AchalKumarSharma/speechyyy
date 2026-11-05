@@ -474,12 +474,14 @@ pub fn check_local_model_exists(model_type: LocalModelType, base_dir: Option<&Pa
 }
 
 pub fn is_model_active(cfg: &crate::config::Config, model_id: &str) -> bool {
+    if cfg.inference.model.trim().is_empty() {
+        return false;
+    }
     match model_id {
         "saaras:v4" => {
             cfg.inference.provider.eq_ignore_ascii_case("sarvam")
                 && (cfg.inference.model.eq_ignore_ascii_case("saaras:v4")
-                    || cfg.inference.model.eq_ignore_ascii_case("sarvam:saaras-v4")
-                    || cfg.inference.model.is_empty())
+                    || cfg.inference.model.eq_ignore_ascii_case("sarvam:saaras-v4"))
         }
         #[cfg(target_os = "macos")]
         "apple-speech" => cfg.inference.provider.eq_ignore_ascii_case("apple"),
@@ -720,6 +722,15 @@ pub fn handle_model_remove_internal(
     models_dir: Option<&Path>,
     config_path: Option<&Path>,
 ) -> Result<(), String> {
+    handle_model_remove_full(model_name, models_dir, config_path, None)
+}
+
+pub fn handle_model_remove_full(
+    model_name: &str,
+    models_dir: Option<&Path>,
+    config_path: Option<&Path>,
+    paths_override: Option<&crate::ipc::RuntimePaths>,
+) -> Result<(), String> {
     let trimmed = model_name.trim();
     if trimmed.is_empty() {
         return Err("Model name cannot be empty".to_string());
@@ -752,18 +763,31 @@ pub fn handle_model_remove_internal(
         Some(cp) => crate::config::Config::load_from_path(cp),
         None => crate::config::Config::load(),
     };
+    let nickname = cfg.nickname();
 
     if is_model_active(&cfg, trimmed) {
+        let paths = paths_override.cloned().unwrap_or_else(crate::ipc::RuntimePaths::new);
+        let is_running = crate::ipc::PidFile::read_pid(&paths.pid_path)
+            .is_some_and(crate::ipc::PidFile::is_process_running)
+            || paths.socket_path.exists();
+        if is_running {
+            let _ = crate::daemon::stop_daemon(&paths);
+        }
+
+        let target_config_path = config_path
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::config::Config::config_path);
+        let _ = crate::config::Config::deactivate_model_in_file(&target_config_path);
+
         println!(
-            "[!] Notice: '{}' is currently your active model. Run 'speechyyy use <OTHER_MODEL>' before starting Speechyyy.",
-            trimmed
+            "[!] Notice: '{}' was your active model, {}. Speechyyy has been stopped and deactivated. Pick another model with 'speechyyy use <model>' whenever you're ready.",
+            trimmed, nickname
         );
     }
 
     fs::remove_dir_all(&target_dir)
         .map_err(|e| format!("Failed to remove model directory {}: {}", target_dir.display(), e))?;
 
-    let nickname = cfg.nickname();
     let size_str = format!("{:.1} MB", size_mb);
     println!(
         "[✓] Removed '{}', {}. Reclaimed {} for you.",
@@ -888,6 +912,15 @@ mod tests {
         assert!(parakeet_row.contains("Local Transducer"));
         assert!(parakeet_row.contains("Installed"));
         assert!(parakeet_row.contains("yes"));
+
+        // When deactivated, no model is active ("no" for all models)
+        cfg.inference.model = "".into();
+        let output_inactive = format_model_list_with_models_dir(&cfg, Some(&models_dir));
+        for line in output_inactive.lines().skip(1) {
+            if line.contains("Sarvam") || line.contains("Local") {
+                assert!(line.ends_with("no"), "Row should have ACTIVE: no, got: {}", line);
+            }
+        }
 
         let _ = fs::remove_dir_all(temp_dir);
     }
