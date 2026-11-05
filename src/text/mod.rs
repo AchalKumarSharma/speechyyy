@@ -3,7 +3,7 @@ pub mod format;
 
 pub use dictionary::{
     handle_learn_command, handle_learn_command_opts, handle_unlearn_command,
-    handle_unlearn_command_internal, LearningDictionary,
+    handle_unlearn_command_internal, LearningDictionary, DEFAULT_REPLACEMENTS,
 };
 pub use format::{capitalize_sentence, clean_hallucinations, TextFormatter};
 

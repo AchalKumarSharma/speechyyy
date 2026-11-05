@@ -51,27 +51,30 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
    speechyyy doctor
    ```
 
-2. **Manage Models (Local & Cloud BYOK)**:
-   ```bash
-   # List available presets
-   speechyyy models
+2. **Initial Setup Flow**:
+   - **Step 1: Download or Configure a Model**:
+     Fetch local model weights or configure cloud BYOK credentials without premature activation:
+     ```bash
+     # Download a fast local offline model (e.g. Parakeet TDT v3)
+     speechyyy download parakeet-tdt-v3
 
-   # Download local weights (e.g. Parakeet TDT v3)
-   speechyyy download parakeet-tdt-v3
+     # Or configure cloud models (interactively prompts for Sarvam API key if not set)
+     speechyyy download saaras:v4
+     ```
 
-   # Or configure cloud models (interactively prompts for API key if not set)
-   speechyyy download saaras:v4
+   - **Step 2: Activate the Model**:
+     Explicitly set your active model:
+     ```bash
+     speechyyy use parakeet-tdt-v3  # or: speechyyy use saaras:v4
+     ```
 
-   # Activate the model
-   speechyyy use parakeet-tdt-v3  # or: speechyyy use saaras:v4
-   ```
+   - **Step 3: Wake Up Speechyyy**:
+     Start the background daemon:
+     ```bash
+     speechyyy start
+     ```
 
-3. **Start the Daemon**:
-   ```bash
-   speechyyy start
-   ```
-
-4. **Dictate**:
+3. **Dictate**:
    - Focus any text box or application.
    - Hold **RightAlt**, speak your thoughts, and release.
    - Speechyyy transcribes and types the text directly at your caret.
@@ -80,27 +83,33 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 | Command | Description |
 |---|---|
-| `speechyyy start [-f]` | Start the background daemon (`-f` for foreground logs) |
-| `speechyyy stop` | Stop the running daemon |
-| `speechyyy status` | Inspect daemon process status |
-| `speechyyy doctor` | Inspect system permissions, audio inputs, and model weights |
-| `speechyyy models` | List available models and active status (alias: `model`) |
-| `speechyyy download <MODEL>` | Download local model weights or configure cloud BYOK (`saaras:v4`) |
-| `speechyyy use <MODEL>` | Switch active model (`saaras:v4`, `parakeet-tdt-v3`, etc.) |
-| `speechyyy remove <MODEL>` | Delete local model weights to free disk space (alias: `rm`) |
-| `speechyyy uninstall [--purge]`| Stop daemon and remove local configuration/data |
-| `speechyyy learn <HEARD> <TYPED>`| Add a phonetic replacement rule to `dictionary.toml` |
+| `speechyyy start [-f]` | Start Speechyyy in background (`-f` / `--foreground` for foreground logs) |
+| `speechyyy stop` | Stop the running Speechyyy process |
+| `speechyyy status` | Check whether Speechyyy is active and listening |
+| `speechyyy doctor` | Inspect system permissions, audio inputs, and active model configuration |
+| `speechyyy model` | List all supported models with installation status and active indicator (alias: `models`) |
+| `speechyyy download <MODEL>` | Fetch model weights or configure credentials without premature activation |
+| `speechyyy use <MODEL>` | Switch active model, automatically stopping and reloading active processes |
+| `speechyyy remove <MODEL>` | Reclaim disk space by deleting weights; deactivates and stops Speechyyy if active (alias: `rm`) |
+| `speechyyy update [--force]` | In-place atomic self-updater to the latest GitHub release |
+| `speechyyy uninstall [-y]` | Autonomous complete uninstallation of binary, companion libraries, models, and configs (`-y` to skip prompt) |
+| `speechyyy learn <HEARD> <TYPED>` | Add a phonetic replacement rule to `dictionary.toml` |
 | `speechyyy fix <EXPECTED>` | Fix the last transcription and store correction rule |
 | `speechyyy unlearn [KEY]` | Remove a replacement rule from `dictionary.toml` |
 | `speechyyy history` | Inspect recent dictation utterances |
 
-## Configuration
+## Configuration & Personality
+
+Speechyyy comes with a warm, flirty personality engine that addresses you by nickname across all commands and notifications.
 
 Configuration is stored in `~/.config/speechyyy/config.toml`:
 
 ```toml
 hotkey = "RightAlt"
 pacing_delay_ms = 15
+
+[ui]
+nickname = "babe" # Customize how Speechyyy affectionately addresses you (default: "babe")
 
 [audio]
 sample_rate = 16000
@@ -110,10 +119,10 @@ min_duration_ms = 200
 [inference]
 provider = "local" # "local", "sarvam", or "custom"
 model = "parakeet-tdt-v3"
-# api_key = "..." # or set SARVAM_API_KEY environment variable
+# api_key = "..."  # or set SARVAM_API_KEY environment variable
 
 [injector]
-method = "typewriter" # "typewriter" or "wayland"
+method = "typewriter" # "typewriter" (direct uinput keystrokes) or "wayland" (clipboard fallback)
 pacing_delay_ms = 15
 ```
 

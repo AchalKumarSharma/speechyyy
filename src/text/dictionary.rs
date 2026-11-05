@@ -3,6 +3,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const DEFAULT_REPLACEMENTS: &[(&str, &str)] = &[
+    ("speechy", "speechyyy"),
+    ("speechi", "speechyyy"),
+    ("spichi", "speechyyy"),
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DictionaryFile {
     #[serde(default)]
@@ -203,6 +209,12 @@ impl LearningDictionary {
             current = replace_word_boundary(&current, pattern_lower, replacement);
         }
 
+        for &(pattern, replacement) in DEFAULT_REPLACEMENTS {
+            if !self.rules.iter().any(|(k, _, _)| k == pattern) {
+                current = replace_word_boundary_with_case(&current, pattern, replacement, true);
+            }
+        }
+
         current
     }
 }
@@ -268,8 +280,37 @@ pub fn handle_unlearn_command(key: Option<&str>) -> Result<(), String> {
     handle_unlearn_command_internal(key, None)
 }
 
+/// Adapts replacement casing based on the matched original token.
+fn adapt_casing(matched: &str, replacement: &str) -> String {
+    if matched.chars().all(|c| !c.is_alphabetic() || c.is_uppercase()) {
+        return replacement.to_uppercase();
+    }
+    let mut chars = matched.chars();
+    if let Some(first) = chars.next() {
+        if first.is_uppercase() {
+            let mut rep_chars = replacement.chars();
+            if let Some(rep_first) = rep_chars.next() {
+                let mut res = rep_first.to_uppercase().to_string();
+                res.extend(rep_chars);
+                return res;
+            }
+        }
+    }
+    replacement.to_string()
+}
+
 /// Replaces whole-word occurrences of `pattern_lower` in `text` with `replacement` (case-insensitive).
 fn replace_word_boundary(text: &str, pattern_lower: &str, replacement: &str) -> String {
+    replace_word_boundary_with_case(text, pattern_lower, replacement, false)
+}
+
+/// Replaces whole-word occurrences with optional casing adaptation.
+fn replace_word_boundary_with_case(
+    text: &str,
+    pattern_lower: &str,
+    replacement: &str,
+    preserve_case: bool,
+) -> String {
     if pattern_lower.is_empty() || text.is_empty() {
         return text.to_string();
     }
@@ -300,12 +341,21 @@ fn replace_word_boundary(text: &str, pattern_lower: &str, replacement: &str) -> 
 
         if is_start_boundary && is_end_boundary {
             result.push_str(&text[cursor..match_start]);
-            result.push_str(replacement);
+            let rep = if preserve_case {
+                adapt_casing(&text[match_start..match_end], replacement)
+            } else {
+                replacement.to_string()
+            };
+            result.push_str(&rep);
             cursor = match_end;
         } else {
-            // Partial match (e.g. "js" inside "json"); advance to start + 1
-            result.push_str(&text[cursor..=match_start]);
-            cursor = match_start + 1;
+            let next_cursor = text[match_start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| match_start + offset)
+                .unwrap_or(text.len());
+            result.push_str(&text[cursor..next_cursor]);
+            cursor = next_cursor;
         }
     }
 
@@ -452,5 +502,45 @@ mod tests {
         assert!(res_bare.is_ok());
         let res_one = handle_learn_command_opts(Some("wrong"), None);
         assert!(res_one.is_ok());
+    }
+
+    #[test]
+    fn test_default_speechyyy_replacements() {
+        let dict = LearningDictionary::new();
+
+        // Exact test case required by spec:
+        let input = "Hey speechi, test speechy spichi";
+        assert_eq!(
+            dict.apply(input),
+            "Hey speechyyy, test speechyyy speechyyy"
+        );
+
+        // Case-insensitive adaptation (e.g. Speechi -> Speechyyy)
+        assert_eq!(dict.apply("Speechi is ready"), "Speechyyy is ready");
+        assert_eq!(dict.apply("I love Speechy"), "I love Speechyyy");
+        assert_eq!(dict.apply("Listen Spichi"), "Listen Speechyyy");
+        assert_eq!(dict.apply("ALL CAPS SPEECHI AND SPEECHY"), "ALL CAPS SPEECHYYY AND SPEECHYYY");
+
+        // Substring boundary protection - should NOT replace inside other words
+        assert_eq!(dict.apply("He is speechless"), "He is speechless");
+        assert_eq!(dict.apply("the speechiest speaker"), "the speechiest speaker");
+        assert_eq!(dict.apply("conspichi test"), "conspichi test");
+    }
+
+    #[test]
+    fn test_text_pipeline_speechyyy_normalization() {
+        let mut pipeline = crate::text::TextPipeline::new(
+            crate::text::TextFormatter::default(),
+            LearningDictionary::new(),
+        );
+        let res = pipeline.process("Hey speechi, test speechy spichi").unwrap();
+        assert_eq!(res, "Hey speechyyy, test speechyyy speechyyy");
+
+        let mut pipeline2 = crate::text::TextPipeline::new(
+            crate::text::TextFormatter::default(),
+            LearningDictionary::new(),
+        );
+        let res2 = pipeline2.process("speechi is active").unwrap();
+        assert_eq!(res2, "Speechyyy is active");
     }
 }
