@@ -322,11 +322,16 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
     let username = env.current_username();
     let groups = env.user_groups();
 
+    // Check evdev event access first to check direct read access (e.g. via ACL/uaccess)
+    let events = env.list_input_events();
+    let readable_count = events.iter().filter(|p| env.can_read_path(p)).count();
+    let has_readable_events = readable_count > 0;
+
     // 1. Group membership checks (input and uinput)
     let has_input_group = groups.iter().any(|g| g == "input");
     let _has_uinput_group = groups.iter().any(|g| g == "uinput");
 
-    if has_input_group {
+    if has_input_group || has_readable_events {
         items.push(DiagnosticItem {
             name: "User 'input' group membership".into(),
             status: CheckStatus::Pass,
@@ -343,33 +348,29 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
         status: CheckStatus::Pass, // On many distros uinput is managed under input group via udev
     });
 
-    if !has_input_group {
+    if !has_input_group && !has_readable_events {
         fix_instructions.push(format!("sudo usermod -aG input,uinput {}", username));
     }
 
     // 2. evdev event access
-    let events = env.list_input_events();
     if events.is_empty() {
         items.push(DiagnosticItem {
             name: "Linux evdev devices (/dev/input/event*)".into(),
             status: CheckStatus::Fail("No /dev/input/event* devices found on system".into()),
         });
+    } else if has_readable_events {
+        items.push(DiagnosticItem {
+            name: "evdev read permissions".into(),
+            status: CheckStatus::Pass,
+        });
     } else {
-        let readable_count = events.iter().filter(|p| env.can_read_path(p)).count();
-        if readable_count > 0 {
-            items.push(DiagnosticItem {
-                name: "evdev read permissions".into(),
-                status: CheckStatus::Pass,
-            });
-        } else {
-            items.push(DiagnosticItem {
-                name: "evdev read permissions".into(),
-                status: CheckStatus::Fail(format!(
-                    "Found {} input device(s) in /dev/input/, but none are readable",
-                    events.len()
-                )),
-            });
-        }
+        items.push(DiagnosticItem {
+            name: "evdev read permissions".into(),
+            status: CheckStatus::Fail(format!(
+                "Found {} input device(s) in /dev/input/, but none are readable",
+                events.len()
+            )),
+        });
     }
 
     // 3. /dev/uinput write access or Wayland clipboard fallback
@@ -503,12 +504,13 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
 
     let udev_rule_content =
         r#"# Speechyyy uinput rule for unprivileged virtual keyboard caret injection
-KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"
 "#
         .trim_start()
         .to_string();
 
-    if !has_input_group {
+    if !has_input_group && !has_readable_events {
         fix_instructions
             .push("Log out and log back in for new group permissions to take effect.".into());
     }
@@ -637,6 +639,23 @@ mod tests {
             .iter()
             .any(|cmd| cmd.contains("usermod -aG input")));
         assert!(report.udev_rule_content.contains("KERNEL==\"uinput\""));
+    }
+
+    #[test]
+    fn test_doctor_acl_direct_read_passes_without_input_group() {
+        let env = MockEnv {
+            user: "alfred".into(),
+            groups: vec!["alfred".into(), "nobody".into()],
+            readable_paths: vec![PathBuf::from("/dev/input/event0")],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            events: vec![PathBuf::from("/dev/input/event0")],
+            audio_input: Ok("Builtin Mic".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
+        };
+
+        let report = run_doctor(&env);
+        assert!(report.is_ready(), "Expected checks to pass via direct ACL access");
+        assert!(report.fix_instructions.is_empty());
     }
 
     #[test]

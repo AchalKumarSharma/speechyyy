@@ -64,6 +64,7 @@ fn main() {
         ),
         Command::Stop => stop_daemon(&paths),
         Command::Status => check_status(&paths),
+        Command::Update { force } => speechyyy::update::handle_update_command(force),
     };
 
     if let Err(e) = result {

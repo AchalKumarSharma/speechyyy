@@ -366,6 +366,8 @@ where
         if let Some(key) = cfg.inference.resolve_api_key() {
             if !key.trim().is_empty() {
                 println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
+                crate::config::Config::update_active_model_in_file(config_path, "sarvam", "saaras:v4")?;
+                println!("[✓] Model 'saaras:v4' downloaded and set as active.");
                 return Ok(());
             }
         }
@@ -377,14 +379,26 @@ where
         }
 
         crate::config::Config::save_sarvam_credentials_in_file(config_path, key)?;
+        crate::config::Config::update_active_model_in_file(config_path, "sarvam", "saaras:v4")?;
         println!("[✓] Sarvam API key configured successfully. saaras:v4 is ready to use.");
+        println!("[✓] Model 'saaras:v4' downloaded and set as active.");
         Ok(())
     } else if let Some(local_type) = LocalModelType::from_str_name(trimmed) {
         let target_dir = match models_dir {
             Some(d) => d.join(local_type.folder_name()),
             None => ModelManager::model_dir(local_type),
         };
-        ModelManager::download_model(local_type, &target_dir).map(|_| ())
+        ModelManager::download_model(local_type, &target_dir)?;
+        crate::config::Config::update_active_model_in_file(
+            config_path,
+            "local",
+            local_type.folder_name(),
+        )?;
+        println!(
+            "[✓] Model '{}' downloaded and set as active.",
+            local_type.folder_name()
+        );
+        Ok(())
     } else {
         Err(unsupported_model_error(trimmed))
     }
@@ -507,6 +521,14 @@ pub fn format_model_list_with_models_dir(
                 }
             } else {
                 "Unknown"
+            }
+        } else if model.provider_type == "sarvam" {
+            let has_key = !cfg.inference.api_key.trim().is_empty()
+                || std::env::var("SARVAM_API_KEY").is_ok_and(|k| !k.trim().is_empty());
+            if has_key {
+                "Configured"
+            } else {
+                "API Key Required"
             }
         } else {
             "Available"
@@ -651,7 +673,24 @@ pub fn handle_model_use_command(model_arg: &str) -> Result<(), String> {
     if let Some(notice) = result.notice {
         println!("{}", notice);
     }
-    println!("{}", result.confirmation);
+
+    let paths = crate::ipc::RuntimePaths::new();
+    let is_running = crate::ipc::PidFile::read_pid(&paths.pid_path)
+        .is_some_and(crate::ipc::PidFile::is_process_running);
+
+    if is_running {
+        let new_pid = crate::daemon::restart_daemon_process(&paths, None)?;
+        println!(
+            "[✓] Switched active model to '{}' and restarted daemon (PID: {}).",
+            result.model, new_pid
+        );
+    } else {
+        println!(
+            "[✓] Switched active model to '{}'. Run 'speechyyy start' to begin.",
+            result.model
+        );
+    }
+
     Ok(())
 }
 
@@ -823,7 +862,12 @@ mod tests {
         assert!(output_sarvam.contains("parakeet-tdt-v3"));
         assert!(output_sarvam.contains("Installed"));
         assert!(output_sarvam.contains("Not Downloaded"));
+        assert!(output_sarvam.contains("API Key Required") || output_sarvam.contains("Configured"));
         assert!(output_sarvam.contains("Tip: For custom ONNX models, set provider = 'custom' in ~/.config/speechyyy/config.toml"));
+
+        cfg.inference.api_key = "test_key".into();
+        let output_configured = format_model_list_with_models_dir(&cfg, Some(&models_dir));
+        assert!(output_configured.contains("Configured"));
 
         // Switch active config to local parakeet-tdt-v3
         cfg.inference.provider = "local".into();

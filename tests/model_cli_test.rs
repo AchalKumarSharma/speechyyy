@@ -97,6 +97,14 @@ fn test_cli_parsing_model_subcommands() {
     let cli_unlearn_bare =
         Cli::try_parse_from(["speechyyy", "unlearn"]).expect("parse unlearn bare");
     assert_eq!(cli_unlearn_bare.command, Command::Unlearn { key: None });
+
+    let cli_update =
+        Cli::try_parse_from(["speechyyy", "update"]).expect("parse update");
+    assert_eq!(cli_update.command, Command::Update { force: false });
+
+    let cli_update_force =
+        Cli::try_parse_from(["speechyyy", "update", "--force"]).expect("parse update force");
+    assert_eq!(cli_update_force.command, Command::Update { force: true });
 }
 
 #[test]
@@ -130,7 +138,7 @@ fn test_model_list_table_format_and_hint() {
     assert!(list_output.contains("moonshine-base"));
 
     // Verify statuses
-    assert!(list_output.contains("Available"));
+    assert!(list_output.contains("API Key Required") || list_output.contains("Configured"));
     assert!(list_output.contains("Installed"));
     assert!(list_output.contains("Not Downloaded"));
 

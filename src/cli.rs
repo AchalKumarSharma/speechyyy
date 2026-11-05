@@ -93,6 +93,12 @@ pub enum Command {
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
     },
+    /// Update Speechyyy to the newest release
+    Update {
+        /// Force re-installation even if already on the latest version
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
@@ -422,6 +428,16 @@ mod tests {
         let cli_purge =
             Cli::try_parse_from(["speechyyy", "uninstall", "--purge"]).expect("parse uninstall purge");
         assert_eq!(cli_purge.command, Command::Uninstall { purge: true });
+    }
+
+    #[test]
+    fn test_parse_update() {
+        let cli = Cli::try_parse_from(["speechyyy", "update"]).expect("parse update");
+        assert_eq!(cli.command, Command::Update { force: false });
+
+        let cli_force =
+            Cli::try_parse_from(["speechyyy", "update", "--force"]).expect("parse update force");
+        assert_eq!(cli_force.command, Command::Update { force: true });
     }
 
     #[test]

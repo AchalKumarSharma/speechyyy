@@ -16,6 +16,7 @@ serde_json = "1.0.154"
 toml = "1.1.8"
 ureq = { version = "2", features = ["tls", "json"] }
 tar = "0.4"
+flate2 = "1.0"
 bzip2 = "0.4"
 indicatif = "0.17"
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }

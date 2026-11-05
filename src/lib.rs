@@ -11,3 +11,4 @@ pub mod input;
 pub mod ipc;
 pub mod model;
 pub mod text;
+pub mod update;

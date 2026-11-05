@@ -307,6 +307,69 @@ pub fn stop_daemon(paths: &RuntimePaths) -> Result<(), String> {
     Ok(())
 }
 
+pub fn restart_daemon_process(
+    paths: &RuntimePaths,
+    binary_override: Option<&Path>,
+) -> Result<u32, String> {
+    if let Some(pid) = PidFile::read_pid(&paths.pid_path) {
+        if PidFile::is_process_running(pid) {
+            let _ = stop_daemon(paths);
+            let proc_path = PathBuf::from(format!("/proc/{}", pid));
+            let start = Instant::now();
+            while (proc_path.exists() || PidFile::is_process_running(pid))
+                && start.elapsed() < Duration::from_secs(2)
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    let binary_path = match binary_override {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_exe()
+            .map_err(|e| format!("Failed to determine binary path: {}", e))?,
+    };
+
+    let mut cmd = ProcessCommand::new(binary_path);
+    cmd.arg("start").arg("--foreground");
+
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn daemon process: {}", e))?;
+
+    let child_pid = child.id();
+
+    let start = Instant::now();
+    let mut ready = false;
+    while start.elapsed() < Duration::from_secs(2) {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "Daemon process exited prematurely with status: {}",
+                status
+            ));
+        }
+        if paths.socket_path.exists() {
+            if let Ok(IpcResponse::Pong) =
+                IpcClient::send_request(&paths.socket_path, &IpcRequest::Ping)
+            {
+                ready = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if !ready {
+        let _ = child.kill();
+        return Err("Timed out waiting for restarted Speechyyy daemon to initialize.".into());
+    }
+
+    Ok(child_pid)
+}
+
 pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
     if paths.socket_path.exists() {
         match IpcClient::send_request(&paths.socket_path, &IpcRequest::Status) {
