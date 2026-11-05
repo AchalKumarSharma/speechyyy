@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "speechyyy"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bzip2",
  "clap",
