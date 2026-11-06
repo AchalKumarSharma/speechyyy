@@ -33,17 +33,25 @@ fn main() {
             Ok(())
         }
         Command::Models { action } => match action {
-            Some(ModelCommands::Download { model, model_flag }) => {
+            Some(ModelCommands::Download {
+                model,
+                model_flag,
+                force,
+            }) => {
                 let target = ModelCommands::resolved_download_model(model, model_flag);
-                handle_model_download_command(&target)
+                handle_model_download_command(&target, force)
             }
             Some(ModelCommands::List) | None => handle_model_list_command(),
             Some(ModelCommands::Use { model }) => handle_model_use_command(&model),
             Some(ModelCommands::Remove { model }) => handle_model_remove(&model),
         },
-        Command::Download { model, model_flag } => {
+        Command::Download {
+            model,
+            model_flag,
+            force,
+        } => {
             let target = ModelCommands::resolved_download_model(model, model_flag);
-            handle_model_download_command(&target)
+            handle_model_download_command(&target, force)
         }
         Command::Use { model } => handle_model_use_command(&model),
         Command::Remove { model } => handle_model_remove(&model),

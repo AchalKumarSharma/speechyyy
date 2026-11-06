@@ -249,6 +249,25 @@ impl RecordingInjector {
         };
     }
 
+    pub fn reset_modifiers(&mut self) {
+        let modifiers = [
+            KeyCode::KEY_LEFTALT,
+            KeyCode::KEY_RIGHTALT,
+            KeyCode::KEY_LEFTSHIFT,
+            KeyCode::KEY_RIGHTSHIFT,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTCTRL,
+            KeyCode::KEY_LEFTMETA,
+            KeyCode::KEY_RIGHTMETA,
+        ];
+        for key in modifiers {
+            self.emitted_events.lock().unwrap().push(KeyStroke {
+                key,
+                is_down: false,
+            });
+        }
+    }
+
     fn emit_keystroke(&self, key: KeyCode, is_down: bool) {
         self.emitted_events
             .lock()
@@ -266,22 +285,7 @@ impl TextInjector for RecordingInjector {
         self.injected_strings.lock().unwrap().push(text.to_string());
 
         if self.settle_modifiers {
-            let modifiers = [
-                KeyCode::KEY_RIGHTALT,
-                KeyCode::KEY_LEFTALT,
-                KeyCode::KEY_LEFTCTRL,
-                KeyCode::KEY_RIGHTCTRL,
-                KeyCode::KEY_LEFTSHIFT,
-                KeyCode::KEY_RIGHTSHIFT,
-                KeyCode::KEY_LEFTMETA,
-                KeyCode::KEY_RIGHTMETA,
-            ];
-            for key in modifiers {
-                self.emitted_events.lock().unwrap().push(KeyStroke {
-                    key,
-                    is_down: false,
-                });
-            }
+            self.reset_modifiers();
         }
 
         match self.mode {
@@ -398,34 +402,31 @@ impl UinputInjector {
         };
     }
 
-    pub fn settle_modifiers(&mut self) -> Result<(), String> {
-        // 1. Explicit release for hotkey RightAlt with SYN_REPORT
-        let right_alt_ev = InputEvent::new(EventType::KEY.0, KeyCode::KEY_RIGHTALT.0, 0);
-        self.device
-            .emit(&[right_alt_ev])
-            .map_err(|e| format!("Failed to emit RightAlt settle: {}", e))?;
-
-        // 2. Release other potential modifiers with SYN_REPORT
-        let other_modifiers = [
+    pub fn reset_modifiers(&mut self) -> Result<(), String> {
+        let modifiers = [
             KeyCode::KEY_LEFTALT,
-            KeyCode::KEY_LEFTCTRL,
-            KeyCode::KEY_RIGHTCTRL,
+            KeyCode::KEY_RIGHTALT,
             KeyCode::KEY_LEFTSHIFT,
             KeyCode::KEY_RIGHTSHIFT,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTCTRL,
             KeyCode::KEY_LEFTMETA,
             KeyCode::KEY_RIGHTMETA,
         ];
-        let events: Vec<InputEvent> = other_modifiers
+        let events: Vec<InputEvent> = modifiers
             .iter()
             .map(|k| InputEvent::new(EventType::KEY.0, k.0, 0))
             .collect();
         self.device
             .emit(&events)
-            .map_err(|e| format!("Failed to emit modifier settle: {}", e))?;
+            .map_err(|e| format!("Failed to emit modifier reset: {}", e))?;
 
-        // 3. 50ms settle delay for compositor seat modifier reset
         thread::sleep(Self::MODIFIER_SETTLE_DELAY);
         Ok(())
+    }
+
+    pub fn settle_modifiers(&mut self) -> Result<(), String> {
+        self.reset_modifiers()
     }
 
     fn emit_key(&mut self, key: KeyCode, is_down: bool) -> Result<(), String> {
@@ -444,38 +445,66 @@ impl UinputInjector {
 
 impl TextInjector for UinputInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
-        self.settle_modifiers()?;
+        self.reset_modifiers()?;
 
-        match self.mode {
+        let res = match self.mode {
             InjectionMode::Paste => {
                 WaylandClipboardInjector::copy_to_clipboard(text)?;
                 thread::sleep(WaylandClipboardInjector::SETTLE_DELAY);
-                WaylandClipboardInjector::trigger_uinput_paste(&mut self.device)?;
+                WaylandClipboardInjector::trigger_uinput_paste(&mut self.device)
             }
             InjectionMode::Typewriter { .. } => {
                 let segments = segment_text(text);
+                let mut type_res = Ok(());
                 for segment in segments {
                     match segment {
                         TextSegment::Mapped(_c, key, needs_shift) => {
                             if needs_shift {
-                                self.emit_key(KeyCode::KEY_LEFTSHIFT, true)?;
+                                if let Err(e) = self.emit_key(KeyCode::KEY_LEFTSHIFT, true) {
+                                    type_res = Err(e);
+                                    break;
+                                }
                             }
-                            self.emit_key(key, true)?;
-                            self.emit_key(key, false)?;
+                            if let Err(e) = self.emit_key(key, true) {
+                                type_res = Err(e);
+                                break;
+                            }
+                            if let Err(e) = self.emit_key(key, false) {
+                                type_res = Err(e);
+                                break;
+                            }
                             if needs_shift {
-                                self.emit_key(KeyCode::KEY_LEFTSHIFT, false)?;
+                                if let Err(e) = self.emit_key(KeyCode::KEY_LEFTSHIFT, false) {
+                                    type_res = Err(e);
+                                    break;
+                                }
                             }
                         }
                         TextSegment::Unmapped(fallback_text) => {
-                            WaylandClipboardInjector::copy_to_clipboard(&fallback_text)?;
+                            if let Err(e) =
+                                WaylandClipboardInjector::copy_to_clipboard(&fallback_text)
+                            {
+                                type_res = Err(e);
+                                break;
+                            }
                             thread::sleep(WaylandClipboardInjector::SETTLE_DELAY);
-                            WaylandClipboardInjector::trigger_uinput_paste(&mut self.device)?;
+                            if let Err(e) =
+                                WaylandClipboardInjector::trigger_uinput_paste(&mut self.device)
+                            {
+                                type_res = Err(e);
+                                break;
+                            }
                         }
                     }
                 }
+                type_res
             }
+        };
+
+        if res.is_err() {
+            let _ = self.reset_modifiers();
         }
-        Ok(())
+        res
     }
 
     fn name(&self) -> &'static str {
@@ -693,5 +722,36 @@ mod tests {
             "Expected pacing delay to be respected, got {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn test_recording_injector_modifier_reset_sequence() {
+        let mut injector = RecordingInjector::with_settle(Duration::ZERO, true);
+        injector.inject("a").unwrap();
+
+        let events = injector.emitted_events.lock().unwrap();
+        // The first 8 events must be modifier KeyUp releases
+        let expected_modifiers = [
+            KeyCode::KEY_LEFTALT,
+            KeyCode::KEY_RIGHTALT,
+            KeyCode::KEY_LEFTSHIFT,
+            KeyCode::KEY_RIGHTSHIFT,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTCTRL,
+            KeyCode::KEY_LEFTMETA,
+            KeyCode::KEY_RIGHTMETA,
+        ];
+
+        assert!(events.len() >= 10);
+        for (i, &expected_key) in expected_modifiers.iter().enumerate() {
+            assert_eq!(events[i].key, expected_key);
+            assert!(!events[i].is_down, "Modifier event must be KeyUp");
+        }
+
+        // Following events should be 'a' down and 'a' up
+        assert_eq!(events[8].key, KeyCode::KEY_A);
+        assert!(events[8].is_down);
+        assert_eq!(events[9].key, KeyCode::KEY_A);
+        assert!(!events[9].is_down);
     }
 }

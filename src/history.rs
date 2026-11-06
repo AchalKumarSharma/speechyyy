@@ -24,6 +24,9 @@ impl Default for HistoryLogger {
 }
 
 impl HistoryLogger {
+    pub const MAX_ENTRIES: usize = 500;
+    pub const MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
     pub fn default_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(home)
@@ -43,20 +46,117 @@ impl HistoryLogger {
         Self { path }
     }
 
-    pub fn append(&self, record: &HistoryRecord) -> Result<(), std::io::Error> {
+    fn ensure_parent_dir(&self) -> Result<(), std::io::Error> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+                if !parent.exists() {
+                    let mut builder = std::fs::DirBuilder::new();
+                    builder.recursive(true);
+                    builder.mode(0o700);
+                    builder.create(parent)?;
+                } else if let Ok(metadata) = fs::metadata(parent) {
+                    let mut perms = metadata.permissions();
+                    if perms.mode() & 0o777 != 0o700 {
+                        perms.set_mode(0o700);
+                        let _ = fs::set_permissions(parent, perms);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rotate_if_needed(&self) -> Result<(), std::io::Error> {
+        if !self.path.exists() {
+            return Ok(());
         }
 
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let metadata = fs::metadata(&self.path)?;
+        let content = fs::read_to_string(&self.path)?;
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+        if lines.len() <= Self::MAX_ENTRIES && metadata.len() <= Self::MAX_BYTES {
+            return Ok(());
+        }
+
+        let retained = if lines.len() > Self::MAX_ENTRIES {
+            &lines[lines.len() - Self::MAX_ENTRIES..]
+        } else {
+            &lines[..]
+        };
+
+        #[cfg(unix)]
+        let mut open_opts = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = fs::OpenOptions::new();
+            opts.mode(0o600);
+            opts
+        };
+        #[cfg(not(unix))]
+        let mut open_opts = fs::OpenOptions::new();
+
+        open_opts.create(true).write(true).truncate(true);
+        let mut file = open_opts.open(&self.path)?;
+        for line in retained {
+            writeln!(file, "{}", line)?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = file.metadata() {
+                let mut perms = metadata.permissions();
+                if perms.mode() & 0o777 != 0o600 {
+                    perms.set_mode(0o600);
+                    let _ = fs::set_permissions(&self.path, perms);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn append(&self, record: &HistoryRecord) -> Result<(), std::io::Error> {
+        self.ensure_parent_dir()?;
+
+        #[cfg(unix)]
+        let mut open_opts = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = fs::OpenOptions::new();
+            opts.mode(0o600);
+            opts
+        };
+        #[cfg(not(unix))]
+        let mut open_opts = fs::OpenOptions::new();
+
+        open_opts.create(true).append(true);
+        let mut file = open_opts.open(&self.path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = file.metadata() {
+                let mut perms = metadata.permissions();
+                if perms.mode() & 0o777 != 0o600 {
+                    perms.set_mode(0o600);
+                    let _ = fs::set_permissions(&self.path, perms);
+                }
+            }
+        }
 
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         writeln!(file, "{}", line)?;
+
+        self.rotate_if_needed()?;
+
         Ok(())
     }
 
@@ -360,5 +460,63 @@ mod tests {
         assert!(res_none.is_ok());
         let res_empty = handle_fix_command_opts(Some("   "));
         assert!(res_empty.is_ok());
+    }
+
+    #[test]
+    fn test_history_file_and_dir_permissions() {
+        let temp_dir = std::env::temp_dir().join(format!("hist_perm_test_{}", std::process::id()));
+        let hist_path = temp_dir.join("history.jsonl");
+        let logger = HistoryLogger::with_path(hist_path.clone());
+
+        let rec = HistoryRecord {
+            timestamp: "2026-11-06T12:00:00Z".into(),
+            raw_text: "test".into(),
+            final_text: "Test".into(),
+            provider: "mock".into(),
+            duration_secs: 0.5,
+        };
+
+        logger.append(&rec).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_meta = fs::metadata(&temp_dir).unwrap();
+            assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+
+            let file_meta = fs::metadata(&hist_path).unwrap();
+            assert_eq!(file_meta.permissions().mode() & 0o777, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_history_rotation_at_capacity() {
+        let temp_dir = std::env::temp_dir().join(format!("hist_rot_test_{}", std::process::id()));
+        let hist_path = temp_dir.join("history.jsonl");
+        let logger = HistoryLogger::with_path(hist_path.clone());
+
+        // Append 520 records
+        for i in 0..520 {
+            let rec = HistoryRecord {
+                timestamp: format!("2026-11-06T12:{:02}:00Z", i % 60),
+                raw_text: format!("record {}", i),
+                final_text: format!("Record {}", i),
+                provider: "mock".into(),
+                duration_secs: 1.0,
+            };
+            logger.append(&rec).unwrap();
+        }
+
+        let content = fs::read_to_string(&hist_path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), HistoryLogger::MAX_ENTRIES);
+
+        // Verify the oldest records were truncated and the newest preserved
+        let last_entry = logger.get_last_entry().unwrap().unwrap();
+        assert_eq!(last_entry.raw_text, "record 519");
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

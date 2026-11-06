@@ -2,7 +2,7 @@ use crate::audio::capture::CpalAudioCapture;
 use crate::audio::vad::EnergyVad;
 use crate::config::Config;
 use crate::doctor::{run_doctor, RealSysEnv};
-use crate::engine::{AudioDictationEngine, DictationEngine, StateMachineController};
+use crate::engine::{AudioDictationEngine, DictationEngine, DictationState, StateMachineController};
 use crate::history::HistoryLogger;
 use crate::inference::create_inference_provider;
 use crate::injector::{create_injector, TextInjector};
@@ -70,20 +70,35 @@ where
 
         // 2. Poll input events (10ms tick)
         if let Some((keycode, is_down)) = input_source.poll_event(Duration::from_millis(10)) {
+            let prev_state = controller.state;
             match controller.handle_key_event(keycode, is_down) {
                 Ok(Some(text)) => {
+                    let _ = input_source.ungrab();
                     if let Err(e) = injector.inject(&text) {
                         eprintln!("Failed to inject text: {}", e);
                     }
                     controller.finish_emission();
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    let new_state = controller.state;
+                    if prev_state != DictationState::Recording
+                        && new_state == DictationState::Recording
+                    {
+                        let _ = input_source.grab();
+                    } else if prev_state == DictationState::Recording
+                        && new_state != DictationState::Recording
+                    {
+                        let _ = input_source.ungrab();
+                    }
+                }
                 Err(e) => {
+                    let _ = input_source.ungrab();
                     eprintln!("Engine error: {}", e);
                 }
             }
         }
     }
+    let _ = input_source.ungrab();
     Ok(())
 }
 
@@ -227,6 +242,7 @@ pub fn start_daemon(
         };
 
         let mut input_source = EvdevListener::new();
+        input_source.set_grab_enabled(config.input.grab_key);
         let capture = match CpalAudioCapture::new() {
             Ok(c) => c,
             Err(e) => {
@@ -452,3 +468,55 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
 }
 
 pub use crate::uninstall::{handle_uninstall_command, handle_uninstall_command_internal};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{MockDictationEngine, TargetChord};
+    use crate::injector::RecordingInjector;
+    use crate::input::FakeInputSource;
+    use evdev::KeyCode;
+
+    #[test]
+    fn test_run_session_loop_grab_and_release() {
+        let temp_dir = std::env::temp_dir().join(format!("daemon_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let sock_path = temp_dir.join("test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let mut input_source = FakeInputSource::new();
+        input_source.push_event(KeyCode::KEY_RIGHTALT, true);
+        input_source.push_event(KeyCode::KEY_RIGHTALT, false);
+
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let engine = MockDictationEngine::with_payload("test transcription");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+        let running = Arc::new(AtomicBool::new(true));
+
+        let running_clone = Arc::clone(&running);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            running_clone.store(false, Ordering::SeqCst);
+        });
+
+        let _ = run_session_loop(
+            &listener,
+            &mut input_source,
+            &mut injector,
+            &mut controller,
+            &running,
+            "RightAlt",
+            15,
+        );
+
+        assert!(!input_source.grabbed);
+        assert_eq!(
+            injector.injected_strings.lock().unwrap().as_slice(),
+            &["test transcription".to_string()]
+        );
+
+        let _ = std::fs::remove_file(sock_path);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+}

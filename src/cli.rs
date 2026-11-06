@@ -52,6 +52,9 @@ pub enum Command {
         /// Target model architecture flag (-m, --model)
         #[arg(short = 'm', long = "model", value_name = "MODEL")]
         model_flag: Option<String>,
+        /// Force re-download or overwrite existing credentials
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
     /// Switch active model (e.g. speechyyy use parakeet-tdt-v3)
     Use {
@@ -111,6 +114,9 @@ pub enum ModelCommands {
         /// Target model architecture flag (-m, --model)
         #[arg(short = 'm', long = "model", value_name = "MODEL")]
         model_flag: Option<String>,
+        /// Force re-download or overwrite existing credentials
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
     /// List supported speech models
     List,
@@ -272,9 +278,24 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Models {
-                action: Some(ModelAction::Download {
+                action: Some(ModelCommands::Download {
                     model: None,
                     model_flag: Some("parakeet-tdt-v3".to_string()),
+                    force: false,
+                })
+            }
+        );
+
+        let cli_force =
+            Cli::try_parse_from(["speechyyy", "model", "download", "saaras:v4", "-f"])
+                .expect("parse model download force");
+        assert_eq!(
+            cli_force.command,
+            Command::Models {
+                action: Some(ModelCommands::Download {
+                    model: Some("saaras:v4".to_string()),
+                    model_flag: None,
+                    force: true,
                 })
             }
         );
@@ -331,6 +352,7 @@ mod tests {
             Command::Download {
                 model: Some("parakeet-tdt-v3".to_string()),
                 model_flag: None,
+                force: false,
             }
         );
 
@@ -341,6 +363,7 @@ mod tests {
             Command::Download {
                 model: None,
                 model_flag: Some("whisper-small".to_string()),
+                force: false,
             }
         );
 
@@ -351,6 +374,7 @@ mod tests {
             Command::Download {
                 model: Some("saaras:v4".to_string()),
                 model_flag: None,
+                force: false,
             }
         );
 
@@ -361,6 +385,18 @@ mod tests {
             Command::Download {
                 model: Some("sarvam:saaras-v4".to_string()),
                 model_flag: None,
+                force: false,
+            }
+        );
+
+        let cli_force = Cli::try_parse_from(["speechyyy", "download", "saaras:v4", "--force"])
+            .expect("parse download cloud saaras with --force");
+        assert_eq!(
+            cli_force.command,
+            Command::Download {
+                model: Some("saaras:v4".to_string()),
+                model_flag: None,
+                force: true,
             }
         );
     }

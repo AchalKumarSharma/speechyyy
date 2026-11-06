@@ -8,6 +8,72 @@ fn default_hotkey() -> String {
     "RightAlt".to_string()
 }
 
+fn default_grab_key() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputConfig {
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
+    #[serde(default = "default_grab_key")]
+    pub grab_key: bool,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            hotkey: default_hotkey(),
+            grab_key: default_grab_key(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputError {
+    UnknownKey(String),
+}
+
+impl std::fmt::Display for InputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputError::UnknownKey(k) => write!(f, "Unknown or unsupported key '{}'", k),
+        }
+    }
+}
+
+impl std::error::Error for InputError {}
+
+pub fn resolve_hotkey(name: &str) -> Result<KeyCode, InputError> {
+    match name.to_lowercase().as_str() {
+        "space" => Ok(KeyCode::KEY_SPACE),
+        "rightalt" | "right_alt" | "alt_r" => Ok(KeyCode::KEY_RIGHTALT),
+        "leftalt" | "left_alt" | "alt_l" => Ok(KeyCode::KEY_LEFTALT),
+        "capslock" | "caps_lock" | "caps" => Ok(KeyCode::KEY_CAPSLOCK),
+        "scrolllock" | "scroll_lock" => Ok(KeyCode::KEY_SCROLLLOCK),
+        "pause" | "pausebreak" | "pause_break" => Ok(KeyCode::KEY_PAUSE),
+        "rightctrl" | "right_ctrl" | "ctrl_r" => Ok(KeyCode::KEY_RIGHTCTRL),
+        "leftctrl" | "left_ctrl" | "ctrl_l" => Ok(KeyCode::KEY_LEFTCTRL),
+        "rightshift" | "right_shift" | "shift_r" => Ok(KeyCode::KEY_RIGHTSHIFT),
+        "leftshift" | "left_shift" | "shift_l" => Ok(KeyCode::KEY_LEFTSHIFT),
+        "enter" | "return" => Ok(KeyCode::KEY_ENTER),
+        "tab" => Ok(KeyCode::KEY_TAB),
+        "f1" => Ok(KeyCode::KEY_F1),
+        "f2" => Ok(KeyCode::KEY_F2),
+        "f3" => Ok(KeyCode::KEY_F3),
+        "f4" => Ok(KeyCode::KEY_F4),
+        "f5" => Ok(KeyCode::KEY_F5),
+        "f6" => Ok(KeyCode::KEY_F6),
+        "f7" => Ok(KeyCode::KEY_F7),
+        "f8" => Ok(KeyCode::KEY_F8),
+        "f9" => Ok(KeyCode::KEY_F9),
+        "f10" => Ok(KeyCode::KEY_F10),
+        "f11" => Ok(KeyCode::KEY_F11),
+        "f12" => Ok(KeyCode::KEY_F12),
+        _ => Err(InputError::UnknownKey(name.to_string())),
+    }
+}
+
 fn default_pacing_ms() -> u64 {
     15
 }
@@ -156,6 +222,7 @@ fn default_ui_config() -> UiConfig {
 pub struct Config {
     pub hotkey: String,
     pub pacing_delay_ms: u64,
+    pub input: InputConfig,
     pub audio: AudioConfig,
     pub inference: InferenceConfig,
     pub injector: InjectorConfig,
@@ -164,8 +231,10 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawConfig {
-    #[serde(default = "default_hotkey")]
-    hotkey: String,
+    #[serde(default)]
+    input: Option<InputConfig>,
+    #[serde(default)]
+    hotkey: Option<String>,
     #[serde(default)]
     pacing_delay_ms: Option<u64>,
     #[serde(default)]
@@ -231,9 +300,16 @@ impl From<RawConfig> for Config {
             ui.nickname = default_nickname();
         }
 
+        let mut input = raw.input.unwrap_or_default();
+        if let Some(h) = raw.hotkey {
+            input.hotkey = h;
+        }
+        let hotkey = input.hotkey.clone();
+
         Config {
-            hotkey: raw.hotkey,
+            hotkey,
             pacing_delay_ms: delay,
+            input,
             audio: raw.audio,
             inference,
             injector,
@@ -247,6 +323,7 @@ impl Default for Config {
         Self {
             hotkey: default_hotkey(),
             pacing_delay_ms: default_pacing_ms(),
+            input: InputConfig::default(),
             audio: AudioConfig::default(),
             inference: InferenceConfig::default(),
             injector: InjectorConfig::default(),
@@ -362,7 +439,9 @@ impl Config {
     }
 
     pub fn to_target_chord(&self) -> TargetChord {
-        parse_hotkey(&self.hotkey).unwrap_or_else(TargetChord::right_alt)
+        parse_hotkey(&self.input.hotkey)
+            .or_else(|| parse_hotkey(&self.hotkey))
+            .unwrap_or_else(TargetChord::right_alt)
     }
 
     pub fn apply_cli_overrides(
@@ -445,16 +524,7 @@ fn write_secure_config(path: &Path, table: &toml::Table) -> Result<(), String> {
 }
 
 fn parse_trigger_key(name: &str) -> Option<KeyCode> {
-    match name.to_lowercase().as_str() {
-        "space" => Some(KeyCode::KEY_SPACE),
-        "rightalt" | "right_alt" | "alt_r" => Some(KeyCode::KEY_RIGHTALT),
-        "leftalt" | "left_alt" | "alt_l" => Some(KeyCode::KEY_LEFTALT),
-        "rightctrl" | "right_ctrl" | "ctrl_r" => Some(KeyCode::KEY_RIGHTCTRL),
-        "leftctrl" | "left_ctrl" | "ctrl_l" => Some(KeyCode::KEY_LEFTCTRL),
-        "enter" => Some(KeyCode::KEY_ENTER),
-        "tab" => Some(KeyCode::KEY_TAB),
-        _ => None,
-    }
+    resolve_hotkey(name).ok()
 }
 
 pub fn parse_hotkey(s: &str) -> Option<TargetChord> {
@@ -502,6 +572,47 @@ mod tests {
                 modifiers: vec![Modifier::Alt],
                 trigger_key: KeyCode::KEY_SPACE
             })
+        );
+        assert_eq!(
+            parse_hotkey("CapsLock"),
+            Some(TargetChord::SingleKey(KeyCode::KEY_CAPSLOCK))
+        );
+        assert_eq!(
+            parse_hotkey("F8"),
+            Some(TargetChord::SingleKey(KeyCode::KEY_F8))
+        );
+    }
+
+    #[test]
+    fn test_hotkey_resolver_mappings() {
+        assert_eq!(resolve_hotkey("RightAlt").unwrap(), KeyCode::KEY_RIGHTALT);
+        assert_eq!(resolve_hotkey("LeftAlt").unwrap(), KeyCode::KEY_LEFTALT);
+        assert_eq!(resolve_hotkey("CapsLock").unwrap(), KeyCode::KEY_CAPSLOCK);
+        assert_eq!(resolve_hotkey("ScrollLock").unwrap(), KeyCode::KEY_SCROLLLOCK);
+        assert_eq!(resolve_hotkey("Pause").unwrap(), KeyCode::KEY_PAUSE);
+        assert_eq!(resolve_hotkey("Space").unwrap(), KeyCode::KEY_SPACE);
+        assert_eq!(resolve_hotkey("F8").unwrap(), KeyCode::KEY_F8);
+        assert_eq!(resolve_hotkey("F12").unwrap(), KeyCode::KEY_F12);
+        assert!(matches!(
+            resolve_hotkey("InvalidKey123"),
+            Err(InputError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn test_input_config_deserialization() {
+        let toml_data = r#"
+[input]
+hotkey = "CapsLock"
+grab_key = false
+"#;
+        let parsed: Config = toml::from_str(toml_data).unwrap();
+        assert_eq!(parsed.input.hotkey, "CapsLock");
+        assert!(!parsed.input.grab_key);
+        assert_eq!(parsed.hotkey, "CapsLock");
+        assert_eq!(
+            parsed.to_target_chord(),
+            TargetChord::SingleKey(KeyCode::KEY_CAPSLOCK)
         );
     }
 

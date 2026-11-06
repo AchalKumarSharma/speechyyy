@@ -8,16 +8,26 @@ use std::time::Duration;
 
 pub trait InputEventSource {
     fn poll_event(&mut self, timeout: Duration) -> Option<(KeyCode, bool)>;
+
+    fn grab(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn ungrab(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct FakeInputSource {
     events: VecDeque<(KeyCode, bool)>,
+    pub grabbed: bool,
 }
 
 impl FakeInputSource {
     pub fn new() -> Self {
         Self {
             events: VecDeque::new(),
+            grabbed: false,
         }
     }
 
@@ -35,6 +45,16 @@ impl Default for FakeInputSource {
 impl InputEventSource for FakeInputSource {
     fn poll_event(&mut self, _timeout: Duration) -> Option<(KeyCode, bool)> {
         self.events.pop_front()
+    }
+
+    fn grab(&mut self) -> Result<(), String> {
+        self.grabbed = true;
+        Ok(())
+    }
+
+    fn ungrab(&mut self) -> Result<(), String> {
+        self.grabbed = false;
+        Ok(())
     }
 }
 
@@ -55,14 +75,55 @@ pub fn is_keyboard_device(device: &Device) -> bool {
     }
 }
 
+pub struct EvdevGrabGuard<'a> {
+    device: &'a mut Device,
+    grabbed_at: std::time::Instant,
+    released: bool,
+}
+
+impl<'a> EvdevGrabGuard<'a> {
+    pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
+
+    pub fn new(device: &'a mut Device) -> std::io::Result<Self> {
+        device.grab()?;
+        Ok(Self {
+            device,
+            grabbed_at: std::time::Instant::now(),
+            released: false,
+        })
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.grabbed_at.elapsed() >= Self::WATCHDOG_TIMEOUT
+    }
+
+    pub fn release(&mut self) {
+        if !self.released {
+            let _ = self.device.ungrab();
+            self.released = true;
+        }
+    }
+}
+
+impl<'a> Drop for EvdevGrabGuard<'a> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct EvdevListener {
     input_dir: PathBuf,
     devices: Vec<Device>,
     inotify_fd: Option<i32>,
     pending_events: VecDeque<(KeyCode, bool)>,
+    grab_enabled: bool,
+    is_grabbed: bool,
+    grabbed_at: Option<std::time::Instant>,
 }
 
 impl EvdevListener {
+    pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
+
     pub fn new() -> Self {
         Self::with_dir(PathBuf::from("/dev/input"))
     }
@@ -81,11 +142,60 @@ impl EvdevListener {
             devices: Vec::new(),
             inotify_fd: None,
             pending_events: VecDeque::new(),
+            grab_enabled: true,
+            is_grabbed: false,
+            grabbed_at: None,
         };
 
         listener.init_inotify(&dir);
         listener.scan_devices();
         listener
+    }
+
+    pub fn set_grab_enabled(&mut self, enabled: bool) {
+        self.grab_enabled = enabled;
+    }
+
+    pub fn is_grab_enabled(&self) -> bool {
+        self.grab_enabled
+    }
+
+    pub fn is_grabbed(&self) -> bool {
+        self.is_grabbed
+    }
+
+    pub fn grab(&mut self) -> std::io::Result<()> {
+        if !self.grab_enabled || self.is_grabbed {
+            return Ok(());
+        }
+        for dev in &mut self.devices {
+            let _ = dev.grab();
+        }
+        self.is_grabbed = true;
+        self.grabbed_at = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    pub fn ungrab(&mut self) -> std::io::Result<()> {
+        if !self.is_grabbed {
+            return Ok(());
+        }
+        for dev in &mut self.devices {
+            let _ = dev.ungrab();
+        }
+        self.is_grabbed = false;
+        self.grabbed_at = None;
+        Ok(())
+    }
+
+    pub fn check_grab_watchdog(&mut self) {
+        if self.is_grabbed {
+            if let Some(started_at) = self.grabbed_at {
+                if started_at.elapsed() >= Self::WATCHDOG_TIMEOUT {
+                    let _ = self.ungrab();
+                }
+            }
+        }
     }
 
     fn init_inotify(&mut self, dir: &Path) {
@@ -158,6 +268,7 @@ impl EvdevListener {
 
 impl Drop for EvdevListener {
     fn drop(&mut self) {
+        let _ = self.ungrab();
         if let Some(fd) = self.inotify_fd {
             unsafe {
                 libc::close(fd);
@@ -168,6 +279,8 @@ impl Drop for EvdevListener {
 
 impl InputEventSource for EvdevListener {
     fn poll_event(&mut self, timeout: Duration) -> Option<(KeyCode, bool)> {
+        self.check_grab_watchdog();
+
         if let Some(ev) = self.pending_events.pop_front() {
             return Some(ev);
         }
@@ -249,6 +362,14 @@ impl InputEventSource for EvdevListener {
 
         self.pending_events.pop_front()
     }
+
+    fn grab(&mut self) -> Result<(), String> {
+        EvdevListener::grab(self).map_err(|e| e.to_string())
+    }
+
+    fn ungrab(&mut self) -> Result<(), String> {
+        EvdevListener::ungrab(self).map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -283,5 +404,36 @@ mod tests {
         assert_eq!(listener.poll_event(Duration::from_millis(5)), None);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_fake_input_source_grab() {
+        let mut source = FakeInputSource::new();
+        assert!(!source.grabbed);
+        assert!(source.grab().is_ok());
+        assert!(source.grabbed);
+        assert!(source.ungrab().is_ok());
+        assert!(!source.grabbed);
+    }
+
+    #[test]
+    fn test_evdev_listener_grab_state_and_watchdog() {
+        let mut listener = EvdevListener::with_dir(PathBuf::from("/nonexistent/dev/input"));
+        assert!(listener.is_grab_enabled());
+        assert!(!listener.is_grabbed());
+
+        assert!(listener.grab().is_ok());
+        assert!(listener.is_grabbed());
+
+        // Fast-forward grab time to simulate 61 seconds elapsed
+        listener.grabbed_at = Some(std::time::Instant::now() - Duration::from_secs(61));
+        listener.check_grab_watchdog();
+        assert!(!listener.is_grabbed());
+
+        // Test disable grab
+        listener.set_grab_enabled(false);
+        assert!(!listener.is_grab_enabled());
+        assert!(listener.grab().is_ok());
+        assert!(!listener.is_grabbed());
     }
 }
