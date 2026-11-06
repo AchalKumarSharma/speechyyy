@@ -44,34 +44,109 @@ impl std::fmt::Display for InputError {
 
 impl std::error::Error for InputError {}
 
-pub fn resolve_hotkey(name: &str) -> Result<KeyCode, InputError> {
-    match name.to_lowercase().as_str() {
-        "space" => Ok(KeyCode::KEY_SPACE),
-        "rightalt" | "right_alt" | "alt_r" => Ok(KeyCode::KEY_RIGHTALT),
-        "leftalt" | "left_alt" | "alt_l" => Ok(KeyCode::KEY_LEFTALT),
-        "capslock" | "caps_lock" | "caps" => Ok(KeyCode::KEY_CAPSLOCK),
-        "scrolllock" | "scroll_lock" => Ok(KeyCode::KEY_SCROLLLOCK),
-        "pause" | "pausebreak" | "pause_break" => Ok(KeyCode::KEY_PAUSE),
-        "rightctrl" | "right_ctrl" | "ctrl_r" => Ok(KeyCode::KEY_RIGHTCTRL),
-        "leftctrl" | "left_ctrl" | "ctrl_l" => Ok(KeyCode::KEY_LEFTCTRL),
-        "rightshift" | "right_shift" | "shift_r" => Ok(KeyCode::KEY_RIGHTSHIFT),
-        "leftshift" | "left_shift" | "shift_l" => Ok(KeyCode::KEY_LEFTSHIFT),
-        "enter" | "return" => Ok(KeyCode::KEY_ENTER),
-        "tab" => Ok(KeyCode::KEY_TAB),
-        "f1" => Ok(KeyCode::KEY_F1),
-        "f2" => Ok(KeyCode::KEY_F2),
-        "f3" => Ok(KeyCode::KEY_F3),
-        "f4" => Ok(KeyCode::KEY_F4),
-        "f5" => Ok(KeyCode::KEY_F5),
-        "f6" => Ok(KeyCode::KEY_F6),
-        "f7" => Ok(KeyCode::KEY_F7),
-        "f8" => Ok(KeyCode::KEY_F8),
-        "f9" => Ok(KeyCode::KEY_F9),
-        "f10" => Ok(KeyCode::KEY_F10),
-        "f11" => Ok(KeyCode::KEY_F11),
-        "f12" => Ok(KeyCode::KEY_F12),
-        _ => Err(InputError::UnknownKey(name.to_string())),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputKey {
+    RightAlt,
+    LeftAlt,
+    CapsLock,
+    ScrollLock,
+    Pause,
+    RightCtrl,
+    LeftCtrl,
+    RightShift,
+    LeftShift,
+    Space,
+    Enter,
+    Tab,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
+
+impl InputKey {
+    pub fn to_keycode(&self) -> KeyCode {
+        match self {
+            InputKey::Space => KeyCode::KEY_SPACE,
+            InputKey::RightAlt => KeyCode::KEY_RIGHTALT,
+            InputKey::LeftAlt => KeyCode::KEY_LEFTALT,
+            InputKey::CapsLock => KeyCode::KEY_CAPSLOCK,
+            InputKey::ScrollLock => KeyCode::KEY_SCROLLLOCK,
+            InputKey::Pause => KeyCode::KEY_PAUSE,
+            InputKey::RightCtrl => KeyCode::KEY_RIGHTCTRL,
+            InputKey::LeftCtrl => KeyCode::KEY_LEFTCTRL,
+            InputKey::RightShift => KeyCode::KEY_RIGHTSHIFT,
+            InputKey::LeftShift => KeyCode::KEY_LEFTSHIFT,
+            InputKey::Enter => KeyCode::KEY_ENTER,
+            InputKey::Tab => KeyCode::KEY_TAB,
+            InputKey::F1 => KeyCode::KEY_F1,
+            InputKey::F2 => KeyCode::KEY_F2,
+            InputKey::F3 => KeyCode::KEY_F3,
+            InputKey::F4 => KeyCode::KEY_F4,
+            InputKey::F5 => KeyCode::KEY_F5,
+            InputKey::F6 => KeyCode::KEY_F6,
+            InputKey::F7 => KeyCode::KEY_F7,
+            InputKey::F8 => KeyCode::KEY_F8,
+            InputKey::F9 => KeyCode::KEY_F9,
+            InputKey::F10 => KeyCode::KEY_F10,
+            InputKey::F11 => KeyCode::KEY_F11,
+            InputKey::F12 => KeyCode::KEY_F12,
+        }
     }
+}
+
+impl std::str::FromStr for InputKey {
+    type Err = InputError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "space" => Ok(InputKey::Space),
+            "rightalt" | "right_alt" | "alt_r" => Ok(InputKey::RightAlt),
+            "leftalt" | "left_alt" | "alt_l" => Ok(InputKey::LeftAlt),
+            "capslock" | "caps_lock" | "caps" => Ok(InputKey::CapsLock),
+            "scrolllock" | "scroll_lock" => Ok(InputKey::ScrollLock),
+            "pause" | "pausebreak" | "pause_break" => Ok(InputKey::Pause),
+            "rightctrl" | "right_ctrl" | "ctrl_r" => Ok(InputKey::RightCtrl),
+            "leftctrl" | "left_ctrl" | "ctrl_l" => Ok(InputKey::LeftCtrl),
+            "rightshift" | "right_shift" | "shift_r" => Ok(InputKey::RightShift),
+            "leftshift" | "left_shift" | "shift_l" => Ok(InputKey::LeftShift),
+            "enter" | "return" => Ok(InputKey::Enter),
+            "tab" => Ok(InputKey::Tab),
+            "f1" => Ok(InputKey::F1),
+            "f2" => Ok(InputKey::F2),
+            "f3" => Ok(InputKey::F3),
+            "f4" => Ok(InputKey::F4),
+            "f5" => Ok(InputKey::F5),
+            "f6" => Ok(InputKey::F6),
+            "f7" => Ok(InputKey::F7),
+            "f8" => Ok(InputKey::F8),
+            "f9" => Ok(InputKey::F9),
+            "f10" => Ok(InputKey::F10),
+            "f11" => Ok(InputKey::F11),
+            "f12" => Ok(InputKey::F12),
+            _ => Err(InputError::UnknownKey(s.to_string())),
+        }
+    }
+}
+
+impl TryFrom<&str> for InputKey {
+    type Error = InputError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+pub fn resolve_hotkey(name: &str) -> Result<KeyCode, InputError> {
+    name.parse::<InputKey>().map(|k| k.to_keycode())
 }
 
 fn default_pacing_ms() -> u64 {
@@ -585,6 +660,11 @@ mod tests {
 
     #[test]
     fn test_hotkey_resolver_mappings() {
+        use std::str::FromStr;
+        assert_eq!(InputKey::from_str("RightAlt").unwrap(), InputKey::RightAlt);
+        assert_eq!(InputKey::try_from("CapsLock").unwrap(), InputKey::CapsLock);
+        assert_eq!(InputKey::RightAlt.to_keycode(), KeyCode::KEY_RIGHTALT);
+
         assert_eq!(resolve_hotkey("RightAlt").unwrap(), KeyCode::KEY_RIGHTALT);
         assert_eq!(resolve_hotkey("LeftAlt").unwrap(), KeyCode::KEY_LEFTALT);
         assert_eq!(resolve_hotkey("CapsLock").unwrap(), KeyCode::KEY_CAPSLOCK);

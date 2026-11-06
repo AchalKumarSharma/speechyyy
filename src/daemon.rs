@@ -49,6 +49,15 @@ where
     J: TextInjector,
     E: DictationEngine,
 {
+    // RAII guard for the session loop: guarantees ungrab on loop exit, return, panic, or error
+    struct SessionUngrabGuard<'a, S: InputEventSource + ?Sized>(&'a mut S);
+    impl<'a, S: InputEventSource + ?Sized> Drop for SessionUngrabGuard<'a, S> {
+        fn drop(&mut self) {
+            let _ = self.0.ungrab();
+        }
+    }
+    let guard = SessionUngrabGuard(input_source);
+
     while running.load(Ordering::SeqCst) {
         // 1. Process IPC socket connections
         match listener.accept() {
@@ -69,11 +78,11 @@ where
         }
 
         // 2. Poll input events (10ms tick)
-        if let Some((keycode, is_down)) = input_source.poll_event(Duration::from_millis(10)) {
+        if let Some((keycode, is_down)) = guard.0.poll_event(Duration::from_millis(10)) {
             let prev_state = controller.state;
             match controller.handle_key_event(keycode, is_down) {
                 Ok(Some(text)) => {
-                    let _ = input_source.ungrab();
+                    let _ = guard.0.ungrab();
                     if let Err(e) = injector.inject(&text) {
                         eprintln!("Failed to inject text: {}", e);
                     }
@@ -84,21 +93,20 @@ where
                     if prev_state != DictationState::Recording
                         && new_state == DictationState::Recording
                     {
-                        let _ = input_source.grab();
+                        let _ = guard.0.grab();
                     } else if prev_state == DictationState::Recording
                         && new_state != DictationState::Recording
                     {
-                        let _ = input_source.ungrab();
+                        let _ = guard.0.ungrab();
                     }
                 }
                 Err(e) => {
-                    let _ = input_source.ungrab();
+                    let _ = guard.0.ungrab();
                     eprintln!("Engine error: {}", e);
                 }
             }
         }
     }
-    let _ = input_source.ungrab();
     Ok(())
 }
 

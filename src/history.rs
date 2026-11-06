@@ -23,6 +23,44 @@ impl Default for HistoryLogger {
     }
 }
 
+fn open_secure_history_file(
+    path: &std::path::Path,
+    append: bool,
+) -> Result<fs::File, std::io::Error> {
+    #[cfg(unix)]
+    let mut open_opts = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = fs::OpenOptions::new();
+        opts.mode(0o600);
+        opts
+    };
+    #[cfg(not(unix))]
+    let mut open_opts = fs::OpenOptions::new();
+
+    open_opts.create(true);
+    if append {
+        open_opts.append(true);
+    } else {
+        open_opts.write(true).truncate(true);
+    }
+
+    let file = open_opts.open(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = file.metadata() {
+            let mut perms = metadata.permissions();
+            if perms.mode() & 0o777 != 0o600 {
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+    }
+
+    Ok(file)
+}
+
 impl HistoryLogger {
     pub const MAX_ENTRIES: usize = 500;
     pub const MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
@@ -48,25 +86,19 @@ impl HistoryLogger {
 
     fn ensure_parent_dir(&self) -> Result<(), std::io::Error> {
         if let Some(parent) = self.path.parent() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-                if !parent.exists() {
+            if !parent.exists() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
                     let mut builder = std::fs::DirBuilder::new();
                     builder.recursive(true);
                     builder.mode(0o700);
                     builder.create(parent)?;
-                } else if let Ok(metadata) = fs::metadata(parent) {
-                    let mut perms = metadata.permissions();
-                    if perms.mode() & 0o777 != 0o700 {
-                        perms.set_mode(0o700);
-                        let _ = fs::set_permissions(parent, perms);
-                    }
                 }
-            }
-            #[cfg(not(unix))]
-            {
-                fs::create_dir_all(parent)?;
+                #[cfg(not(unix))]
+                {
+                    fs::create_dir_all(parent)?;
+                }
             }
         }
         Ok(())
@@ -85,38 +117,28 @@ impl HistoryLogger {
             return Ok(());
         }
 
-        let retained = if lines.len() > Self::MAX_ENTRIES {
+        let line_capped = if lines.len() > Self::MAX_ENTRIES {
             &lines[lines.len() - Self::MAX_ENTRIES..]
         } else {
             &lines[..]
         };
 
-        #[cfg(unix)]
-        let mut open_opts = {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut opts = fs::OpenOptions::new();
-            opts.mode(0o600);
-            opts
-        };
-        #[cfg(not(unix))]
-        let mut open_opts = fs::OpenOptions::new();
-
-        open_opts.create(true).write(true).truncate(true);
-        let mut file = open_opts.open(&self.path)?;
-        for line in retained {
-            writeln!(file, "{}", line)?;
+        let mut total_bytes: u64 = 0;
+        let mut start_idx = 0;
+        for (i, line) in line_capped.iter().enumerate().rev() {
+            let line_len = (line.len() + 1) as u64;
+            if total_bytes + line_len > Self::MAX_BYTES && total_bytes > 0 {
+                start_idx = i + 1;
+                break;
+            }
+            total_bytes += line_len;
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = file.metadata() {
-                let mut perms = metadata.permissions();
-                if perms.mode() & 0o777 != 0o600 {
-                    perms.set_mode(0o600);
-                    let _ = fs::set_permissions(&self.path, perms);
-                }
-            }
+        let retained = &line_capped[start_idx..];
+
+        let mut file = open_secure_history_file(&self.path, false)?;
+        for line in retained {
+            writeln!(file, "{}", line)?;
         }
 
         Ok(())
@@ -125,30 +147,7 @@ impl HistoryLogger {
     pub fn append(&self, record: &HistoryRecord) -> Result<(), std::io::Error> {
         self.ensure_parent_dir()?;
 
-        #[cfg(unix)]
-        let mut open_opts = {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut opts = fs::OpenOptions::new();
-            opts.mode(0o600);
-            opts
-        };
-        #[cfg(not(unix))]
-        let mut open_opts = fs::OpenOptions::new();
-
-        open_opts.create(true).append(true);
-        let mut file = open_opts.open(&self.path)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = file.metadata() {
-                let mut perms = metadata.permissions();
-                if perms.mode() & 0o777 != 0o600 {
-                    perms.set_mode(0o600);
-                    let _ = fs::set_permissions(&self.path, perms);
-                }
-            }
-        }
+        let mut file = open_secure_history_file(&self.path, true)?;
 
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -516,6 +515,41 @@ mod tests {
         // Verify the oldest records were truncated and the newest preserved
         let last_entry = logger.get_last_entry().unwrap().unwrap();
         assert_eq!(last_entry.raw_text, "record 519");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_history_rotation_at_byte_capacity() {
+        let temp_dir = std::env::temp_dir().join(format!("hist_byte_rot_{}", std::process::id()));
+        let hist_path = temp_dir.join("history.jsonl");
+        let logger = HistoryLogger::with_path(hist_path.clone());
+
+        // Create large payload: 3 entries of 2 MB each -> 6 MB total (> MAX_BYTES 5 MB)
+        let large_str = "x".repeat(2 * 1024 * 1024);
+        for i in 0..3 {
+            let rec = HistoryRecord {
+                timestamp: format!("2026-11-06T12:{:02}:00Z", i),
+                raw_text: format!("large_{}_{}", i, &large_str[..10]),
+                final_text: format!("large_{}_{}", i, large_str),
+                provider: "mock".into(),
+                duration_secs: 1.0,
+            };
+            logger.append(&rec).unwrap();
+        }
+
+        let meta = fs::metadata(&hist_path).unwrap();
+        assert!(
+            meta.len() <= HistoryLogger::MAX_BYTES,
+            "History file size {} exceeded MAX_BYTES {}",
+            meta.len(),
+            HistoryLogger::MAX_BYTES
+        );
+
+        let recent = logger.get_recent_entries(10).unwrap();
+        // Oldest entries must have been trimmed to fit inside 5 MB
+        assert!(recent.len() < 3);
+        assert_eq!(recent.last().unwrap().raw_text, "large_2_xxxxxxxxxx");
 
         let _ = fs::remove_dir_all(temp_dir);
     }

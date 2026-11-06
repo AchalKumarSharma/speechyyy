@@ -368,6 +368,7 @@ pub struct UinputInjector {
     device: VirtualDevice,
     pacing_delay: Duration,
     mode: InjectionMode,
+    currently_pressed: Vec<KeyCode>,
 }
 
 impl UinputInjector {
@@ -382,6 +383,7 @@ impl UinputInjector {
             device,
             pacing_delay,
             mode,
+            currently_pressed: Vec::new(),
         })
     }
 
@@ -425,12 +427,32 @@ impl UinputInjector {
         Ok(())
     }
 
+    pub fn release_all_pressed_keys(&mut self) -> Result<(), String> {
+        if !self.currently_pressed.is_empty() {
+            let events: Vec<InputEvent> = self
+                .currently_pressed
+                .drain(..)
+                .map(|k| InputEvent::new(EventType::KEY.0, k.0, 0))
+                .collect();
+            self.device
+                .emit(&events)
+                .map_err(|e| format!("Failed to release stuck keys: {}", e))?;
+        }
+        self.reset_modifiers()
+    }
+
     pub fn settle_modifiers(&mut self) -> Result<(), String> {
         self.reset_modifiers()
     }
 
     fn emit_key(&mut self, key: KeyCode, is_down: bool) -> Result<(), String> {
-        let val = if is_down { 1 } else { 0 };
+        let val = if is_down {
+            self.currently_pressed.push(key);
+            1
+        } else {
+            self.currently_pressed.retain(|&k| k != key);
+            0
+        };
         let ev = InputEvent::new(EventType::KEY.0, key.0, val);
         self.device
             .emit(&[ev])
@@ -501,9 +523,8 @@ impl TextInjector for UinputInjector {
             }
         };
 
-        if res.is_err() {
-            let _ = self.reset_modifiers();
-        }
+        // State cleanup after injection completes or fails to ensure no stuck keys
+        let _ = self.release_all_pressed_keys();
         res
     }
 

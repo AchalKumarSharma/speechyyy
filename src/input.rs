@@ -75,39 +75,40 @@ pub fn is_keyboard_device(device: &Device) -> bool {
     }
 }
 
-pub struct EvdevGrabGuard<'a> {
-    device: &'a mut Device,
+pub struct EvdevGrabGuard {
+    fds: Vec<std::os::fd::RawFd>,
     grabbed_at: std::time::Instant,
-    released: bool,
 }
 
-impl<'a> EvdevGrabGuard<'a> {
+impl EvdevGrabGuard {
     pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
 
-    pub fn new(device: &'a mut Device) -> std::io::Result<Self> {
-        device.grab()?;
+    pub fn new(devices: &mut [Device]) -> std::io::Result<Self> {
+        let mut fds = Vec::new();
+        for dev in devices.iter_mut() {
+            if dev.grab().is_ok() {
+                fds.push(dev.as_raw_fd());
+            }
+        }
         Ok(Self {
-            device,
+            fds,
             grabbed_at: std::time::Instant::now(),
-            released: false,
         })
     }
 
     pub fn is_expired(&self) -> bool {
         self.grabbed_at.elapsed() >= Self::WATCHDOG_TIMEOUT
     }
-
-    pub fn release(&mut self) {
-        if !self.released {
-            let _ = self.device.ungrab();
-            self.released = true;
-        }
-    }
 }
 
-impl<'a> Drop for EvdevGrabGuard<'a> {
+impl Drop for EvdevGrabGuard {
     fn drop(&mut self) {
-        self.release();
+        for &fd in &self.fds {
+            unsafe {
+                libc::ioctl(fd, Self::EVIOCGRAB, 0);
+            }
+        }
     }
 }
 
@@ -117,8 +118,7 @@ pub struct EvdevListener {
     inotify_fd: Option<i32>,
     pending_events: VecDeque<(KeyCode, bool)>,
     grab_enabled: bool,
-    is_grabbed: bool,
-    grabbed_at: Option<std::time::Instant>,
+    active_grab: Option<EvdevGrabGuard>,
 }
 
 impl EvdevListener {
@@ -143,8 +143,7 @@ impl EvdevListener {
             inotify_fd: None,
             pending_events: VecDeque::new(),
             grab_enabled: true,
-            is_grabbed: false,
-            grabbed_at: None,
+            active_grab: None,
         };
 
         listener.init_inotify(&dir);
@@ -161,39 +160,26 @@ impl EvdevListener {
     }
 
     pub fn is_grabbed(&self) -> bool {
-        self.is_grabbed
+        self.active_grab.is_some()
     }
 
     pub fn grab(&mut self) -> std::io::Result<()> {
-        if !self.grab_enabled || self.is_grabbed {
+        if !self.grab_enabled || self.active_grab.is_some() {
             return Ok(());
         }
-        for dev in &mut self.devices {
-            let _ = dev.grab();
-        }
-        self.is_grabbed = true;
-        self.grabbed_at = Some(std::time::Instant::now());
+        self.active_grab = Some(EvdevGrabGuard::new(&mut self.devices)?);
         Ok(())
     }
 
     pub fn ungrab(&mut self) -> std::io::Result<()> {
-        if !self.is_grabbed {
-            return Ok(());
-        }
-        for dev in &mut self.devices {
-            let _ = dev.ungrab();
-        }
-        self.is_grabbed = false;
-        self.grabbed_at = None;
+        self.active_grab = None;
         Ok(())
     }
 
     pub fn check_grab_watchdog(&mut self) {
-        if self.is_grabbed {
-            if let Some(started_at) = self.grabbed_at {
-                if started_at.elapsed() >= Self::WATCHDOG_TIMEOUT {
-                    let _ = self.ungrab();
-                }
+        if let Some(ref guard) = self.active_grab {
+            if guard.is_expired() {
+                self.active_grab = None;
             }
         }
     }
@@ -426,7 +412,9 @@ mod tests {
         assert!(listener.is_grabbed());
 
         // Fast-forward grab time to simulate 61 seconds elapsed
-        listener.grabbed_at = Some(std::time::Instant::now() - Duration::from_secs(61));
+        if let Some(ref mut guard) = listener.active_grab {
+            guard.grabbed_at = std::time::Instant::now() - Duration::from_secs(61);
+        }
         listener.check_grab_watchdog();
         assert!(!listener.is_grabbed());
 

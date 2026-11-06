@@ -106,8 +106,7 @@ pub fn build_multipart_body(
 
 impl SpeechInference for SarvamSpeechInference {
     fn transcribe(&mut self, chunk: &AudioChunk) -> Result<String, InferenceError> {
-        let sanitized_key = self.api_key.trim().trim_matches('"');
-        if sanitized_key.is_empty() {
+        if self.api_key.is_empty() {
             return Err(InferenceError::MissingApiKey("SARVAM_API_KEY".to_string()));
         }
 
@@ -135,7 +134,7 @@ impl SpeechInference for SarvamSpeechInference {
 
         let response = agent
             .post(&self.endpoint)
-            .set("api-subscription-key", sanitized_key)
+            .set("api-subscription-key", &self.api_key)
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={}", boundary),
