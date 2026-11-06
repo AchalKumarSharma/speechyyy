@@ -219,20 +219,28 @@ pub fn start_daemon(
             }
         }
     } else {
-        PidFile::acquire(&paths.pid_path)?;
-
         let server = IpcServer::new(paths.clone());
         let listener = match server.start_listener() {
             Ok(l) => l,
-            Err(e) => {
-                paths.cleanup();
+            Err(ref e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(format!(
-                    "Failed to bind Speechyyy socket at {}: {:?}",
+                    "Active Speechyyy daemon is already running (listening on {})",
+                    paths.socket_path.display()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to bind Speechyyy socket at {}: {}",
                     paths.socket_path.display(),
                     e
                 ));
             }
         };
+
+        if let Err(e) = PidFile::acquire(&paths.pid_path) {
+            paths.cleanup();
+            return Err(e);
+        }
 
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let running = server.running_flag();

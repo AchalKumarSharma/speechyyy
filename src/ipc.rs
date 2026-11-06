@@ -196,20 +196,20 @@ impl IpcServer {
         self.running.clone()
     }
 
-    pub fn start_listener(&self) -> Result<UnixListener, std::io::Result<()>> {
+    pub fn start_listener(&self) -> Result<UnixListener, std::io::Error> {
         if let Some(parent) = self.paths.socket_path.parent() {
-            create_secure_dir(parent).map_err(Err)?;
+            create_secure_dir(parent)?;
         }
         if self.paths.socket_path.exists() {
             match IpcClient::send_request(&self.paths.socket_path, &IpcRequest::Ping) {
                 Ok(IpcResponse::Pong) => {
-                    return Err(Err(std::io::Error::new(
+                    return Err(std::io::Error::new(
                         std::io::ErrorKind::AddrInUse,
                         format!(
                             "Active Speechyyy daemon is already listening on {}",
                             self.paths.socket_path.display()
                         ),
-                    )));
+                    ));
                 }
                 _ => {
                     match UnixStream::connect(&self.paths.socket_path) {
@@ -228,18 +228,17 @@ impl IpcServer {
                             let _ = fs::remove_file(&self.paths.socket_path);
                         }
                         Err(e) => {
-                            return Err(Err(e));
+                            return Err(e);
                         }
                     }
                 }
             }
         }
-        let listener = UnixListener::bind(&self.paths.socket_path).map_err(Err)?;
+        let listener = UnixListener::bind(&self.paths.socket_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.paths.socket_path, fs::Permissions::from_mode(0o600))
-                .map_err(Err)?;
+            fs::set_permissions(&self.paths.socket_path, fs::Permissions::from_mode(0o600))?;
         }
         Ok(listener)
     }
@@ -251,6 +250,9 @@ impl IpcServer {
         hotkey: &str,
         pacing_delay_ms: u64,
     ) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -276,7 +278,8 @@ impl IpcServer {
             },
         };
 
-        let mut out = serde_json::to_string(&resp).unwrap();
+        let mut out = serde_json::to_string(&resp)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         out.push('\n');
         stream.write_all(out.as_bytes())?;
         stream.flush()
