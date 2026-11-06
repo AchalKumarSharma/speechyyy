@@ -66,9 +66,6 @@ pub enum Command {
     },
     /// Completely uninstall Speechyyy
     Uninstall {
-        /// Purge all models, configs, dictionaries, and user-space binaries
-        #[arg(long)]
-        purge: bool,
         /// Automatic yes to prompts; run non-interactively
         #[arg(short = 'y', long = "yes")]
         yes: bool,
@@ -139,7 +136,6 @@ impl ModelCommands {
     }
 }
 
-pub type Commands = Command;
 pub type ModelAction = ModelCommands;
 
 #[cfg(test)]
@@ -429,17 +425,6 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Uninstall {
-                purge: false,
-                yes: false
-            }
-        );
-
-        let cli_purge =
-            Cli::try_parse_from(["speechyyy", "uninstall", "--purge"]).expect("parse uninstall purge");
-        assert_eq!(
-            cli_purge.command,
-            Command::Uninstall {
-                purge: true,
                 yes: false
             }
         );
@@ -449,7 +434,6 @@ mod tests {
         assert_eq!(
             cli_yes.command,
             Command::Uninstall {
-                purge: false,
                 yes: true
             }
         );
@@ -459,7 +443,6 @@ mod tests {
         assert_eq!(
             cli_yes_long.command,
             Command::Uninstall {
-                purge: false,
                 yes: true
             }
         );

@@ -43,13 +43,12 @@ pub struct RuntimePaths {
 
 impl RuntimePaths {
     pub fn new() -> Self {
-        let base = std::env::var("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
+        let dir = std::env::var("XDG_RUNTIME_DIR")
+            .map(|xdg| PathBuf::from(xdg).join("speechyyy"))
             .unwrap_or_else(|_| {
                 let uid = unsafe { libc::getuid() };
                 PathBuf::from(format!("/tmp/speechyyy-{}", uid))
             });
-        let dir = base.join("speechyyy");
         let mut paths = Self::with_dir(dir);
         paths.binary_path = std::env::current_exe().ok();
         paths
@@ -86,12 +85,29 @@ impl RuntimePaths {
     }
 
     pub fn ensure_dir(&self) -> std::io::Result<()> {
-        fs::create_dir_all(&self.dir)
+        create_secure_dir(&self.dir)
     }
 
     pub fn cleanup(&self) {
         PidFile::remove(&self.pid_path);
         let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+pub fn create_secure_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder.create(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
     }
 }
 
@@ -108,7 +124,7 @@ impl PidFile {
 
     pub fn acquire(path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            create_secure_dir(parent)
                 .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
         }
 
@@ -182,10 +198,17 @@ impl IpcServer {
 
     pub fn start_listener(&self) -> Result<UnixListener, std::io::Result<()>> {
         if let Some(parent) = self.paths.socket_path.parent() {
-            fs::create_dir_all(parent).map_err(Err)?;
+            create_secure_dir(parent).map_err(Err)?;
         }
         let _ = fs::remove_file(&self.paths.socket_path);
-        UnixListener::bind(&self.paths.socket_path).map_err(Err)
+        let listener = UnixListener::bind(&self.paths.socket_path).map_err(Err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.paths.socket_path, fs::Permissions::from_mode(0o600))
+                .map_err(Err)?;
+        }
+        Ok(listener)
     }
 
     pub fn handle_connection(
@@ -336,5 +359,29 @@ mod tests {
         paths.cleanup();
         let root_created = temp_dir.parent().unwrap().parent().unwrap();
         let _ = fs::remove_dir_all(root_created);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ipc_directory_and_socket_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = std::env::temp_dir()
+            .join(format!("speechyyy_perm_test_{}", std::process::id()))
+            .join("sock_dir");
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        paths.ensure_dir().expect("ensure_dir should succeed");
+
+        let dir_meta = fs::metadata(&temp_dir).expect("dir metadata");
+        let dir_mode = dir_meta.permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "Runtime directory mode must be 0700");
+
+        let server = IpcServer::new(paths.clone());
+        let _listener = server.start_listener().expect("listener should bind");
+        let sock_meta = fs::metadata(&paths.socket_path).expect("socket metadata");
+        let sock_mode = sock_meta.permissions().mode() & 0o777;
+        assert_eq!(sock_mode, 0o600, "Socket file mode must be 0600");
+
+        paths.cleanup();
+        let _ = fs::remove_dir_all(temp_dir.parent().unwrap());
     }
 }

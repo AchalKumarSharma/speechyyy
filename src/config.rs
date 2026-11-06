@@ -297,26 +297,7 @@ impl Config {
         provider: &str,
         model: &str,
     ) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create config directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
-
-        let mut table = if path.exists() {
-            let content = fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            match toml::from_str::<toml::Value>(&content) {
-                Ok(toml::Value::Table(t)) => t,
-                _ => toml::Table::new(),
-            }
-        } else {
-            toml::Table::new()
-        };
+        let mut table = read_toml_table(path)?;
 
         let inf_val = table
             .entry("inference")
@@ -335,36 +316,11 @@ impl Config {
         table.remove("provider");
         table.remove("sarvam_model");
 
-        let serialized = toml::to_string_pretty(&toml::Value::Table(table))
-            .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
-
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
-
-        Ok(())
+        write_secure_config(path, &table)
     }
 
     pub fn deactivate_model_in_file(path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create config directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
-
-        let mut table = if path.exists() {
-            let content = fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            match toml::from_str::<toml::Value>(&content) {
-                Ok(toml::Value::Table(t)) => t,
-                _ => toml::Table::new(),
-            }
-        } else {
-            toml::Table::new()
-        };
+        let mut table = read_toml_table(path)?;
 
         let inf_val = table
             .entry("inference")
@@ -380,36 +336,11 @@ impl Config {
 
         table.remove("sarvam_model");
 
-        let serialized = toml::to_string_pretty(&toml::Value::Table(table))
-            .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
-
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
-
-        Ok(())
+        write_secure_config(path, &table)
     }
 
     pub fn save_sarvam_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create config directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
-
-        let mut table = if path.exists() {
-            let content = fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            match toml::from_str::<toml::Value>(&content) {
-                Ok(toml::Value::Table(t)) => t,
-                _ => toml::Table::new(),
-            }
-        } else {
-            toml::Table::new()
-        };
+        let mut table = read_toml_table(path)?;
 
         let inf_val = table
             .entry("inference")
@@ -427,13 +358,7 @@ impl Config {
         table.remove("sarvam_api_key");
         table.remove("sarvam_model");
 
-        let serialized = toml::to_string_pretty(&toml::Value::Table(table))
-            .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
-
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
-
-        Ok(())
+        write_secure_config(path, &table)
     }
 
     pub fn to_target_chord(&self) -> TargetChord {
@@ -461,6 +386,62 @@ impl Config {
             self.injector.pacing_delay_ms = d;
         }
     }
+}
+
+fn read_toml_table(path: &Path) -> Result<toml::Table, String> {
+    if path.exists() {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        match toml::from_str::<toml::Value>(&content) {
+            Ok(toml::Value::Table(t)) => Ok(t),
+            _ => Ok(toml::Table::new()),
+        }
+    } else {
+        Ok(toml::Table::new())
+    }
+}
+
+fn write_secure_config(path: &Path, table: &toml::Table) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create config directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+
+    let serialized = toml::to_string_pretty(&toml::Value::Table(table.clone()))
+        .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+
+        file.write_all(serialized.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to set permissions on {}: {}", path.display(), e))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, serialized)
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    }
+
+    Ok(())
 }
 
 fn parse_trigger_key(name: &str) -> Option<KeyCode> {
@@ -709,6 +690,23 @@ model = "parakeet-tdt-v3"
         let reloaded = Config::load_from_path(&config_file);
         assert_eq!(reloaded.inference.provider, "local");
         assert_eq!(reloaded.inference.model, "");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_sarvam_credentials_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = std::env::temp_dir().join(format!("speechyyy_cfg_perm_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let config_file = temp_dir.join("speechyyy").join("config.toml");
+
+        Config::save_sarvam_credentials_in_file(&config_file, "secret_key_123")
+            .expect("save credentials");
+        let meta = fs::metadata(&config_file).expect("config file metadata");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "Config file permissions must be 0600");
 
         let _ = fs::remove_dir_all(temp_dir);
     }

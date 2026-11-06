@@ -75,9 +75,7 @@ fi
 
 TARGET_USER="${SUDO_USER:-$USER}"
 echo "==> Configuring instant hardware permissions for user ${TARGET_USER}..."
-sudo usermod -aG input,uinput "$TARGET_USER" 2>/dev/null || true
 sudo setfacl -m u:"$TARGET_USER":rw /dev/uinput 2>/dev/null || true
-sudo setfacl -m u:"$TARGET_USER":r /dev/input/event* 2>/dev/null || true
 
 if [ -n "$UDEV_RULE_SRC" ] && [ -f "$UDEV_RULE_SRC" ]; then
     echo "==> Installing udev rule to /etc/udev/rules.d/99-speechyyy-uinput.rules..."

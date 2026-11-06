@@ -1,3 +1,1 @@
-KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
-SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"
-
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

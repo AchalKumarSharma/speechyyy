@@ -8,7 +8,6 @@ clap = { version = "4.6.7", features = ["derive"] }
 cpal = "0.18.2"
 evdev = "0.13.2"
 libc = "0.2.191"
-nix = "0.31.3"
 ringbuf = "0.6.0"
 rpassword = "7.3"
 serde = { version = "1.0.229", features = ["derive"] }

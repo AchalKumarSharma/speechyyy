@@ -1,5 +1,5 @@
 use crate::audio::AudioChunk;
-use crate::inference::wav::encode_wav_16k_mono;
+use crate::audio::wav::encode_wav_16k_mono;
 use crate::inference::{InferenceError, SpeechInference};
 use serde::Deserialize;
 

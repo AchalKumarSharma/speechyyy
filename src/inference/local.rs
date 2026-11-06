@@ -70,16 +70,18 @@ impl LocalSpeechInference {
                     ))
                 })?;
 
-                let mut config = TransducerConfig::default();
-                config.encoder = encoder.to_string_lossy().to_string();
-                config.decoder = decoder.to_string_lossy().to_string();
-                config.joiner = joiner.to_string_lossy().to_string();
-                config.tokens = tokens.to_string_lossy().to_string();
-                config.model_type = "nemo_transducer".to_string();
-                config.feature_dim = 128;
-                config.sample_rate = 16000;
-                config.provider = Some("cpu".to_string());
-                config.num_threads = 2;
+                let config = TransducerConfig {
+                    encoder: encoder.to_string_lossy().to_string(),
+                    decoder: decoder.to_string_lossy().to_string(),
+                    joiner: joiner.to_string_lossy().to_string(),
+                    tokens: tokens.to_string_lossy().to_string(),
+                    model_type: "nemo_transducer".to_string(),
+                    feature_dim: 128,
+                    sample_rate: 16000,
+                    provider: Some("cpu".to_string()),
+                    num_threads: 2,
+                    ..Default::default()
+                };
                 let recognizer = TransducerRecognizer::new(config).map_err(|e| {
                     InferenceError::LocalEngine(format!(
                         "Failed to initialize Parakeet Transducer recognizer: {}",
@@ -279,20 +281,22 @@ impl CustomSpeechInference {
                     )
                 })?;
                 let is_nemo = self.config.r#type.to_lowercase() == "nemo_transducer";
-                let mut cfg = TransducerConfig::default();
-                cfg.encoder = self.config.encoder.to_string_lossy().to_string();
-                cfg.decoder = self.config.decoder.to_string_lossy().to_string();
-                cfg.joiner = joiner.to_string_lossy().to_string();
-                cfg.tokens = self.config.tokens.to_string_lossy().to_string();
-                cfg.model_type = if is_nemo {
-                    "nemo_transducer".to_string()
-                } else {
-                    "transducer".to_string()
+                let cfg = TransducerConfig {
+                    encoder: self.config.encoder.to_string_lossy().to_string(),
+                    decoder: self.config.decoder.to_string_lossy().to_string(),
+                    joiner: joiner.to_string_lossy().to_string(),
+                    tokens: self.config.tokens.to_string_lossy().to_string(),
+                    model_type: if is_nemo {
+                        "nemo_transducer".to_string()
+                    } else {
+                        "transducer".to_string()
+                    },
+                    feature_dim: if is_nemo { 128 } else { 80 },
+                    sample_rate: 16000,
+                    provider: Some("cpu".to_string()),
+                    num_threads: 2,
+                    ..Default::default()
                 };
-                cfg.feature_dim = if is_nemo { 128 } else { 80 };
-                cfg.sample_rate = 16000;
-                cfg.provider = Some("cpu".to_string());
-                cfg.num_threads = 2;
                 let rec = TransducerRecognizer::new(cfg).map_err(|e| {
                     InferenceError::LocalEngine(format!("Failed to init custom transducer: {}", e))
                 })?;

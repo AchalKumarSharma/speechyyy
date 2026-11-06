@@ -75,24 +75,13 @@ pub fn start_daemon(
     typing_delay: Option<u64>,
     paths: &RuntimePaths,
 ) -> Result<(), String> {
-    if let Some(parent) = paths.pid_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create runtime directory {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
-    if let Some(parent) = paths.socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create runtime directory {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
+    paths.ensure_dir().map_err(|e| {
+        format!(
+            "Failed to create runtime directory {}: {}",
+            paths.dir.display(),
+            e
+        )
+    })?;
 
     // Pre-flight check
     let mut check_config = Config::load();

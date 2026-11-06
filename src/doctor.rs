@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub trait SysEnv {
     fn current_username(&self) -> String;
     fn user_groups(&self) -> Vec<String>;
-    fn can_read_path(&self, path: &Path) -> bool;
     fn can_write_path(&self, path: &Path) -> bool;
-    fn list_input_events(&self) -> Vec<PathBuf>;
     fn check_audio_input(&self) -> Result<String, String>;
     fn check_inference(&self) -> Result<String, String>;
 
@@ -78,26 +76,8 @@ impl SysEnv for RealSysEnv {
         groups
     }
 
-    fn can_read_path(&self, path: &Path) -> bool {
-        OpenOptions::new().read(true).open(path).is_ok()
-    }
-
     fn can_write_path(&self, path: &Path) -> bool {
         OpenOptions::new().write(true).open(path).is_ok()
-    }
-
-    fn list_input_events(&self) -> Vec<PathBuf> {
-        let mut events = Vec::new();
-        if let Ok(entries) = fs::read_dir("/dev/input") {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("event") {
-                    events.push(entry.path());
-                }
-            }
-        }
-        events.sort();
-        events
     }
 
     fn check_audio_input(&self) -> Result<String, String> {
@@ -327,61 +307,8 @@ pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
 pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config) -> DoctorReport {
     let mut items = Vec::new();
     let mut fix_instructions = Vec::new();
-    let username = env.current_username();
-    let groups = env.user_groups();
 
-    // Check evdev event access first to check direct read access (e.g. via ACL/uaccess)
-    let events = env.list_input_events();
-    let readable_count = events.iter().filter(|p| env.can_read_path(p)).count();
-    let has_readable_events = readable_count > 0;
-
-    // 1. Group membership checks (input and uinput)
-    let has_input_group = groups.iter().any(|g| g == "input");
-    let _has_uinput_group = groups.iter().any(|g| g == "uinput");
-
-    if has_input_group || has_readable_events {
-        items.push(DiagnosticItem {
-            name: "User 'input' group membership".into(),
-            status: CheckStatus::Pass,
-        });
-    } else {
-        items.push(DiagnosticItem {
-            name: "User 'input' group membership".into(),
-            status: CheckStatus::Fail(format!("User '{}' is not in the 'input' group", username)),
-        });
-    }
-
-    items.push(DiagnosticItem {
-        name: "User 'uinput' group membership".into(),
-        status: CheckStatus::Pass, // On many distros uinput is managed under input group via udev
-    });
-
-    if !has_input_group && !has_readable_events {
-        fix_instructions.push(format!("sudo usermod -aG input,uinput {}", username));
-    }
-
-    // 2. evdev event access
-    if events.is_empty() {
-        items.push(DiagnosticItem {
-            name: "Linux evdev devices (/dev/input/event*)".into(),
-            status: CheckStatus::Fail("No /dev/input/event* devices found on system".into()),
-        });
-    } else if has_readable_events {
-        items.push(DiagnosticItem {
-            name: "evdev read permissions".into(),
-            status: CheckStatus::Pass,
-        });
-    } else {
-        items.push(DiagnosticItem {
-            name: "evdev read permissions".into(),
-            status: CheckStatus::Fail(format!(
-                "Found {} input device(s) in /dev/input/, but none are readable",
-                events.len()
-            )),
-        });
-    }
-
-    // 3. /dev/uinput write access or Wayland clipboard fallback
+    // 1. /dev/uinput write access or Wayland clipboard fallback
     let uinput_path = Path::new("/dev/uinput");
     let uinput_writable = env.can_write_path(uinput_path);
     if uinput_writable {
@@ -392,7 +319,7 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
     } else if env.is_wayland() && env.has_command("wl-copy") {
         items.push(DiagnosticItem {
             name: "Virtual keyboard permissions (/dev/uinput)".into(),
-            status: CheckStatus::Pass,
+            status: CheckStatus::Warn("Cannot write to /dev/uinput (using Wayland clipboard fallback)".into()),
         });
         items.push(DiagnosticItem {
             name: "Wayland clipboard fallback (wl-copy)".into(),
@@ -403,7 +330,7 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
             name: "Virtual keyboard permissions (/dev/uinput)".into(),
             status: CheckStatus::Fail("Cannot write to /dev/uinput (permission denied)".into()),
         });
-        fix_instructions.push("sudo cp /etc/udev/rules.d/99-speechyyy.rules (or generate below) && sudo udevadm control --reload-rules && sudo udevadm trigger".into());
+        fix_instructions.push("sudo cp /etc/udev/rules.d/99-speechyyy-uinput.rules (or generate below) && sudo udevadm control --reload-rules && sudo udevadm trigger".into());
     }
 
     // Typewriter specific check
@@ -512,16 +439,10 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
 
     let udev_rule_content =
         r#"# Speechyyy uinput rule for unprivileged virtual keyboard caret injection
-KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
-SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
 "#
         .trim_start()
         .to_string();
-
-    if !has_input_group && !has_readable_events {
-        fix_instructions
-            .push("Log out and log back in for new group permissions to take effect.".into());
-    }
 
     DoctorReport {
         items,
@@ -572,13 +493,12 @@ pub fn print_doctor_report(report: &DoctorReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     struct MockEnv {
         user: String,
         groups: Vec<String>,
-        readable_paths: Vec<PathBuf>,
         writable_paths: Vec<PathBuf>,
-        events: Vec<PathBuf>,
         audio_input: Result<String, String>,
         inference_result: Result<String, String>,
     }
@@ -590,14 +510,8 @@ mod tests {
         fn user_groups(&self) -> Vec<String> {
             self.groups.clone()
         }
-        fn can_read_path(&self, path: &Path) -> bool {
-            self.readable_paths.iter().any(|p| p == path)
-        }
         fn can_write_path(&self, path: &Path) -> bool {
             self.writable_paths.iter().any(|p| p == path)
-        }
-        fn list_input_events(&self) -> Vec<PathBuf> {
-            self.events.clone()
         }
         fn check_audio_input(&self) -> Result<String, String> {
             self.audio_input.clone()
@@ -612,9 +526,7 @@ mod tests {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["alfred".into(), "input".into(), "uinput".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Default Source".into()),
             inference_result: Ok("Mock provider (mock)".into()),
         };
@@ -633,62 +545,43 @@ mod tests {
     }
 
     #[test]
-    fn test_doctor_missing_input_group_and_uinput_access() {
+    fn test_doctor_uinput_unwritable_fails() {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["alfred".into(), "nobody".into()],
-            readable_paths: vec![],
             writable_paths: vec![],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("Builtin Mic".into()),
             inference_result: Ok("Mock provider (mock)".into()),
         };
 
         let report = run_doctor(&env);
-        assert!(!report.is_ready(), "Expected checks to fail");
+        assert!(!report.is_ready(), "Expected checks to fail when /dev/uinput is unwritable");
         assert!(!report.fix_instructions.is_empty());
         assert!(report
             .fix_instructions
             .iter()
+            .any(|cmd| cmd.contains("99-speechyyy-uinput.rules")));
+        assert!(!report
+            .fix_instructions
+            .iter()
             .any(|cmd| cmd.contains("usermod -aG input")));
         assert!(report.udev_rule_content.contains("KERNEL==\"uinput\""));
+        assert!(!report.udev_rule_content.contains("KERNEL==\"event*\""));
     }
 
     #[test]
-    fn test_doctor_acl_direct_read_passes_without_input_group() {
+    fn test_doctor_uinput_writable_passes_without_input_group() {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["alfred".into(), "nobody".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("Builtin Mic".into()),
             inference_result: Ok("Mock provider (mock)".into()),
         };
 
         let report = run_doctor(&env);
-        assert!(report.is_ready(), "Expected checks to pass via direct ACL access");
+        assert!(report.is_ready(), "Expected checks to pass via /dev/uinput write access");
         assert!(report.fix_instructions.is_empty());
-    }
-
-    #[test]
-    fn test_doctor_no_events_found() {
-        let env = MockEnv {
-            user: "alfred".into(),
-            groups: vec!["input".into()],
-            readable_paths: vec![],
-            writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![],
-            audio_input: Ok("Builtin Mic".into()),
-            inference_result: Ok("Mock provider (mock)".into()),
-        };
-
-        let report = run_doctor(&env);
-        assert!(!report.is_ready());
-        assert!(report
-            .items
-            .iter()
-            .any(|i| i.name.contains("Linux evdev devices")));
     }
 
     #[test]
@@ -696,9 +589,7 @@ mod tests {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["input".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Err("No default audio input device found".into()),
             inference_result: Ok("Mock provider (mock)".into()),
         };
@@ -721,9 +612,7 @@ mod tests {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["input".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Default Source".into()),
             inference_result: Err("SARVAM_API_KEY is not set".into()),
         };
@@ -746,9 +635,7 @@ mod tests {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["input".into(), "uinput".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Default Source".into()),
             inference_result: Err("Unknown inference provider 'foo'".into()),
         };
@@ -765,8 +652,6 @@ mod tests {
     struct MockWaylandEnv {
         user: String,
         groups: Vec<String>,
-        readable_paths: Vec<PathBuf>,
-        events: Vec<PathBuf>,
         audio_input: Result<String, String>,
         inference_result: Result<String, String>,
     }
@@ -778,14 +663,8 @@ mod tests {
         fn user_groups(&self) -> Vec<String> {
             self.groups.clone()
         }
-        fn can_read_path(&self, path: &Path) -> bool {
-            self.readable_paths.iter().any(|p| p == path)
-        }
         fn can_write_path(&self, _path: &Path) -> bool {
             false
-        }
-        fn list_input_events(&self) -> Vec<PathBuf> {
-            self.events.clone()
         }
         fn check_audio_input(&self) -> Result<String, String> {
             self.audio_input.clone()
@@ -806,8 +685,6 @@ mod tests {
         let env = MockWaylandEnv {
             user: "alfred".into(),
             groups: vec!["alfred".into(), "input".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Source".into()),
             inference_result: Ok("Mock provider (mock)".into()),
         };
@@ -820,7 +697,13 @@ mod tests {
         assert!(report
             .items
             .iter()
-            .any(|i| i.name.contains("Wayland clipboard fallback")));
+            .any(|i| i.name.contains("Virtual keyboard permissions")
+                && matches!(i.status, CheckStatus::Warn(_))));
+        assert!(report
+            .items
+            .iter()
+            .any(|i| i.name.contains("Wayland clipboard fallback")
+                && matches!(i.status, CheckStatus::Pass)));
     }
 
     #[test]
@@ -828,9 +711,7 @@ mod tests {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["input".into(), "uinput".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Source".into()),
             inference_result: Ok("Sarvam API Key: sk_...1234 (configured)".into()),
         };
@@ -849,9 +730,7 @@ mod tests {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["input".into(), "uinput".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Source".into()),
             inference_result: Err(
                 "Sarvam API Key missing. Set SARVAM_API_KEY in config.toml or environment.".into(),
@@ -874,9 +753,7 @@ mod tests {
         let env = MockEnv {
             user: "alfred".into(),
             groups: vec!["input".into(), "uinput".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
             writable_paths: vec![PathBuf::from("/dev/uinput")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Source".into()),
             inference_result: Ok("Mock provider (mock)".into()),
         };
@@ -898,8 +775,6 @@ mod tests {
         let env = MockWaylandEnv {
             user: "alfred".into(),
             groups: vec!["input".into()],
-            readable_paths: vec![PathBuf::from("/dev/input/event0")],
-            events: vec![PathBuf::from("/dev/input/event0")],
             audio_input: Ok("PipeWire Source".into()),
             inference_result: Ok("Mock provider (mock)".into()),
         };
