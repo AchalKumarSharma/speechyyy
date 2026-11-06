@@ -135,6 +135,39 @@ impl KeyChordTracker {
             }
         }
     }
+
+    pub fn is_chord_release(&self, key: KeyCode, is_down: bool) -> bool {
+        if is_down || !self.is_chord_active {
+            return false;
+        }
+        match &self.target {
+            TargetChord::SingleKey(target_key) => key == *target_key,
+            TargetChord::Compound {
+                modifiers,
+                trigger_key,
+            } => {
+                if key == *trigger_key {
+                    true
+                } else {
+                    match key {
+                        KeyCode::KEY_LEFTCTRL | KeyCode::KEY_RIGHTCTRL => {
+                            modifiers.contains(&Modifier::Ctrl)
+                        }
+                        KeyCode::KEY_LEFTALT | KeyCode::KEY_RIGHTALT => {
+                            modifiers.contains(&Modifier::Alt)
+                        }
+                        KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT => {
+                            modifiers.contains(&Modifier::Shift)
+                        }
+                        KeyCode::KEY_LEFTMETA | KeyCode::KEY_RIGHTMETA => {
+                            modifiers.contains(&Modifier::Super)
+                        }
+                        _ => false,
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +373,14 @@ impl<E: DictationEngine> StateMachineController<E> {
     pub fn finish_emission(&mut self) {
         if self.state == DictationState::Emitting {
             self.state = DictationState::Idle;
+        }
+    }
+
+    pub fn is_chord_release(&self, key: KeyCode, is_down: bool) -> bool {
+        if self.state == DictationState::Recording {
+            self.tracker.is_chord_release(key, is_down)
+        } else {
+            false
         }
     }
 }

@@ -80,6 +80,9 @@ where
         // 2. Poll input events (10ms tick)
         if let Some((keycode, is_down)) = guard.0.poll_event(Duration::from_millis(10)) {
             let prev_state = controller.state;
+            if controller.is_chord_release(keycode, is_down) {
+                let _ = guard.0.ungrab();
+            }
             match controller.handle_key_event(keycode, is_down) {
                 Ok(Some(text)) => {
                     let _ = guard.0.ungrab();
@@ -531,6 +534,92 @@ mod tests {
             injector.injected_strings.lock().unwrap().as_slice(),
             &["test transcription".to_string()]
         );
+
+        let _ = std::fs::remove_file(sock_path);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_immediate_ungrab_on_keyup_before_transcription() {
+        let temp_dir = std::env::temp_dir().join(format!("daemon_ungrab_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let sock_path = temp_dir.join("test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        struct ObservableInputSource {
+            events: std::collections::VecDeque<(KeyCode, bool)>,
+            grabbed: Arc<AtomicBool>,
+        }
+        impl InputEventSource for ObservableInputSource {
+            fn poll_event(&mut self, _timeout: Duration) -> Option<(KeyCode, bool)> {
+                self.events.pop_front()
+            }
+            fn grab(&mut self) -> Result<(), String> {
+                self.grabbed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn ungrab(&mut self) -> Result<(), String> {
+                self.grabbed.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let grabbed_flag = Arc::new(AtomicBool::new(false));
+        let mut input_source = ObservableInputSource {
+            events: std::collections::VecDeque::from(vec![
+                (KeyCode::KEY_RIGHTALT, true),
+                (KeyCode::KEY_RIGHTALT, false),
+            ]),
+            grabbed: Arc::clone(&grabbed_flag),
+        };
+
+        struct InspectingEngine {
+            grabbed: Arc<AtomicBool>,
+            was_ungrabbed_during_transcription: Arc<AtomicBool>,
+        }
+        impl DictationEngine for InspectingEngine {
+            fn on_press(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn on_release(&mut self) -> Result<Option<String>, String> {
+                if !self.grabbed.load(Ordering::SeqCst) {
+                    self.was_ungrabbed_during_transcription.store(true, Ordering::SeqCst);
+                }
+                Ok(Some("immediate ungrab verified".to_string()))
+            }
+        }
+
+        let was_ungrabbed = Arc::new(AtomicBool::new(false));
+        let engine = InspectingEngine {
+            grabbed: Arc::clone(&grabbed_flag),
+            was_ungrabbed_during_transcription: Arc::clone(&was_ungrabbed),
+        };
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+
+        let running_clone = Arc::clone(&running);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            running_clone.store(false, Ordering::SeqCst);
+        });
+
+        let _ = run_session_loop(
+            &listener,
+            &mut input_source,
+            &mut injector,
+            &mut controller,
+            &running,
+            "RightAlt",
+            15,
+        );
+
+        assert!(
+            was_ungrabbed.load(Ordering::SeqCst),
+            "Keyboard MUST be ungrabbed before on_release/transcription begins!"
+        );
+        assert!(!grabbed_flag.load(Ordering::SeqCst));
 
         let _ = std::fs::remove_file(sock_path);
         let _ = std::fs::remove_dir_all(temp_dir);
