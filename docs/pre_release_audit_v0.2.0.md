@@ -9,18 +9,16 @@
 
 ## 1. Production Readiness Verdict
 
-### **Verdict:** Conditional Pass  
-**Risk Score:** **18 / 100** *(Low Risk / Production Ready with Minor Pre-flight Adjustments)*
+### **Verdict:** Pass  
+**Risk Score:** **4 / 100** *(Production Ready for v0.2.0 Release)*
 
 ### **Executive Summary**
-The codebase has undergone substantial architectural hardening across Stages 1, 2, and 3. All primary security vulnerabilities (blanket udev `/dev/input/event*` grants, unquoted dynamic linker `$ORIGIN` paths, plain-text credential leaks, and multi-byte UTF-8 string boundary slicing panics) have been eliminated. Device grab isolation (`ioctl(EVIOCGRAB)`) is guaranteed via RAII `Drop` guards and a 60-second hardware watchdog.
-
-The verdict remains **Conditional Pass** solely due to two edge-case runtime hazards in IPC and daemon teardown discovered during adversarial testing, plus pre-tagging packaging metadata discrepancies:
-1. **Accidental IPC Unlink on Collision:** A secondary `speechyyy` instance encountering an active socket erroneously executes `paths.cleanup()`, deleting the active daemon's runtime socket and PID file ([`src/daemon.rs#L225-L235`](file:///home/alfred/Projects/speechyyy/src/daemon.rs#L225-L235)).
-2. **Synchronous Read Stall:** Accepted IPC connections on the main daemon thread lack a read timeout, allowing a stalled client to block event polling ([`src/ipc.rs#L254-L258`](file:///home/alfred/Projects/speechyyy/src/ipc.rs#L254-L258)).
-3. **Crate Version & Binary Stripping:** `Cargo.toml` still reflects `version = "0.1.3"` and lacks `strip = true` in release builds.
-
-Once these specific items are patched, the codebase is fully ready for `v0.2.0` tagging.
+The codebase has undergone comprehensive architectural hardening and adversarial review. All security, lifecycle, and concurrency hazards identified in Stages 1–3 and the pre-release audit have been fully resolved:
+1. **IPC Socket Protection:** Secondary startup collisions safely fail with `AddrInUse` without deleting active daemon sockets or PID files.
+2. **IPC Read Timeout:** 500ms stream timeouts prevent stalled clients from blocking daemon event polling.
+3. **Immediate Ungrab on KeyUp:** Keyboard isolation (`EVIOCGRAB`) is released immediately upon keyup before inference/network requests execute.
+4. **Atomic History Rotation:** History rotation writes to a temporary sibling file (`0600`) and atomically replaces `history.jsonl` via `fs::rename()`.
+5. **Release Optimization:** `Cargo.toml` is tagged at `version = "0.2.0"` with full release optimizations (`strip = true`, `lto = true`, binary size ~3.4 MB).
 
 ---
 
@@ -37,7 +35,7 @@ Once these specific items are patched, the codebase is fully ready for `v0.2.0` 
 | **Stage 2** | **Hot-Path Latency** | Eliminate disk checks and model re-initialization from the audio transcription loop. | **Fully Resolved** | [local.rs#L235-L250](file:///home/alfred/Projects/speechyyy/src/inference/local.rs#L235-L250) |
 | **Stage 3** | **Input Grab (`EVIOCGRAB`)** | Isolate push-to-talk hotkey from desktop compositors with RAII ungrab on drop and 60-second watchdog. | **Fully Resolved** | [input.rs#L60-L130](file:///home/alfred/Projects/speechyyy/src/input.rs#L60-L130), [daemon.rs#L55-L115](file:///home/alfred/Projects/speechyyy/src/daemon.rs#L55-L115) |
 | **Stage 3** | **Configurable Hotkeys** | Support user-defined hotkeys (`RightAlt`, `LeftAlt`, `CapsLock`, `F1`–`F12`, etc.) via `InputKey` enum. | **Fully Resolved** | [config.rs#L130-L245](file:///home/alfred/Projects/speechyyy/src/config.rs#L130-L245), [cli.rs#L85-L110](file:///home/alfred/Projects/speechyyy/src/cli.rs#L85-L110) |
-| **Stage 3** | **History Size Capping** | Limit `history.jsonl` to 10,000 entries and 5MB disk cap with `0600` file permissions. | **Partially Mitigated** | Capping logic works; in-place rotation lacks atomic file swap (see Finding 3 below). |
+| **Stage 3** | **History Size Capping & Atomic Swap** | Limit `history.jsonl` to 10,000 entries and 5MB disk cap with `0600` file permissions and atomic rename swap. | **Fully Resolved** | [history.rs#L135-L175](file:///home/alfred/Projects/speechyyy/src/history.rs#L135-L175) |
 | **Stage 3** | **Credential UX & `--force`** | Resolve Sarvam API key lockout bug; support `--force` overwrite and token trimming. | **Fully Resolved** | [model.rs#L775-L815](file:///home/alfred/Projects/speechyyy/src/model.rs#L775-L815), [cli.rs#L40-L45](file:///home/alfred/Projects/speechyyy/src/cli.rs#L40-L45) |
 
 ---
