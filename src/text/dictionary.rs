@@ -299,6 +299,11 @@ fn adapt_casing(matched: &str, replacement: &str) -> String {
     replacement.to_string()
 }
 
+#[inline]
+fn is_word_boundary_char(c: char) -> bool {
+    !c.is_alphanumeric() && c != '_'
+}
+
 /// Replaces whole-word occurrences of `pattern_lower` in `text` with `replacement` (case-insensitive).
 fn replace_word_boundary(text: &str, pattern_lower: &str, replacement: &str) -> String {
     replace_word_boundary_with_case(text, pattern_lower, replacement, false)
@@ -315,51 +320,79 @@ fn replace_word_boundary_with_case(
         return text.to_string();
     }
 
-    let text_lower = text.to_lowercase();
-    let pattern_len = pattern_lower.len();
+    let char_indices: Vec<(usize, char)> = text.char_indices().collect();
+    let num_chars = char_indices.len();
     let mut result = String::with_capacity(text.len());
-    let mut cursor = 0;
+    let mut cursor_byte = 0;
+    let mut i = 0;
 
-    while let Some(rel_idx) = text_lower[cursor..].find(pattern_lower) {
-        let match_start = cursor + rel_idx;
-        let match_end = match_start + pattern_len;
-
-        // Check word boundaries
-        let is_start_boundary = if match_start == 0 {
+    while i < num_chars {
+        // Check start boundary: first character, or previous character is a word boundary
+        let is_start_boundary = if i == 0 {
             true
         } else {
-            let prev_char = text[..match_start].chars().last().unwrap();
-            !prev_char.is_alphanumeric() && prev_char != '_'
+            let prev_char = char_indices[i - 1].1;
+            is_word_boundary_char(prev_char)
         };
 
-        let is_end_boundary = if match_end >= text.len() {
-            true
-        } else {
-            let next_char = text[match_end..].chars().next().unwrap();
-            !next_char.is_alphanumeric() && next_char != '_'
-        };
+        if is_start_boundary {
+            let mut pat_iter = pattern_lower.chars();
+            let mut matched = true;
+            let mut end_char_idx = i;
 
-        if is_start_boundary && is_end_boundary {
-            result.push_str(&text[cursor..match_start]);
-            let rep = if preserve_case {
-                adapt_casing(&text[match_start..match_end], replacement)
-            } else {
-                replacement.to_string()
-            };
-            result.push_str(&rep);
-            cursor = match_end;
-        } else {
-            let next_cursor = text[match_start..]
-                .char_indices()
-                .nth(1)
-                .map(|(offset, _)| match_start + offset)
-                .unwrap_or(text.len());
-            result.push_str(&text[cursor..next_cursor]);
-            cursor = next_cursor;
+            for (offset, &(_, ch)) in char_indices[i..].iter().enumerate() {
+                let mut ch_matched = true;
+                for lower_c in ch.to_lowercase() {
+                    if pat_iter.next() != Some(lower_c) {
+                        ch_matched = false;
+                        break;
+                    }
+                }
+                if !ch_matched {
+                    matched = false;
+                    break;
+                }
+                end_char_idx = i + offset + 1;
+                if pat_iter.clone().next().is_none() {
+                    break;
+                }
+            }
+
+            if matched && pat_iter.next().is_none() {
+                // Check end boundary: end of text, or next character is a word boundary
+                let is_end_boundary = if end_char_idx >= num_chars {
+                    true
+                } else {
+                    let next_char = char_indices[end_char_idx].1;
+                    is_word_boundary_char(next_char)
+                };
+
+                if is_end_boundary {
+                    let match_start = char_indices[i].0;
+                    let match_end = if end_char_idx < num_chars {
+                        char_indices[end_char_idx].0
+                    } else {
+                        text.len()
+                    };
+
+                    result.push_str(&text[cursor_byte..match_start]);
+                    let replacement_text = if preserve_case {
+                        adapt_casing(&text[match_start..match_end], replacement)
+                    } else {
+                        replacement.to_string()
+                    };
+                    result.push_str(&replacement_text);
+                    cursor_byte = match_end;
+                    i = end_char_idx;
+                    continue;
+                }
+            }
         }
+
+        i += 1;
     }
 
-    result.push_str(&text[cursor..]);
+    result.push_str(&text[cursor_byte..]);
     result
 }
 
@@ -378,6 +411,40 @@ mod tests {
             dict.apply(input),
             "I am using PostgreSQL and wisprflow today"
         );
+    }
+
+    #[test]
+    fn test_utf8_multibyte_dictionary_replacement() {
+        let mut dict = LearningDictionary::new();
+        dict.add_rule("café", "Coffee");
+        dict.add_rule("schloßstraße", "Castle Street");
+        dict.add_rule("über", "above");
+
+        // Test mixed multibyte UTF-8 characters with various non-ASCII punctuation
+        let input = "Wir trinken «Café» über der „Schloßstraße“… Wunderbar!";
+        let output = dict.apply(input);
+        assert_eq!(
+            output,
+            "Wir trinken «Coffee» above der „Castle Street“… Wunderbar!"
+        );
+
+        // Test boundary cases with emoji and non-ASCII characters
+        let mut dict2 = LearningDictionary::new();
+        dict2.add_rule("rust", "🦀 Rust 🦀");
+        let input2 = "Hello 🚀 rust 🚀 world, 日本語 rust!";
+        assert_eq!(
+            dict2.apply(input2),
+            "Hello 🚀 🦀 Rust 🦀 🚀 world, 日本語 🦀 Rust 🦀!"
+        );
+
+        // Test preserve_case with accented multibyte words
+        let preserved = replace_word_boundary_with_case(
+            "Café oder CAFÉ",
+            "café",
+            "coffee",
+            true,
+        );
+        assert_eq!(preserved, "Coffee oder COFFEE");
     }
 
     #[test]

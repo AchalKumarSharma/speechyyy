@@ -63,3 +63,49 @@ fn test_daemon_full_lifecycle_on_temp_paths() {
 
     let _ = fs::remove_dir_all(temp_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn test_simulated_sigterm_cleans_up_socket() {
+    let temp_dir = std::env::temp_dir().join(format!("speechyyy_sigterm_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    let paths = RuntimePaths::with_dir(temp_dir.clone());
+    paths.ensure_dir().expect("ensure dir");
+
+    let server = IpcServer::new(paths.clone());
+    let _listener = server.start_listener().expect("bind listener");
+    let running = server.running_flag();
+
+    assert!(paths.socket_path.exists());
+
+    // Register real termination signals handler from daemon module
+    let signal_handle = speechyyy::daemon::register_termination_signals(std::sync::Arc::clone(&running))
+        .expect("register termination signals");
+
+    // Send SIGTERM to the current thread
+    unsafe {
+        libc::pthread_kill(libc::pthread_self(), libc::SIGTERM);
+    }
+
+    // Wait for the daemon signal thread to process SIGTERM and transition running to false
+    let start = std::time::Instant::now();
+    while running.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        !running.load(Ordering::SeqCst),
+        "Expected running flag to become false after SIGTERM"
+    );
+
+    signal_handle.close();
+
+    // Verify cleanup unlinks socket file
+    paths.cleanup();
+    assert!(
+        !paths.socket_path.exists(),
+        "Socket file must be unlinked after shutdown"
+    );
+
+    let _ = fs::remove_dir_all(temp_dir);
+}

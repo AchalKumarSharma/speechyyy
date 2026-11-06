@@ -13,7 +13,27 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+pub fn register_termination_signals(
+    running: Arc<AtomicBool>,
+) -> Result<signal_hook::iterator::backend::Handle, std::io::Error> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])?;
+
+    let handle = signals.handle();
+    std::thread::spawn(move || {
+        if let Some(sig) = signals.forever().next() {
+            eprintln!("\nReceived termination signal ({}), shutting down daemon...", sig);
+            running.store(false, Ordering::SeqCst);
+        }
+    });
+    Ok(handle)
+}
 
 pub fn run_session_loop<I, J, E>(
     listener: &UnixListener,
@@ -245,6 +265,10 @@ pub fn start_daemon(
             println!("Sarvam Language: {}", config.inference.language_code);
         }
 
+        #[cfg(unix)]
+        let signal_handle = register_termination_signals(Arc::clone(&running))
+            .map_err(|e| format!("Failed to register POSIX signal handlers: {}", e))?;
+
         let _ = run_session_loop(
             &listener,
             &mut input_source,
@@ -254,6 +278,9 @@ pub fn start_daemon(
             &config.hotkey,
             config.pacing_delay_ms,
         );
+
+        #[cfg(unix)]
+        signal_handle.close();
 
         println!("Shutting down Speechyyy...");
         paths.cleanup();

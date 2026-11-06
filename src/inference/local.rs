@@ -18,6 +18,7 @@ pub enum ActiveRecognizer {
 pub struct LocalSpeechInference {
     pub model_type: LocalModelType,
     pub model_dir: PathBuf,
+    model_verified: bool,
     recognizer: Option<ActiveRecognizer>,
 }
 
@@ -31,9 +32,11 @@ impl Default for LocalSpeechInference {
 
 impl LocalSpeechInference {
     pub fn new(model_type: LocalModelType, model_dir: PathBuf) -> Self {
+        let model_verified = ModelManager::verify_model_files(model_type, &model_dir).is_ok();
         Self {
             model_type,
             model_dir,
+            model_verified,
             recognizer: None,
         }
     }
@@ -214,13 +217,16 @@ impl LocalSpeechInference {
 
 impl SpeechInference for LocalSpeechInference {
     fn transcribe(&mut self, chunk: &AudioChunk) -> Result<String, InferenceError> {
-        // Guardrail: Verify model files exist on disk before attempting execution
-        if let Err(err) = ModelManager::verify_model_files(self.model_type, &self.model_dir) {
-            return Err(InferenceError::NotConfigured(format!(
-                "Local model weights missing at {}: {}. Run 'speechyyy model download' to install.",
-                self.model_dir.display(),
-                err
-            )));
+        // Fast-path guardrail: Check verified model weights status from initialization without disk I/O
+        if !self.model_verified {
+            if let Err(err) = ModelManager::verify_model_files(self.model_type, &self.model_dir) {
+                return Err(InferenceError::NotConfigured(format!(
+                    "Local model weights missing at {}: {}. Run 'speechyyy model download' to install.",
+                    self.model_dir.display(),
+                    err
+                )));
+            }
+            self.model_verified = true;
         }
 
         // Check if there is audio to transcribe

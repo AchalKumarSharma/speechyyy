@@ -200,7 +200,40 @@ impl IpcServer {
         if let Some(parent) = self.paths.socket_path.parent() {
             create_secure_dir(parent).map_err(Err)?;
         }
-        let _ = fs::remove_file(&self.paths.socket_path);
+        if self.paths.socket_path.exists() {
+            match IpcClient::send_request(&self.paths.socket_path, &IpcRequest::Ping) {
+                Ok(IpcResponse::Pong) => {
+                    return Err(Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!(
+                            "Active Speechyyy daemon is already listening on {}",
+                            self.paths.socket_path.display()
+                        ),
+                    )));
+                }
+                _ => {
+                    match UnixStream::connect(&self.paths.socket_path) {
+                        Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            eprintln!(
+                                "Detected stale socket at {}, unlinking...",
+                                self.paths.socket_path.display()
+                            );
+                            let _ = fs::remove_file(&self.paths.socket_path);
+                        }
+                        Ok(_) => {
+                            eprintln!(
+                                "Detected non-responsive socket at {}, unlinking...",
+                                self.paths.socket_path.display()
+                            );
+                            let _ = fs::remove_file(&self.paths.socket_path);
+                        }
+                        Err(e) => {
+                            return Err(Err(e));
+                        }
+                    }
+                }
+            }
+        }
         let listener = UnixListener::bind(&self.paths.socket_path).map_err(Err)?;
         #[cfg(unix)]
         {
@@ -383,5 +416,32 @@ mod tests {
 
         paths.cleanup();
         let _ = fs::remove_dir_all(temp_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn test_stale_socket_recovery() {
+        let temp_dir = std::env::temp_dir().join(format!("speechyyy_stale_sock_{}", std::process::id()));
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        paths.ensure_dir().expect("ensure dir");
+
+        // 1. Create a socket listener and immediately drop it without unlinking the file
+        {
+            let server = IpcServer::new(paths.clone());
+            let listener = server.start_listener().expect("bind initial listener");
+            assert!(paths.socket_path.exists());
+            drop(listener);
+        }
+
+        // The socket file still exists on disk, but no process is listening (ECONNREFUSED)
+        assert!(paths.socket_path.exists());
+
+        // 2. A new server should detect the stale socket, unlink it, and bind successfully
+        let server2 = IpcServer::new(paths.clone());
+        let listener2 = server2.start_listener();
+        assert!(listener2.is_ok(), "Expected stale socket to be unlinked and rebound");
+        assert!(paths.socket_path.exists());
+
+        paths.cleanup();
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

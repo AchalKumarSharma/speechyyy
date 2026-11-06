@@ -120,6 +120,17 @@ impl SysEnv for RealSysEnv {
     }
 }
 
+pub fn mask_credential(key: &str) -> String {
+    let char_count = key.chars().count();
+    if char_count > 8 {
+        let prefix: String = key.chars().take(4).collect();
+        let suffix: String = key.chars().skip(char_count.saturating_sub(4)).collect();
+        format!("{}...{}", prefix, suffix)
+    } else {
+        "********".to_string()
+    }
+}
+
 pub fn check_inference_for_config(config: &crate::config::Config) -> Result<String, String> {
     if config.inference.provider != "mock"
         && config.inference.provider != "custom"
@@ -132,11 +143,7 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
     match config.inference.provider.to_lowercase().as_str() {
         "sarvam" => {
             if let Some(key) = config.inference.resolve_api_key() {
-                let masked = if key.len() > 8 {
-                    format!("{}...{}", &key[..4], &key[key.len() - 4..])
-                } else {
-                    "********".to_string()
-                };
+                let masked = mask_credential(&key);
                 Ok(format!("Sarvam API Key: {} (configured)", masked))
             } else {
                 Err(
@@ -813,6 +820,21 @@ mod tests {
         config.inference.provider = "mock".into();
         let mock_res = check_inference_for_config(&config).expect("mock should succeed");
         assert_eq!(mock_res, "Mock provider (mock)");
+    }
+
+    #[test]
+    fn test_doctor_unicode_key_masking() {
+        // Multi-byte Unicode tokens (emojis & accents) must not panic on char boundary slicing
+        let unicode_key = "🦀🔑🔐💎_secret_token_✨🚀🌟🎉";
+        let masked = mask_credential(unicode_key);
+        assert_eq!(masked, "🦀🔑🔐💎...✨🚀🌟🎉");
+
+        let accented_key = "café_münchen_straße";
+        let masked_accented = mask_credential(accented_key);
+        assert_eq!(masked_accented, "café...raße");
+
+        let short_key = "short";
+        assert_eq!(mask_credential(short_key), "********");
     }
 
     #[test]
