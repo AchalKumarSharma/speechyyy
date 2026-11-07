@@ -21,3 +21,4 @@ The daemon runs an unprivileged event loop using `NoopInputSource`, completely b
 
 - **Retaining Kernel evdev + EVIOCGRAB**: Rejected due to host security threat model (blanket `/dev/input/event*` access) and edge-case compositor focus/modifier collisions.
 - **XDG GlobalShortcuts Portal**: Rejected because the portal specification lacks key-release events necessary for push-to-talk semantics.
+
