@@ -58,6 +58,25 @@ impl InputEventSource for FakeInputSource {
     }
 }
 
+/// No-op input source for compositor IPC mode where the daemon does not iterate /dev/input/event*
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopInputSource;
+
+impl InputEventSource for NoopInputSource {
+    fn poll_event(&mut self, timeout: Duration) -> Option<(KeyCode, bool)> {
+        std::thread::sleep(timeout);
+        None
+    }
+
+    fn grab(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn ungrab(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 pub fn is_keyboard_device(device: &Device) -> bool {
     // Exclude our own virtual keyboard
     if let Some(name) = device.name() {

@@ -13,6 +13,9 @@ pub enum IpcRequest {
     Status,
     Stop,
     Ping,
+    PushDown,
+    PushUp,
+    Toggle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +31,8 @@ pub enum IpcResponse {
         pacing_delay_ms: u64,
     },
     Pong,
+    PushDown,
+    PushUp,
     Error {
         message: String,
     },
@@ -249,40 +254,58 @@ impl IpcServer {
         current_state: &str,
         hotkey: &str,
         pacing_delay_ms: u64,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Option<IpcRequest>> {
         stream.set_read_timeout(Some(Duration::from_millis(500)))?;
         stream.set_write_timeout(Some(Duration::from_millis(500)))?;
 
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Ok(());
+            return Ok(None);
         }
 
-        let resp = match serde_json::from_str::<IpcRequest>(line.trim()) {
-            Ok(IpcRequest::Ping) => IpcResponse::Pong,
-            Ok(IpcRequest::Status) => IpcResponse::Status {
-                pid: std::process::id(),
-                state: current_state.to_string(),
-                hotkey: hotkey.to_string(),
-                pacing_delay_ms,
-            },
+        let (resp, action) = match serde_json::from_str::<IpcRequest>(line.trim()) {
+            Ok(IpcRequest::Ping) => (IpcResponse::Pong, None),
+            Ok(IpcRequest::Status) => (
+                IpcResponse::Status {
+                    pid: std::process::id(),
+                    state: current_state.to_string(),
+                    hotkey: hotkey.to_string(),
+                    pacing_delay_ms,
+                },
+                None,
+            ),
             Ok(IpcRequest::Stop) => {
                 running.store(false, Ordering::SeqCst);
-                IpcResponse::Ok {
-                    message: "Speechyyy stopping".into(),
-                }
+                (
+                    IpcResponse::Ok {
+                        message: "Speechyyy stopping".into(),
+                    },
+                    None,
+                )
             }
-            Err(e) => IpcResponse::Error {
-                message: format!("Malformed command: {}", e),
-            },
+            Ok(IpcRequest::PushDown) => (IpcResponse::PushDown, Some(IpcRequest::PushDown)),
+            Ok(IpcRequest::PushUp) => (IpcResponse::PushUp, Some(IpcRequest::PushUp)),
+            Ok(IpcRequest::Toggle) => (
+                IpcResponse::Ok {
+                    message: "Toggling recording state".into(),
+                },
+                Some(IpcRequest::Toggle),
+            ),
+            Err(e) => (
+                IpcResponse::Error {
+                    message: format!("Malformed command: {}", e),
+                },
+                None,
+            ),
         };
 
         let mut out = serde_json::to_string(&resp)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         out.push('\n');
         stream.write_all(out.as_bytes())?;
-        stream.flush()
+        stream.flush()?;
+        Ok(action)
     }
 }
 
@@ -346,6 +369,80 @@ mod tests {
                 assert_eq!(pacing_delay_ms, 3);
             }
             other => panic!("Unexpected response: {:?}", other),
+        }
+
+        paths.cleanup();
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_ipc_push_down_up_and_toggle() {
+        let temp_dir = std::env::temp_dir().join(format!("speechyyy_push_test_{}", std::process::id()));
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        let server = IpcServer::new(paths.clone());
+        let listener = server.start_listener().expect("listener should bind");
+        listener.set_nonblocking(true).unwrap();
+
+        let running = server.running_flag();
+
+        // 1. PushDown request
+        let socket_path = paths.socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            IpcClient::send_request(&socket_path, &IpcRequest::PushDown).expect("push down request")
+        });
+
+        let mut stream = loop {
+            if let Ok((s, _)) = listener.accept() {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let action = IpcServer::handle_connection(&mut stream, &running, "Idle", "RightAlt", 3)
+            .expect("handle connection");
+        assert_eq!(action, Some(IpcRequest::PushDown));
+        let resp = client_thread.join().unwrap();
+        assert_eq!(resp, IpcResponse::PushDown);
+
+        // 2. PushUp request
+        let socket_path = paths.socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            IpcClient::send_request(&socket_path, &IpcRequest::PushUp).expect("push up request")
+        });
+
+        let mut stream = loop {
+            if let Ok((s, _)) = listener.accept() {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let action = IpcServer::handle_connection(&mut stream, &running, "Recording", "RightAlt", 3)
+            .expect("handle connection");
+        assert_eq!(action, Some(IpcRequest::PushUp));
+        let resp = client_thread.join().unwrap();
+        assert_eq!(resp, IpcResponse::PushUp);
+
+        // 3. Toggle request
+        let socket_path = paths.socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            IpcClient::send_request(&socket_path, &IpcRequest::Toggle).expect("toggle request")
+        });
+
+        let mut stream = loop {
+            if let Ok((s, _)) = listener.accept() {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let action = IpcServer::handle_connection(&mut stream, &running, "Idle", "RightAlt", 3)
+            .expect("handle connection");
+        assert_eq!(action, Some(IpcRequest::Toggle));
+        let resp = client_thread.join().unwrap();
+        match resp {
+            IpcResponse::Ok { message } => assert!(message.contains("Toggling")),
+            other => panic!("Unexpected response for toggle: {:?}", other),
         }
 
         paths.cleanup();

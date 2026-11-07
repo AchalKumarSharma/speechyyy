@@ -339,6 +339,40 @@ impl<E: DictationEngine> StateMachineController<E> {
         }
     }
 
+    pub fn start_recording(&mut self) -> Result<(), String> {
+        if self.state == DictationState::Idle {
+            self.state = DictationState::Recording;
+            self.engine.on_press()?;
+        }
+        Ok(())
+    }
+
+    pub fn stop_and_transcribe(&mut self) -> Result<Option<String>, String> {
+        if self.state == DictationState::Recording {
+            self.state = DictationState::Processing;
+            let text_opt = self.engine.on_release()?;
+            if text_opt.is_some() {
+                self.state = DictationState::Emitting;
+            } else {
+                self.state = DictationState::Idle;
+            }
+            Ok(text_opt)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn toggle(&mut self) -> Result<Option<String>, String> {
+        match self.state {
+            DictationState::Idle => {
+                self.start_recording()?;
+                Ok(None)
+            }
+            DictationState::Recording => self.stop_and_transcribe(),
+            _ => Ok(None),
+        }
+    }
+
     pub fn handle_key_event(
         &mut self,
         key: KeyCode,
@@ -346,26 +380,10 @@ impl<E: DictationEngine> StateMachineController<E> {
     ) -> Result<Option<String>, String> {
         match self.tracker.handle_key(key, is_down) {
             ChordEvent::Press => {
-                if self.state == DictationState::Idle {
-                    self.state = DictationState::Recording;
-                    self.engine.on_press()?;
-                }
+                self.start_recording()?;
                 Ok(None)
             }
-            ChordEvent::Release => {
-                if self.state == DictationState::Recording {
-                    self.state = DictationState::Processing;
-                    let text_opt = self.engine.on_release()?;
-                    if text_opt.is_some() {
-                        self.state = DictationState::Emitting;
-                    } else {
-                        self.state = DictationState::Idle;
-                    }
-                    Ok(text_opt)
-                } else {
-                    Ok(None)
-                }
-            }
+            ChordEvent::Release => self.stop_and_transcribe(),
             ChordEvent::None => Ok(None),
         }
     }
@@ -482,6 +500,37 @@ mod tests {
         assert_eq!(res, Some("Hello from Speechyyy".to_string()));
         assert_eq!(controller.state, DictationState::Emitting);
 
+        controller.finish_emission();
+        assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_controller_direct_recording_and_toggle() {
+        let engine = MockDictationEngine::with_payload("Direct IPC Payload");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        assert_eq!(controller.state, DictationState::Idle);
+
+        // 1. Direct start_recording
+        controller.start_recording().unwrap();
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // 2. Direct stop_and_transcribe
+        let text = controller.stop_and_transcribe().unwrap();
+        assert_eq!(text, Some("Direct IPC Payload".to_string()));
+        assert_eq!(controller.state, DictationState::Emitting);
+        controller.finish_emission();
+        assert_eq!(controller.state, DictationState::Idle);
+
+        // 3. Toggle from Idle -> Recording
+        let toggle_res1 = controller.toggle().unwrap();
+        assert_eq!(toggle_res1, None);
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // 4. Toggle from Recording -> Processing/Emitting
+        let toggle_res2 = controller.toggle().unwrap();
+        assert_eq!(toggle_res2, Some("Direct IPC Payload".to_string()));
+        assert_eq!(controller.state, DictationState::Emitting);
         controller.finish_emission();
         assert_eq!(controller.state, DictationState::Idle);
     }

@@ -36,6 +36,14 @@ pub enum Command {
     Stop,
     /// Inspect Speechyyy status
     Status,
+    /// Trigger push-to-talk press (start recording via compositor IPC)
+    #[command(name = "push-down", alias = "down")]
+    PushDown,
+    /// Trigger push-to-talk release (stop recording & transcribe via compositor IPC)
+    #[command(name = "push-up", alias = "up")]
+    PushUp,
+    /// Toggle push-to-talk recording state
+    Toggle,
     /// Inspect system permissions, audio inputs, and model weights
     Doctor,
     /// List available speech recognition models (alias: model)
@@ -189,6 +197,27 @@ mod tests {
     fn test_parse_status() {
         let cli = Cli::try_parse_from(["speechyyy", "status"]).expect("parse status");
         assert_eq!(cli.command, Command::Status);
+    }
+
+    #[test]
+    fn test_parse_push_down_and_up() {
+        let cli_down = Cli::try_parse_from(["speechyyy", "push-down"]).expect("parse push-down");
+        assert_eq!(cli_down.command, Command::PushDown);
+
+        let cli_alias_down = Cli::try_parse_from(["speechyyy", "down"]).expect("parse down alias");
+        assert_eq!(cli_alias_down.command, Command::PushDown);
+
+        let cli_up = Cli::try_parse_from(["speechyyy", "push-up"]).expect("parse push-up");
+        assert_eq!(cli_up.command, Command::PushUp);
+
+        let cli_alias_up = Cli::try_parse_from(["speechyyy", "up"]).expect("parse up alias");
+        assert_eq!(cli_alias_up.command, Command::PushUp);
+    }
+
+    #[test]
+    fn test_parse_toggle() {
+        let cli_toggle = Cli::try_parse_from(["speechyyy", "toggle"]).expect("parse toggle");
+        assert_eq!(cli_toggle.command, Command::Toggle);
     }
 
     #[test]

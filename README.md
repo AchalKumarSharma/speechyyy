@@ -96,7 +96,29 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | `speechyyy learn <HEARD> <TYPED>` | Add a phonetic replacement rule to `dictionary.toml` |
 | `speechyyy fix <EXPECTED>` | Fix the last transcription and store correction rule |
 | `speechyyy unlearn [KEY]` | Remove a replacement rule from `dictionary.toml` |
+| `speechyyy push-down` | IPC trigger: start recording (bind to compositor hotkey press) |
+| `speechyyy push-up` | IPC trigger: stop recording & transcribe (bind to compositor hotkey release) |
+| `speechyyy toggle` | IPC trigger: toggle recording state |
 | `speechyyy history` | Inspect recent dictation utterances |
+
+### Compositor Keybindings
+
+Because Speechyyy runs fully unprivileged without accessing raw `/dev/input/event*` devices, bind your push-to-talk key in your window manager or compositor:
+
+**Hyprland** (`~/.config/hypr/hyprland.conf`):
+```ini
+bind = , rightalt, exec, speechyyy push-down
+bindr = , rightalt, exec, speechyyy push-up
+```
+
+**Sway / i3** (`~/.config/sway/config`):
+```ini
+bindsym Mod3 exec speechyyy push-down
+bindsym --release Mod3 exec speechyyy push-up
+```
+
+**GNOME / KDE / Custom Shortcut Managers**:
+Bind any global shortcut to `speechyyy toggle` to start/stop dictation with a single keypress.
 
 ## Configuration & Personality
 

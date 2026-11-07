@@ -1,6 +1,9 @@
 use clap::Parser;
 use speechyyy::cli::{Cli, Command, ModelCommands};
-use speechyyy::daemon::{check_status, handle_uninstall_command, start_daemon, stop_daemon};
+use speechyyy::daemon::{
+    check_status, handle_uninstall_command, send_push_down, send_push_up, send_toggle,
+    start_daemon, stop_daemon,
+};
 use speechyyy::doctor::{print_doctor_report, run_doctor, RealSysEnv};
 use speechyyy::history::{handle_fix_command_opts, handle_history_command};
 use speechyyy::ipc::RuntimePaths;
@@ -72,6 +75,9 @@ fn main() {
         ),
         Command::Stop => stop_daemon(&paths),
         Command::Status => check_status(&paths),
+        Command::PushDown => send_push_down(&paths),
+        Command::PushUp => send_push_up(&paths),
+        Command::Toggle => send_toggle(&paths),
         Command::Update { force } => speechyyy::update::handle_update_command(force),
     };
 
