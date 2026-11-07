@@ -2,6 +2,13 @@ use crate::dock::state::{DockModel, PILL_HEIGHT};
 use crate::events::DictationState;
 use tiny_skia::{FillRule, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
 
+/// Neon Synth / Dark Glass design tokens
+pub const COLOR_BORDER_NEON_PINK: (u8, u8, u8) = (0xf7, 0x07, 0x76); // #f70776
+pub const COLOR_CONTENT_MAGENTA: (u8, u8, u8) = (0xc3, 0x19, 0x5d);   // #c3195d
+pub const COLOR_STANDBY_PLUM: (u8, u8, u8) = (0x68, 0x07, 0x47);      // #680747
+pub const COLOR_BG_GLASS_RGB: (u8, u8, u8) = (18, 18, 20);            // rgba(18, 18, 20, 0.85)
+pub const BG_GLASS_BASE_ALPHA: f32 = 0.85;
+
 pub struct DockRenderer {
     pub width: u32,
     pub height: u32,
@@ -116,12 +123,13 @@ impl DockRenderer {
                     );
                 }
                 _ => {
-                    // Apple Dark Neutral Liquid Glass: rgba(28, 28, 30, 0.78)
+                    // Deep dark glassmorphism: rgba(18, 18, 20, 0.85)
+                    let alpha = (BG_GLASS_BASE_ALPHA * 255.0 * opacity).clamp(0.0, 255.0) as u8;
                     bg_paint.set_color_rgba8(
-                        28,
-                        28,
-                        30,
-                        (199.0 * opacity) as u8,
+                        COLOR_BG_GLASS_RGB.0,
+                        COLOR_BG_GLASS_RGB.1,
+                        COLOR_BG_GLASS_RGB.2,
+                        alpha,
                     );
                 }
             }
@@ -134,43 +142,54 @@ impl DockRenderer {
                 None,
             );
 
-            // 3. Hairline Border Stroke
+            // 3. Perimeter Border Stroke (#f70776, 1.5px stroke, rounded capsule geometry)
             let mut stroke_paint = Paint {
                 anti_alias: true,
                 ..Default::default()
             };
-            let mut stroke = Stroke {
-                width: 1.0,
+            let stroke = Stroke {
+                width: 1.5,
                 ..Default::default()
             };
 
             match model.state {
+                DictationState::Recording => {
+                    // Modulate border opacity slightly with incoming RMS (0.6 resting up to 1.0 on peak voice)
+                    let rms_norm = model.current_rms.clamp(0.0, 1.0);
+                    let border_opacity_factor = 0.6 + 0.4 * rms_norm;
+                    let border_alpha =
+                        (border_opacity_factor * 255.0 * opacity).clamp(0.0, 255.0) as u8;
+                    stroke_paint.set_color_rgba8(
+                        COLOR_BORDER_NEON_PINK.0,
+                        COLOR_BORDER_NEON_PINK.1,
+                        COLOR_BORDER_NEON_PINK.2,
+                        border_alpha,
+                    );
+                }
+                DictationState::Processing | DictationState::Idle => {
+                    let border_alpha = (255.0 * opacity).clamp(0.0, 255.0) as u8;
+                    stroke_paint.set_color_rgba8(
+                        COLOR_BORDER_NEON_PINK.0,
+                        COLOR_BORDER_NEON_PINK.1,
+                        COLOR_BORDER_NEON_PINK.2,
+                        border_alpha,
+                    );
+                }
+                DictationState::Emitting => {
+                    stroke_paint.set_color_rgba8(
+                        COLOR_BORDER_NEON_PINK.0,
+                        COLOR_BORDER_NEON_PINK.1,
+                        COLOR_BORDER_NEON_PINK.2,
+                        (220.0 * opacity) as u8,
+                    );
+                }
                 DictationState::Error => {
-                    // #FF453A
+                    // #FF453A error alert stroke
                     stroke_paint.set_color_rgba8(
                         255,
                         69,
                         58,
                         (230.0 * opacity) as u8,
-                    );
-                }
-                DictationState::Emitting => {
-                    // #30D158
-                    stroke_paint.set_color_rgba8(
-                        48,
-                        209,
-                        88,
-                        (220.0 * opacity) as u8,
-                    );
-                    stroke.width = 1.25;
-                }
-                _ => {
-                    // 1px rgba(255, 255, 255, 0.12)
-                    stroke_paint.set_color_rgba8(
-                        255,
-                        255,
-                        255,
-                        (31.0 * opacity) as u8,
                     );
                 }
             }
@@ -192,13 +211,15 @@ impl DockRenderer {
             DictationState::Processing => {
                 self.render_processing_dots(&mut pixmap, model, center_x, center_y, opacity);
             }
+            DictationState::Idle => {
+                self.render_standby_dot(&mut pixmap, center_x, center_y, opacity);
+            }
             DictationState::Emitting => {
                 self.render_emitting_indicator(&mut pixmap, center_x, center_y, opacity);
             }
             DictationState::Error => {
                 self.render_error_text(&mut pixmap, model, center_x, center_y, opacity);
             }
-            DictationState::Idle => {}
         }
 
         // 5. Wayland SHM Format Translation (RGBA -> ARGB8888 on little-endian)
@@ -221,25 +242,22 @@ impl DockRenderer {
         let start_x = center_x - total_w / 2.0;
 
         for i in 0..9 {
-            let bar_h = model.bar_springs[i].value.clamp(4.0, 22.0);
+            let bar_h = model.bar_springs[i].value.clamp(4.0, 26.0);
             let bar_center_x = start_x + (i as f32 * 7.0) + 1.5;
             let bar_x = bar_center_x - 1.5;
             let bar_y = center_y - bar_h / 2.0;
 
             if let Some(bar_path) = Self::rounded_rect_path(bar_x, bar_y, 3.0, bar_h, 1.5) {
-                // Color interpolation: #F5F5F7 -> #8E8CF8 peak tint
-                let dist_from_center = ((i as f32 - 4.0).abs() / 4.0).clamp(0.0, 1.0);
-                let center_weight = 1.0 - dist_from_center;
-
-                let r = (245.0 - 103.0 * 0.65 * center_weight) as u8;
-                let g = (245.0 - 105.0 * 0.65 * center_weight) as u8;
-                let b = (247.0 + 1.0 * center_weight) as u8;
-
                 let mut bar_paint = Paint {
                     anti_alias: true,
                     ..Default::default()
                 };
-                bar_paint.set_color_rgba8(r, g, b, (250.0 * opacity) as u8);
+                bar_paint.set_color_rgba8(
+                    COLOR_CONTENT_MAGENTA.0,
+                    COLOR_CONTENT_MAGENTA.1,
+                    COLOR_CONTENT_MAGENTA.2,
+                    (255.0 * opacity) as u8,
+                );
 
                 pixmap.fill_path(
                     &bar_path,
@@ -260,7 +278,7 @@ impl DockRenderer {
         center_y: f32,
         opacity: f32,
     ) {
-        // 3 pulsing dots spaced 12px apart
+        // 3 pulsing dots spaced 12px apart in #c3195d with phase-shifted sinusoidal breathing
         for j in 0..3 {
             let dot_x = center_x + (j as f32 - 1.0) * 12.0;
             let dot_y = center_y;
@@ -275,7 +293,12 @@ impl DockRenderer {
                     anti_alias: true,
                     ..Default::default()
                 };
-                paint.set_color_rgba8(245, 245, 247, dot_alpha);
+                paint.set_color_rgba8(
+                    COLOR_CONTENT_MAGENTA.0,
+                    COLOR_CONTENT_MAGENTA.1,
+                    COLOR_CONTENT_MAGENTA.2,
+                    dot_alpha,
+                );
                 pixmap.fill_path(
                     &dot_path,
                     &paint,
@@ -284,6 +307,37 @@ impl DockRenderer {
                     None,
                 );
             }
+        }
+    }
+
+    fn render_standby_dot(
+        &self,
+        pixmap: &mut PixmapMut,
+        center_x: f32,
+        center_y: f32,
+        opacity: f32,
+    ) {
+        // Single status dot at exact center in #680747 (radius: 2px)
+        if let Some(dot_path) =
+            Self::rounded_rect_path(center_x - 2.0, center_y - 2.0, 4.0, 4.0, 2.0)
+        {
+            let mut paint = Paint {
+                anti_alias: true,
+                ..Default::default()
+            };
+            paint.set_color_rgba8(
+                COLOR_STANDBY_PLUM.0,
+                COLOR_STANDBY_PLUM.1,
+                COLOR_STANDBY_PLUM.2,
+                (255.0 * opacity) as u8,
+            );
+            pixmap.fill_path(
+                &dot_path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
     }
 
@@ -426,17 +480,31 @@ mod tests {
         let mut model = DockModel::new();
         let mut canvas = vec![0u8; 280 * 48 * 4];
 
-        // Idle state: renders transparent buffer
+        // Zero opacity renders transparent buffer
+        model.opacity_spring.value = 0.0;
         renderer.render(&model, &mut canvas);
         assert!(canvas.iter().all(|&b| b == 0));
 
-        // Recording state with expanded pill
+        // Ready / Standby state: renders compact 110px capsule with #680747 center dot
+        model.opacity_spring.value = 1.0;
+        model.width_spring.value = 110.0;
+        renderer.render(&model, &mut canvas);
+        assert!(canvas.iter().any(|&b| b != 0));
+
+        // Active Listening state: renders 180px capsule with 9 waveform bars and #f70776 border
         model.transition_to(DictationState::Recording);
         model.width_spring.value = 180.0;
         model.opacity_spring.value = 1.0;
-        renderer.render(&model, &mut canvas);
+        model.current_rms = 0.5;
+        let mut rec_canvas = vec![0u8; 280 * 48 * 4];
+        renderer.render(&model, &mut rec_canvas);
+        assert!(rec_canvas.iter().any(|&b| b != 0));
 
-        // Non-empty pixels rendered
-        assert!(canvas.iter().any(|&b| b != 0));
+        // Processing state: renders 140px capsule with 3 pulse dots
+        model.transition_to(DictationState::Processing);
+        model.width_spring.value = 140.0;
+        let mut proc_canvas = vec![0u8; 280 * 48 * 4];
+        renderer.render(&model, &mut proc_canvas);
+        assert!(proc_canvas.iter().any(|&b| b != 0));
     }
 }
