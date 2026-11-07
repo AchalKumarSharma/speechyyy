@@ -20,6 +20,17 @@ flate2 = "1.0"
 bzip2 = "0.4"
 indicatif = "0.17"
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+smithay-client-toolkit = "0.21"
+tiny-skia = "0.12"
+fontdue = "0.9"
+
+[[bin]]
+name = "speechyyy"
+path = "src/main.rs"
+
+[[bin]]
+name = "speechyyy-dock"
+path = "src/bin/speechyyy-dock.rs"
 
 [profile.release]
 opt-level = 3

@@ -2,6 +2,7 @@ pub mod audio;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod dock;
 pub mod doctor;
 pub mod engine;
 pub mod events;
