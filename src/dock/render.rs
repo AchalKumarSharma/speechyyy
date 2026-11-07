@@ -1,9 +1,10 @@
-use crate::dock::state::{DockModel, PILL_HEIGHT};
+use crate::dock::state::{DockModel, HIDE_OPACITY_EPSILON, HIDE_WIDTH_EPSILON, PILL_HEIGHT};
 use crate::events::DictationState;
 use tiny_skia::{FillRule, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
 
 /// Neon Synth / Dark Glass design tokens
-pub const COLOR_BORDER_NEON_PINK: (u8, u8, u8) = (0xf7, 0x07, 0x76); // #f70776
+pub const COLOR_BORDER_NEON: (u8, u8, u8) = (0xf7, 0x07, 0x76); // #f70776
+pub const COLOR_BORDER_NEON_PINK: (u8, u8, u8) = COLOR_BORDER_NEON;
 pub const COLOR_CONTENT_MAGENTA: (u8, u8, u8) = (0xc3, 0x19, 0x5d);   // #c3195d
 pub const COLOR_STANDBY_PLUM: (u8, u8, u8) = (0x68, 0x07, 0x47);      // #680747
 pub const COLOR_BG_GLASS_RGB: (u8, u8, u8) = (18, 18, 20);            // rgba(18, 18, 20, 0.85)
@@ -48,10 +49,14 @@ impl DockRenderer {
         // Zero-fill / clear canvas
         canvas.fill(0);
 
-        let pill_width = model.width_spring.value;
-        let opacity = model.opacity_spring.value.clamp(0.0, 1.0);
+        if model.is_settled_hidden() {
+            return;
+        }
 
-        if pill_width < 4.0 || opacity <= 0.005 {
+        let pill_width = model.current_width;
+        let opacity = model.current_opacity.clamp(0.0, 1.0);
+
+        if pill_width < HIDE_WIDTH_EPSILON || opacity <= HIDE_OPACITY_EPSILON {
             return;
         }
 
@@ -64,15 +69,16 @@ impl DockRenderer {
         let center_x = self.width as f32 / 2.0;
         let center_y = self.height as f32 / 2.0;
 
-        let pill_x = center_x - pill_width / 2.0;
+        let safe_width = pill_width.max(1.0);
+        let pill_x = center_x - safe_width / 2.0;
         let pill_y = center_y - PILL_HEIGHT / 2.0;
-        let corner_radius = (PILL_HEIGHT / 2.0).min(pill_width / 2.0);
+        let corner_radius = (PILL_HEIGHT / 2.0).min(safe_width / 2.0);
 
         // 1. Ambient Drop Shadow (subtle elevation behind pill)
         if let Some(shadow_path) = Self::rounded_rect_path(
             pill_x - 1.5,
             pill_y + 2.0,
-            pill_width + 3.0,
+            safe_width + 3.0,
             PILL_HEIGHT + 2.0,
             corner_radius + 1.0,
         ) {
@@ -94,7 +100,7 @@ impl DockRenderer {
         if let Some(pill_path) = Self::rounded_rect_path(
             pill_x,
             pill_y,
-            pill_width,
+            safe_width,
             PILL_HEIGHT,
             corner_radius,
         ) {
@@ -111,15 +117,6 @@ impl DockRenderer {
                         69,
                         58,
                         (56.0 * opacity) as u8,
-                    );
-                }
-                DictationState::Emitting => {
-                    // Apple Mint glass tint: rgba(28, 48, 34, 0.88)
-                    bg_paint.set_color_rgba8(
-                        28,
-                        48,
-                        34,
-                        (224.0 * opacity) as u8,
                     );
                 }
                 _ => {
@@ -160,27 +157,10 @@ impl DockRenderer {
                     let border_alpha =
                         (border_opacity_factor * 255.0 * opacity).clamp(0.0, 255.0) as u8;
                     stroke_paint.set_color_rgba8(
-                        COLOR_BORDER_NEON_PINK.0,
-                        COLOR_BORDER_NEON_PINK.1,
-                        COLOR_BORDER_NEON_PINK.2,
+                        COLOR_BORDER_NEON.0,
+                        COLOR_BORDER_NEON.1,
+                        COLOR_BORDER_NEON.2,
                         border_alpha,
-                    );
-                }
-                DictationState::Processing | DictationState::Idle => {
-                    let border_alpha = (255.0 * opacity).clamp(0.0, 255.0) as u8;
-                    stroke_paint.set_color_rgba8(
-                        COLOR_BORDER_NEON_PINK.0,
-                        COLOR_BORDER_NEON_PINK.1,
-                        COLOR_BORDER_NEON_PINK.2,
-                        border_alpha,
-                    );
-                }
-                DictationState::Emitting => {
-                    stroke_paint.set_color_rgba8(
-                        COLOR_BORDER_NEON_PINK.0,
-                        COLOR_BORDER_NEON_PINK.1,
-                        COLOR_BORDER_NEON_PINK.2,
-                        (220.0 * opacity) as u8,
                     );
                 }
                 DictationState::Error => {
@@ -190,6 +170,15 @@ impl DockRenderer {
                         69,
                         58,
                         (230.0 * opacity) as u8,
+                    );
+                }
+                _ => {
+                    let border_alpha = (255.0 * opacity).clamp(0.0, 255.0) as u8;
+                    stroke_paint.set_color_rgba8(
+                        COLOR_BORDER_NEON.0,
+                        COLOR_BORDER_NEON.1,
+                        COLOR_BORDER_NEON.2,
+                        border_alpha,
                     );
                 }
             }
@@ -211,14 +200,11 @@ impl DockRenderer {
             DictationState::Processing => {
                 self.render_processing_dots(&mut pixmap, model, center_x, center_y, opacity);
             }
-            DictationState::Idle => {
-                self.render_standby_dot(&mut pixmap, center_x, center_y, opacity);
-            }
-            DictationState::Emitting => {
-                self.render_emitting_indicator(&mut pixmap, center_x, center_y, opacity);
-            }
             DictationState::Error => {
                 self.render_error_text(&mut pixmap, model, center_x, center_y, opacity);
+            }
+            DictationState::Idle | DictationState::Emitting => {
+                // Auto-hidden: no interior elements
             }
         }
 
@@ -310,63 +296,6 @@ impl DockRenderer {
         }
     }
 
-    fn render_standby_dot(
-        &self,
-        pixmap: &mut PixmapMut,
-        center_x: f32,
-        center_y: f32,
-        opacity: f32,
-    ) {
-        // Single status dot at exact center in #680747 (radius: 2px)
-        if let Some(dot_path) =
-            Self::rounded_rect_path(center_x - 2.0, center_y - 2.0, 4.0, 4.0, 2.0)
-        {
-            let mut paint = Paint {
-                anti_alias: true,
-                ..Default::default()
-            };
-            paint.set_color_rgba8(
-                COLOR_STANDBY_PLUM.0,
-                COLOR_STANDBY_PLUM.1,
-                COLOR_STANDBY_PLUM.2,
-                (255.0 * opacity) as u8,
-            );
-            pixmap.fill_path(
-                &dot_path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
-    }
-
-    fn render_emitting_indicator(
-        &self,
-        pixmap: &mut PixmapMut,
-        center_x: f32,
-        center_y: f32,
-        opacity: f32,
-    ) {
-        // Apple Mint #30D158 checkmark / glowing center circle
-        if let Some(dot_path) =
-            Self::rounded_rect_path(center_x - 4.0, center_y - 4.0, 8.0, 8.0, 4.0)
-        {
-            let mut paint = Paint {
-                anti_alias: true,
-                ..Default::default()
-            };
-            paint.set_color_rgba8(48, 209, 88, (240.0 * opacity) as u8);
-            pixmap.fill_path(
-                &dot_path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
-    }
-
     fn render_error_text(
         &self,
         pixmap: &mut PixmapMut,
@@ -453,6 +382,8 @@ impl DockRenderer {
     }
 
     pub fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
+        let w = w.max(1.0);
+        let h = h.max(1.0);
         let r = r.min(w / 2.0).min(h / 2.0);
         let c = 0.552_284_8 * r;
         let mut pb = PathBuilder::new();
@@ -480,21 +411,16 @@ mod tests {
         let mut model = DockModel::new();
         let mut canvas = vec![0u8; 280 * 48 * 4];
 
-        // Zero opacity renders transparent buffer
-        model.opacity_spring.value = 0.0;
+        // Idle state: settled hidden, renders completely transparent buffer
         renderer.render(&model, &mut canvas);
         assert!(canvas.iter().all(|&b| b == 0));
-
-        // Ready / Standby state: renders compact 110px capsule with #680747 center dot
-        model.opacity_spring.value = 1.0;
-        model.width_spring.value = 110.0;
-        renderer.render(&model, &mut canvas);
-        assert!(canvas.iter().any(|&b| b != 0));
 
         // Active Listening state: renders 180px capsule with 9 waveform bars and #f70776 border
         model.transition_to(DictationState::Recording);
         model.width_spring.value = 180.0;
+        model.current_width = 180.0;
         model.opacity_spring.value = 1.0;
+        model.current_opacity = 1.0;
         model.current_rms = 0.5;
         let mut rec_canvas = vec![0u8; 280 * 48 * 4];
         renderer.render(&model, &mut rec_canvas);
@@ -503,8 +429,20 @@ mod tests {
         // Processing state: renders 140px capsule with 3 pulse dots
         model.transition_to(DictationState::Processing);
         model.width_spring.value = 140.0;
+        model.current_width = 140.0;
         let mut proc_canvas = vec![0u8; 280 * 48 * 4];
         renderer.render(&model, &mut proc_canvas);
         assert!(proc_canvas.iter().any(|&b| b != 0));
+
+        // Emitting state: transitions towards hidden; once settled, renders transparent
+        model.transition_to(DictationState::Emitting);
+        for _ in 0..120 {
+            model.tick(1.0 / 60.0);
+            model.settle();
+        }
+        assert!(model.is_settled_hidden());
+        let mut emit_canvas = vec![0u8; 280 * 48 * 4];
+        renderer.render(&model, &mut emit_canvas);
+        assert!(emit_canvas.iter().all(|&b| b == 0));
     }
 }

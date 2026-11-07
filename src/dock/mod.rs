@@ -4,5 +4,5 @@ pub mod state;
 
 pub use physics::{calculate_bar_targets, Spring, WaveformSprings};
 pub use render::DockRenderer;
-pub use state::DockModel;
+pub use state::{DockModel, HIDE_OPACITY_EPSILON, HIDE_WIDTH_EPSILON};
 

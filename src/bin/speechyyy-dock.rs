@@ -75,6 +75,7 @@ impl CompositorHandler for DockApp {
         self.last_frame_time = now;
 
         self.model.tick(dt);
+        self.model.settle();
         self.draw(qh);
     }
 
@@ -155,6 +156,14 @@ impl ShmHandler for DockApp {
 
 impl DockApp {
     pub fn draw(&mut self, qh: &QueueHandle<Self>) {
+        if self.model.is_settled_hidden() {
+            // Unmap surface when fully settled into the hidden state
+            self.layer.wl_surface().attach(None, 0, 0);
+            self.layer.wl_surface().commit();
+            self.frame_pending = false;
+            return;
+        }
+
         let (buffer, canvas) = match self.pool.create_buffer(
             DOCK_WIDTH as i32,
             DOCK_HEIGHT as i32,
