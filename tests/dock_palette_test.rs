@@ -59,3 +59,4 @@ fn no_green_in_palette() {
         rgb_needle
     );
 }
+

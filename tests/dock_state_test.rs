@@ -73,3 +73,4 @@ fn error_keeps_auto_dismiss() {
     model.transition_to(DictationState::Error);
     assert!(model.error_started_at.is_some());
 }
+
