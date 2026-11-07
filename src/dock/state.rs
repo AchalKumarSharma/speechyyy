@@ -133,6 +133,7 @@ impl DockModel {
     }
 
     pub fn tick(&mut self, dt: f32) {
+        let dt = dt.clamp(0.0, 0.05);
         self.elapsed_time += dt;
         self.width_spring.update(dt);
         self.opacity_spring.update(dt);
@@ -290,6 +291,29 @@ mod tests {
 
         assert_eq!(model.state, DictationState::Idle);
         assert_eq!(model.target_width, 0.0);
+    }
+
+    #[test]
+    fn test_tick_large_dt_is_clamped_and_prevents_instant_overshoot() {
+        let mut model = DockModel::new();
+        model.transition_to(DictationState::Recording);
+        assert_eq!(model.target_width, ACTIVE_PILL_WIDTH);
+        assert_eq!(model.current_width, 0.0);
+
+        // Simulate a huge delta time spike after sitting idle (e.g. 60 seconds)
+        model.tick(60.0);
+        model.settle();
+
+        // The timestep must be clamped to 50ms, so width should only have advanced a 50ms step (117px),
+        // definitely NOT jumping to millions or overshooting/settling hidden.
+        assert!(model.current_width > 0.0);
+        assert!(
+            model.current_width <= 120.0,
+            "current_width was {}",
+            model.current_width
+        );
+        assert!(model.is_animating());
+        assert!(!model.is_settled_hidden());
     }
 }
 

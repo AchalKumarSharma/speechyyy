@@ -27,7 +27,7 @@ impl Spring {
     }
 
     pub fn update(&mut self, dt: f32) {
-        let dt = dt.clamp(0.001, 0.05);
+        let dt = dt.clamp(0.0, 0.05);
         let diff = self.value - self.target;
         let c = 2.0 * self.damping * self.stiffness.sqrt();
         let acceleration = -self.stiffness * diff - c * self.velocity;
@@ -142,6 +142,21 @@ mod tests {
 
         assert!(spring.is_settled(0.5));
         assert!((spring.value - 180.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_spring_clamps_large_dt() {
+        let mut spring = Spring::new(0.0, 300.0, 0.75);
+        spring.set_target(180.0);
+
+        // Huge spike: 100.0 seconds
+        spring.update(100.0);
+
+        // With dt clamped to 0.05, velocity and value advance by exactly one 50ms step (135.0),
+        // rather than exploding to 540,000,000.
+        assert!(spring.value > 0.0);
+        assert!(spring.value <= 135.0 + 1e-4, "spring value was {}", spring.value);
+        assert!(!spring.is_settled(0.5));
     }
 
     #[test]

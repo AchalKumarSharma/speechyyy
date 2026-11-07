@@ -18,7 +18,7 @@ use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry};
 use speechyyy::dock::{DockModel, DockRenderer};
-use speechyyy::events::DaemonEvent;
+use speechyyy::events::{DaemonEvent, DictationState};
 use speechyyy::ipc::RuntimePaths;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
@@ -71,8 +71,9 @@ impl CompositorHandler for DockApp {
     ) {
         self.frame_pending = false;
         let now = Instant::now();
-        let dt = now.duration_since(self.last_frame_time).as_secs_f32();
+        let raw_dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
+        let dt = raw_dt.clamp(0.0, 0.05);
 
         self.model.tick(dt);
         self.model.settle();
@@ -143,6 +144,7 @@ impl LayerShellHandler for DockApp {
     ) {
         if self.first_configure {
             self.first_configure = false;
+            self.last_frame_time = Instant::now();
             self.draw(qh);
         }
     }
@@ -320,7 +322,21 @@ fn main() {
 
     if let Err(e) = handle.insert_source(channel, move |event, _, app: &mut DockApp| {
         if let channel::Event::Msg(daemon_event) = event {
+            let was_settled_hidden = app.model.is_settled_hidden();
+            let is_recording_event = matches!(
+                daemon_event,
+                DaemonEvent::StateChanged {
+                    state: DictationState::Recording,
+                    ..
+                }
+            );
+
             app.model.handle_event(daemon_event);
+
+            // Reset frame timer on wakeup to prevent multi-second delta-time spikes after idle
+            if is_recording_event || (was_settled_hidden && !app.model.is_settled_hidden()) {
+                app.last_frame_time = Instant::now();
+            }
 
             // If dock has started animating and no frame is currently pending, trigger draw immediately
             if app.model.is_animating() && !app.frame_pending {
