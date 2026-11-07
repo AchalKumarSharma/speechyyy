@@ -3,13 +3,15 @@ use crate::audio::vad::EnergyVad;
 use crate::config::Config;
 use crate::doctor::{run_doctor, RealSysEnv};
 use crate::engine::{AudioDictationEngine, DictationEngine, StateMachineController};
+use crate::events::{DaemonEvent, DictationState, EventBroadcaster};
 use crate::history::HistoryLogger;
 use crate::inference::create_inference_provider;
 use crate::injector::{create_injector, TextInjector};
 use crate::input::{InputEventSource, NoopInputSource};
 use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, PidFile, RuntimePaths};
 use crate::text::{LearningDictionary, TextFormatter, TextPipeline};
-use std::os::unix::net::UnixListener;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +51,52 @@ where
     J: TextInjector,
     E: DictationEngine,
 {
+    run_session_loop_with_broadcaster(
+        listener,
+        input_source,
+        injector,
+        controller,
+        running,
+        hotkey,
+        pacing_delay_ms,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_session_loop_with_broadcaster<I, J, E>(
+    listener: &UnixListener,
+    input_source: &mut I,
+    injector: &mut J,
+    controller: &mut StateMachineController<E>,
+    running: &AtomicBool,
+    hotkey: &str,
+    pacing_delay_ms: u64,
+    broadcaster: Option<&EventBroadcaster>,
+) -> Result<(), String>
+where
+    I: InputEventSource,
+    J: TextInjector,
+    E: DictationEngine,
+{
+    let mut last_rms_tick = Instant::now();
+
     while running.load(Ordering::SeqCst) {
+        // Broadcast audio level tick if recording
+        if let Some(b) = broadcaster {
+            b.accept_subscribers();
+            if controller.state == DictationState::Recording
+                && last_rms_tick.elapsed() >= Duration::from_millis(25)
+            {
+                last_rms_tick = Instant::now();
+                if let Some(active_rms) = controller.active_rms() {
+                    let bits = active_rms.load(Ordering::Relaxed);
+                    let rms = f32::from_bits(bits);
+                    b.broadcast(DaemonEvent::audio_level(rms, rms * 1.5));
+                }
+            }
+        }
+
         // 1. Process IPC socket connections
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -62,35 +109,148 @@ where
                     pacing_delay_ms,
                 ) {
                     Ok(Some(IpcRequest::PushDown)) => {
+                        let prev = controller.state;
                         if let Err(e) = controller.start_recording() {
                             eprintln!("Failed to start recording on PushDown: {}", e);
+                        } else if controller.state == DictationState::Recording && prev != DictationState::Recording {
+                            if let Some(b) = broadcaster {
+                                b.broadcast(DaemonEvent::StateChanged {
+                                    state: DictationState::Recording,
+                                    previous: Some(prev),
+                                });
+                            }
                         }
                     }
                     Ok(Some(IpcRequest::PushUp)) => {
-                        match controller.stop_and_transcribe() {
-                            Ok(Some(text)) => {
-                                if let Err(e) = injector.inject(&text) {
-                                    eprintln!("Failed to inject text: {}", e);
-                                }
-                                controller.finish_emission();
+                        if controller.state == DictationState::Recording {
+                            if let Some(b) = broadcaster {
+                                b.broadcast(DaemonEvent::StateChanged {
+                                    state: DictationState::Processing,
+                                    previous: Some(DictationState::Recording),
+                                });
                             }
-                            Ok(None) => {}
-                            Err(e) => {
-                                eprintln!("Engine error on PushUp: {}", e);
+                            match controller.stop_and_transcribe() {
+                                Ok(Some(text)) => {
+                                    if let Some(b) = broadcaster {
+                                        b.broadcast(DaemonEvent::StateChanged {
+                                            state: DictationState::Emitting,
+                                            previous: Some(DictationState::Processing),
+                                        });
+                                    }
+                                    if let Err(e) = injector.inject(&text) {
+                                        eprintln!("Failed to inject text: {}", e);
+                                    }
+                                    controller.finish_emission();
+                                    if let Some(b) = broadcaster {
+                                        b.broadcast(DaemonEvent::StateChanged {
+                                            state: DictationState::Idle,
+                                            previous: Some(DictationState::Emitting),
+                                        });
+                                    }
+                                }
+                                Ok(None) => {
+                                    if let Some(b) = broadcaster {
+                                        b.broadcast(DaemonEvent::StateChanged {
+                                            state: DictationState::Idle,
+                                            previous: Some(DictationState::Processing),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Engine error on PushUp: {}", e);
+                                    if let Some(b) = broadcaster {
+                                        b.broadcast(DaemonEvent::Error {
+                                            code: "inference_failed".into(),
+                                            message: e,
+                                        });
+                                        b.broadcast(DaemonEvent::StateChanged {
+                                            state: DictationState::Idle,
+                                            previous: Some(DictationState::Error),
+                                        });
+                                    }
+                                    controller.reset_to_idle();
+                                }
                             }
                         }
                     }
                     Ok(Some(IpcRequest::Toggle)) => {
-                        match controller.toggle() {
-                            Ok(Some(text)) => {
-                                if let Err(e) = injector.inject(&text) {
-                                    eprintln!("Failed to inject text: {}", e);
+                        let prev = controller.state;
+                        match prev {
+                            DictationState::Idle => {
+                                if let Err(e) = controller.start_recording() {
+                                    eprintln!("Failed to start recording on Toggle: {}", e);
+                                } else if let Some(b) = broadcaster {
+                                    b.broadcast(DaemonEvent::StateChanged {
+                                        state: DictationState::Recording,
+                                        previous: Some(DictationState::Idle),
+                                    });
                                 }
-                                controller.finish_emission();
                             }
-                            Ok(None) => {}
-                            Err(e) => {
-                                eprintln!("Engine error on Toggle: {}", e);
+                            DictationState::Recording => {
+                                if let Some(b) = broadcaster {
+                                    b.broadcast(DaemonEvent::StateChanged {
+                                        state: DictationState::Processing,
+                                        previous: Some(DictationState::Recording),
+                                    });
+                                }
+                                match controller.stop_and_transcribe() {
+                                    Ok(Some(text)) => {
+                                        if let Some(b) = broadcaster {
+                                            b.broadcast(DaemonEvent::StateChanged {
+                                                state: DictationState::Emitting,
+                                                previous: Some(DictationState::Processing),
+                                            });
+                                        }
+                                        if let Err(e) = injector.inject(&text) {
+                                            eprintln!("Failed to inject text: {}", e);
+                                        }
+                                        controller.finish_emission();
+                                        if let Some(b) = broadcaster {
+                                            b.broadcast(DaemonEvent::StateChanged {
+                                                state: DictationState::Idle,
+                                                previous: Some(DictationState::Emitting),
+                                            });
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        if let Some(b) = broadcaster {
+                                            b.broadcast(DaemonEvent::StateChanged {
+                                                state: DictationState::Idle,
+                                                previous: Some(DictationState::Processing),
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Engine error on Toggle: {}", e);
+                                        if let Some(b) = broadcaster {
+                                            b.broadcast(DaemonEvent::Error {
+                                                code: "inference_failed".into(),
+                                                message: e,
+                                            });
+                                            b.broadcast(DaemonEvent::StateChanged {
+                                                state: DictationState::Idle,
+                                                previous: Some(DictationState::Error),
+                                            });
+                                        }
+                                        controller.reset_to_idle();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Some(IpcRequest::Cancel)) => {
+                        if controller.state == DictationState::Recording || controller.state == DictationState::Processing {
+                            let prev = controller.state;
+                            controller.cancel();
+                            if let Some(b) = broadcaster {
+                                b.broadcast(DaemonEvent::Canceled {
+                                    reason: "ipc_cancel".into(),
+                                });
+                                b.broadcast(DaemonEvent::StateChanged {
+                                    state: DictationState::Idle,
+                                    previous: Some(prev),
+                                });
                             }
                         }
                     }
@@ -108,16 +268,49 @@ where
 
         // 2. Poll input events (10ms tick) without hardware EVIOCGRAB
         if let Some((keycode, is_down)) = input_source.poll_event(Duration::from_millis(10)) {
+            let prev = controller.state;
             match controller.handle_key_event(keycode, is_down) {
                 Ok(Some(text)) => {
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Emitting,
+                            previous: Some(DictationState::Processing),
+                        });
+                    }
                     if let Err(e) = injector.inject(&text) {
                         eprintln!("Failed to inject text: {}", e);
                     }
                     controller.finish_emission();
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Idle,
+                            previous: Some(DictationState::Emitting),
+                        });
+                    }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if controller.state != prev {
+                        if let Some(b) = broadcaster {
+                            b.broadcast(DaemonEvent::StateChanged {
+                                state: controller.state,
+                                previous: Some(prev),
+                            });
+                        }
+                    }
+                }
                 Err(e) => {
                     eprintln!("Engine error: {}", e);
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::Error {
+                            code: "inference_failed".into(),
+                            message: e,
+                        });
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Idle,
+                            previous: Some(DictationState::Error),
+                        });
+                    }
+                    controller.reset_to_idle();
                 }
             }
         }
@@ -315,7 +508,19 @@ pub fn start_daemon(
         let signal_handle = register_termination_signals(Arc::clone(&running))
             .map_err(|e| format!("Failed to register POSIX signal handlers: {}", e))?;
 
-        let _ = run_session_loop(
+        let broadcaster = match EventBroadcaster::bind(&paths.events_socket_path) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to bind events socket at {}: {}",
+                    paths.events_socket_path.display(),
+                    e
+                );
+                None
+            }
+        };
+
+        let _ = run_session_loop_with_broadcaster(
             &listener,
             &mut input_source,
             &mut injector,
@@ -323,6 +528,7 @@ pub fn start_daemon(
             &running,
             &config.hotkey,
             config.pacing_delay_ms,
+            broadcaster.as_ref(),
         );
 
         #[cfg(unix)]
@@ -540,6 +746,48 @@ pub fn send_toggle(paths: &RuntimePaths) -> Result<(), String> {
         Ok(other) => Err(format!("Unexpected response: {:?}", other)),
         Err(e) => Err(format!("Failed to communicate with Speechyyy daemon: {}", e)),
     }
+}
+
+pub fn send_cancel(paths: &RuntimePaths) -> Result<(), String> {
+    if !paths.socket_path.exists() {
+        return Err("Speechyyy is not running. Start it first with 'speechyyy start'.".into());
+    }
+    match IpcClient::send_request(&paths.socket_path, &IpcRequest::Cancel) {
+        Ok(IpcResponse::Ok { message }) => {
+            println!("[✓] {}", message);
+            Ok(())
+        }
+        Ok(IpcResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Err(e) => Err(format!("Failed to communicate with Speechyyy daemon: {}", e)),
+    }
+}
+
+pub fn stream_events(paths: &RuntimePaths) -> Result<(), String> {
+    if !paths.events_socket_path.exists() {
+        return Err(format!(
+            "Speechyyy daemon is not running (events socket not found at {}). Start it first with 'speechyyy start'.",
+            paths.events_socket_path.display()
+        ));
+    }
+    let stream = UnixStream::connect(&paths.events_socket_path).map_err(|e| {
+        format!(
+            "Failed to connect to events socket at {}: {}",
+            paths.events_socket_path.display(),
+            e
+        )
+    })?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    while let Ok(bytes) = reader.read_line(&mut line) {
+        if bytes == 0 {
+            break;
+        }
+        print!("{}", line);
+        let _ = std::io::stdout().flush();
+        line.clear();
+    }
+    Ok(())
 }
 
 pub use crate::uninstall::{handle_uninstall_command, handle_uninstall_command_internal};

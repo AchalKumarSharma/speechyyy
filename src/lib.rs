@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod engine;
+pub mod events;
 pub mod history;
 pub mod inference;
 pub mod injector;

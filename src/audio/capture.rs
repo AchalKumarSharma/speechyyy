@@ -1,9 +1,9 @@
 use crate::audio::resample::process_raw_audio;
 use crate::audio::ring_buffer::{AudioConsumer, AudioRingBuffer};
-use crate::audio::{AudioCapture, AudioChunk, AudioError};
+use crate::audio::{calculate_block_rms, AudioCapture, AudioChunk, AudioError};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 // 2,880,000 samples accommodates 30 seconds of 48kHz stereo or 60 seconds of 48kHz mono (~11.5 MB RAM)
@@ -15,6 +15,7 @@ pub struct CpalAudioCapture {
     input_sample_rate: u32,
     channels: u16,
     is_recording: Arc<AtomicBool>,
+    active_rms: Arc<AtomicU32>,
 }
 
 impl CpalAudioCapture {
@@ -35,6 +36,8 @@ impl CpalAudioCapture {
         let (mut producer, consumer) = AudioRingBuffer::new(DEFAULT_BUFFER_CAPACITY);
         let is_recording = Arc::new(AtomicBool::new(false));
         let is_recording_cb = Arc::clone(&is_recording);
+        let active_rms = Arc::new(AtomicU32::new(0));
+        let active_rms_cb = Arc::clone(&active_rms);
 
         let err_fn = |err| {
             eprintln!("CPAL input stream error: {}", err);
@@ -49,6 +52,8 @@ impl CpalAudioCapture {
                     if !is_recording_cb.load(Ordering::Relaxed) {
                         return;
                     }
+                    let block_rms = calculate_block_rms(data);
+                    active_rms_cb.store(block_rms.to_bits(), Ordering::Relaxed);
                     let written = producer.push_frames(data, channels_usize);
                     if written < data.len() {
                         eprintln!(
@@ -60,32 +65,38 @@ impl CpalAudioCapture {
                 err_fn,
                 None,
             ),
-            SampleFormat::I16 => device.build_input_stream(
-                config,
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    // Gating: Discard incoming audio immediately if not recording
-                    if !is_recording_cb.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let mut buffer = [0.0f32; 512];
-                    let step = (512 / channels_usize) * channels_usize;
-                    let step = if step == 0 { 512 } else { step };
-                    for chunk in data.chunks(step) {
-                        for (i, &s) in chunk.iter().enumerate() {
-                            buffer[i] = s as f32 / 32768.0;
+            SampleFormat::I16 => {
+                let active_rms_i16 = Arc::clone(&active_rms);
+                device.build_input_stream(
+                    config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        // Gating: Discard incoming audio immediately if not recording
+                        if !is_recording_cb.load(Ordering::Relaxed) {
+                            return;
                         }
-                        let written = producer.push_frames(&buffer[..chunk.len()], channels_usize);
-                        if written < chunk.len() {
-                            eprintln!(
-                                "Audio ring buffer overflow: dropped {} samples",
-                                chunk.len() - written
-                            );
+                        let mut buffer = [0.0f32; 512];
+                        let step = (512 / channels_usize) * channels_usize;
+                        let step = if step == 0 { 512 } else { step };
+                        for chunk in data.chunks(step) {
+                            for (i, &s) in chunk.iter().enumerate() {
+                                buffer[i] = s as f32 / 32768.0;
+                            }
+                            let block_rms = calculate_block_rms(&buffer[..chunk.len()]);
+                            active_rms_i16.store(block_rms.to_bits(), Ordering::Relaxed);
+                            let written =
+                                producer.push_frames(&buffer[..chunk.len()], channels_usize);
+                            if written < chunk.len() {
+                                eprintln!(
+                                    "Audio ring buffer overflow: dropped {} samples",
+                                    chunk.len() - written
+                                );
+                            }
                         }
-                    }
-                },
-                err_fn,
-                None,
-            ),
+                    },
+                    err_fn,
+                    None,
+                )
+            }
             other => {
                 return Err(AudioError::UnsupportedFormat(format!("{:?}", other)));
             }
@@ -101,12 +112,14 @@ impl CpalAudioCapture {
             input_sample_rate,
             channels,
             is_recording,
+            active_rms,
         })
     }
 }
 
 impl AudioCapture for CpalAudioCapture {
     fn start_capture(&mut self) -> Result<(), AudioError> {
+        self.active_rms.store(0, Ordering::Relaxed);
         // 1. Drain/flush any stale residual samples from the ring buffer
         self.consumer.clear();
 
@@ -126,6 +139,7 @@ impl AudioCapture for CpalAudioCapture {
     }
 
     fn stop_capture(&mut self) -> Result<AudioChunk, AudioError> {
+        self.active_rms.store(0, Ordering::Relaxed);
         // 1. Immediately gate callback so new samples are dropped at the door
         self.is_recording.store(false, Ordering::SeqCst);
 
@@ -143,16 +157,34 @@ impl AudioCapture for CpalAudioCapture {
     fn is_capturing(&self) -> bool {
         self.is_recording.load(Ordering::Relaxed)
     }
+
+    fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        Some(Arc::clone(&self.active_rms))
+    }
 }
 
 /// Deterministic mock capture implementation for headless unit and integration testing.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct MockAudioCapture {
     pub is_recording: bool,
     pub queued_chunks: Vec<AudioChunk>,
     pub captured_chunks: Vec<AudioChunk>,
     pub start_calls: usize,
     pub stop_calls: usize,
+    pub active_rms: Arc<AtomicU32>,
+}
+
+impl Default for MockAudioCapture {
+    fn default() -> Self {
+        Self {
+            is_recording: false,
+            queued_chunks: Vec::new(),
+            captured_chunks: Vec::new(),
+            start_calls: 0,
+            stop_calls: 0,
+            active_rms: Arc::new(AtomicU32::new(0)),
+        }
+    }
 }
 
 impl MockAudioCapture {
@@ -167,6 +199,7 @@ impl MockAudioCapture {
             captured_chunks: Vec::new(),
             start_calls: 0,
             stop_calls: 0,
+            active_rms: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -177,6 +210,7 @@ impl MockAudioCapture {
             captured_chunks: Vec::new(),
             start_calls: 0,
             stop_calls: 0,
+            active_rms: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -204,6 +238,10 @@ impl AudioCapture for MockAudioCapture {
 
     fn is_capturing(&self) -> bool {
         self.is_recording
+    }
+
+    fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        Some(Arc::clone(&self.active_rms))
     }
 }
 

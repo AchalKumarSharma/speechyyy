@@ -44,6 +44,10 @@ pub enum Command {
     PushUp,
     /// Toggle push-to-talk recording state
     Toggle,
+    /// Cancel active recording or processing
+    Cancel,
+    /// Stream real-time daemon events in NDJSON format
+    Events,
     /// Inspect system permissions, audio inputs, and model weights
     Doctor,
     /// List available speech recognition models (alias: model)
@@ -218,6 +222,18 @@ mod tests {
     fn test_parse_toggle() {
         let cli_toggle = Cli::try_parse_from(["speechyyy", "toggle"]).expect("parse toggle");
         assert_eq!(cli_toggle.command, Command::Toggle);
+    }
+
+    #[test]
+    fn test_parse_cancel() {
+        let cli = Cli::try_parse_from(["speechyyy", "cancel"]).expect("parse cancel");
+        assert_eq!(cli.command, Command::Cancel);
+    }
+
+    #[test]
+    fn test_parse_events() {
+        let cli = Cli::try_parse_from(["speechyyy", "events"]).expect("parse events");
+        assert_eq!(cli.command, Command::Events);
     }
 
     #[test]

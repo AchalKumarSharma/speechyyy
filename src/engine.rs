@@ -1,10 +1,13 @@
 use crate::audio::vad::EnergyVad;
 use crate::audio::AudioCapture;
+use crate::events::DictationState;
 use crate::history::HistoryLogger;
 use crate::inference::SpeechInference;
 use crate::text::TextPipeline;
 use evdev::KeyCode;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Modifier {
@@ -170,28 +173,12 @@ impl KeyChordTracker {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DictationState {
-    Idle,
-    Recording,
-    Processing,
-    Emitting,
-}
-
-impl DictationState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Idle => "Idle",
-            Self::Recording => "Recording",
-            Self::Processing => "Processing",
-            Self::Emitting => "Emitting",
-        }
-    }
-}
-
 pub trait DictationEngine {
     fn on_press(&mut self) -> Result<(), String>;
     fn on_release(&mut self) -> Result<Option<String>, String>;
+    fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        None
+    }
 }
 
 pub struct MockDictationEngine {
@@ -311,8 +298,7 @@ impl<C: AudioCapture, I: SpeechInference> DictationEngine for AudioDictationEngi
                     }
                     Err(e) => {
                         eprintln!("Speech inference failed: {}", e);
-                        // Do not inject error string into active caret
-                        Ok(None)
+                        Err(e.to_string())
                     }
                 }
             }
@@ -321,6 +307,10 @@ impl<C: AudioCapture, I: SpeechInference> DictationEngine for AudioDictationEngi
                 Ok(None)
             }
         }
+    }
+
+    fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        self.capture.active_rms()
     }
 }
 
@@ -350,16 +340,38 @@ impl<E: DictationEngine> StateMachineController<E> {
     pub fn stop_and_transcribe(&mut self) -> Result<Option<String>, String> {
         if self.state == DictationState::Recording {
             self.state = DictationState::Processing;
-            let text_opt = self.engine.on_release()?;
-            if text_opt.is_some() {
-                self.state = DictationState::Emitting;
-            } else {
-                self.state = DictationState::Idle;
+            match self.engine.on_release() {
+                Ok(Some(text)) => {
+                    self.state = DictationState::Emitting;
+                    Ok(Some(text))
+                }
+                Ok(None) => {
+                    self.state = DictationState::Idle;
+                    Ok(None)
+                }
+                Err(err) => {
+                    self.state = DictationState::Error;
+                    Err(err)
+                }
             }
-            Ok(text_opt)
         } else {
             Ok(None)
         }
+    }
+
+    pub fn reset_to_idle(&mut self) {
+        self.state = DictationState::Idle;
+    }
+
+    pub fn cancel(&mut self) {
+        if self.state == DictationState::Recording {
+            let _ = self.engine.on_release();
+        }
+        self.state = DictationState::Idle;
+    }
+
+    pub fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        self.engine.active_rms()
     }
 
     pub fn toggle(&mut self) -> Result<Option<String>, String> {
@@ -644,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_dictation_engine_inference_error_returns_none() {
+    fn test_audio_dictation_engine_inference_error_emits_error_state() {
         use crate::audio::capture::MockAudioCapture;
         use crate::audio::AudioChunk;
         use crate::inference::{InferenceError, SpeechInference};
@@ -668,12 +680,10 @@ mod tests {
         controller
             .handle_key_event(KeyCode::KEY_RIGHTALT, true)
             .unwrap();
-        // Failure shouldn't cause an unwrap or error propagation, just Ok(None) to stay resilient
-        let output = controller
-            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
-            .unwrap();
-        assert_eq!(output, None);
-        assert_eq!(controller.state, DictationState::Idle);
+        // Inference error must return Err(...) and set state to DictationState::Error (no silent swallowing)
+        let res = controller.handle_key_event(KeyCode::KEY_RIGHTALT, false);
+        assert!(res.is_err());
+        assert_eq!(controller.state, DictationState::Error);
     }
 
     #[test]

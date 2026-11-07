@@ -16,6 +16,7 @@ pub enum IpcRequest {
     PushDown,
     PushUp,
     Toggle,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +43,7 @@ pub enum IpcResponse {
 pub struct RuntimePaths {
     pub dir: PathBuf,
     pub socket_path: PathBuf,
+    pub events_socket_path: PathBuf,
     pub pid_path: PathBuf,
     pub binary_path: Option<PathBuf>,
 }
@@ -69,10 +71,12 @@ impl Default for RuntimePaths {
 impl RuntimePaths {
     pub fn with_dir(dir: PathBuf) -> Self {
         let socket_path = dir.join("speechyyy.sock");
+        let events_socket_path = dir.join("events.sock");
         let pid_path = dir.join("speechyyy.pid");
         Self {
             dir,
             socket_path,
+            events_socket_path,
             pid_path,
             binary_path: None,
         }
@@ -96,6 +100,7 @@ impl RuntimePaths {
     pub fn cleanup(&self) {
         PidFile::remove(&self.pid_path);
         let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_file(&self.events_socket_path);
     }
 }
 
@@ -291,6 +296,12 @@ impl IpcServer {
                     message: "Toggling recording state".into(),
                 },
                 Some(IpcRequest::Toggle),
+            ),
+            Ok(IpcRequest::Cancel) => (
+                IpcResponse::Ok {
+                    message: "Dictation canceled".into(),
+                },
+                Some(IpcRequest::Cancel),
             ),
             Err(e) => (
                 IpcResponse::Error {
