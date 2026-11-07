@@ -207,10 +207,15 @@ impl ProvidesRegistryState for DockApp {
 delegate_dispatch2!(DockApp);
 
 fn main() {
-    let running = Arc::new(AtomicBool::new(true));
-    let r = Arc::clone(&running);
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&r));
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&r));
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let _ = signal_hook::flag::register(
+        signal_hook::consts::SIGINT,
+        Arc::clone(&shutdown_requested),
+    );
+    let _ = signal_hook::flag::register(
+        signal_hook::consts::SIGTERM,
+        Arc::clone(&shutdown_requested),
+    );
 
     // Connect to Wayland server
     let conn = match Connection::connect_to_env() {
@@ -329,15 +334,15 @@ fn main() {
 
     // Spawn IPC background thread connecting to $XDG_RUNTIME_DIR/speechyyy/events.sock
     let socket_path = RuntimePaths::default().events_socket_path;
-    let thread_running = Arc::clone(&running);
+    let thread_shutdown = Arc::clone(&shutdown_requested);
 
     std::thread::spawn(move || {
-        while thread_running.load(Ordering::Relaxed) {
+        while !thread_shutdown.load(Ordering::Relaxed) {
             match UnixStream::connect(&socket_path) {
                 Ok(stream) => {
                     let reader = BufReader::new(stream);
                     for line in reader.lines() {
-                        if !thread_running.load(Ordering::Relaxed) {
+                        if thread_shutdown.load(Ordering::Relaxed) {
                             return;
                         }
                         match line {
@@ -377,7 +382,7 @@ fn main() {
     println!("speechyyy-dock: running in background, listening on events.sock");
 
     // Event loop dispatch
-    while running.load(Ordering::Relaxed) && !app.exit {
+    while !shutdown_requested.load(Ordering::Relaxed) && !app.exit {
         // Dispatch with a 50ms timeout so signals and state timers are promptly checked
         if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(50)), &mut app) {
             eprintln!("speechyyy-dock: event loop error: {}", e);
