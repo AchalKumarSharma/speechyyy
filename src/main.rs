@@ -4,7 +4,7 @@ use speechyyy::daemon::{
     check_status, handle_uninstall_command, send_cancel, send_push_down, send_push_up, send_toggle,
     start_daemon, stop_daemon, stream_events,
 };
-use speechyyy::doctor::{print_doctor_report, run_doctor, RealSysEnv};
+use speechyyy::doctor::{print_doctor_report, run_doctor_opts, RealSysEnv};
 use speechyyy::history::{handle_fix_command_opts, handle_history_command};
 use speechyyy::ipc::RuntimePaths;
 use speechyyy::model::{
@@ -26,9 +26,10 @@ fn main() {
         }
         Command::Unlearn { key } => handle_unlearn_command(key.as_deref()),
         Command::History { limit } => handle_history_command(limit),
-        Command::Doctor => {
+        Command::Doctor { deep } => {
             let env = RealSysEnv;
-            let report = run_doctor(&env);
+            let config = speechyyy::config::Config::load();
+            let report = run_doctor_opts(&env, &config, deep, None);
             print_doctor_report(&report);
             if !report.is_ready() {
                 std::process::exit(1);

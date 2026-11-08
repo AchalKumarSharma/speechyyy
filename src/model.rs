@@ -1,6 +1,12 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use std::fs::{self};
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum LocalModelType {
@@ -189,132 +195,788 @@ impl ModelManager {
         })
     }
 
-    /// Downloads the model archive (.tar.bz2) and unpacks into `target_dir`.
+    /// Downloads the model archive (.tar.bz2), verifies its SHA-256 and size against the pinned manifest,
+    /// safely extracts it into staging with traversal guards, and atomically promotes it into `target_dir`.
     pub fn download_model(
         model_type: LocalModelType,
         target_dir: &Path,
     ) -> Result<ModelInfo, String> {
-        fs::create_dir_all(target_dir).map_err(|e| {
-            format!(
-                "Failed to create target directory {}: {}",
-                target_dir.display(),
-                e
-            )
-        })?;
+        let fetcher = UreqFetcher;
+        download_and_install_model(model_type, target_dir, &fetcher, None)
+    }
 
-        let url = model_type.download_url();
-        println!(
-            "Downloading {} from {} into {}...",
-            model_type.display_name(),
-            url,
-            target_dir.display()
-        );
+    /// Downloads and installs model with a custom fetcher and optional manifest override (for hermetic testing).
+    pub fn download_model_with_fetcher<F: Fetcher>(
+        model_type: LocalModelType,
+        target_dir: &Path,
+        fetcher: &F,
+        manifest: Option<&ModelsManifest>,
+    ) -> Result<ModelInfo, String> {
+        download_and_install_model(model_type, target_dir, fetcher, manifest)
+    }
+}
 
-        let resp = ureq::get(url)
-            .call()
-            .map_err(|e| format!("Download request failed for {}: {}", url, e))?;
+pub const EMBEDDED_MANIFEST: &str = include_str!("../assets/models.toml");
 
-        let total_bytes = resp
-            .header("content-length")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelManifestEntry {
+    pub id: String,
+    pub url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub max_extracted_bytes: u64,
+    pub max_files: usize,
+    pub expected_files: Vec<String>,
+    pub license: String,
+    pub license_url: String,
+    pub attribution: String,
+}
 
-        let pb = ProgressBar::new(total_bytes);
-        let style = ProgressStyle::with_template(
-            "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("##-");
-        pb.set_style(style);
+impl ModelManifestEntry {
+    pub fn validate_for_download(&self) -> Result<(), String> {
+        let hash = self.sha256.trim();
+        if hash.is_empty()
+            || hash == "unverified"
+            || hash == "placeholder"
+            || hash == "TODO"
+            || hash.len() != 64
+        {
+            return Err(format!(
+                "error: model '{}' does not have a pinned checksum in this build.\nhint: run 'scripts/update-model-manifest.sh' or set up a verified build.",
+                self.id
+            ));
+        }
+        if self.size_bytes == 0 {
+            return Err(format!(
+                "error: model '{}' has no pinned archive size in this build.\nhint: run 'scripts/update-model-manifest.sh' or set up a verified build.",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
 
-        let temp_archive_path = target_dir.join(format!("{}.tar.bz2.part", model_type.folder_name()));
-        if temp_archive_path.exists() {
-            let _ = fs::remove_file(&temp_archive_path);
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelsManifest {
+    #[serde(default)]
+    pub models: HashMap<String, ModelManifestEntry>,
+}
+
+impl ModelsManifest {
+    pub fn parse(content: &str) -> Result<Self, String> {
+        toml::from_str(content).map_err(|e| format!("Failed to parse models.toml: {}", e))
+    }
+
+    pub fn embedded() -> Result<Self, String> {
+        Self::parse(EMBEDDED_MANIFEST)
+    }
+
+    pub fn get(&self, model_id: &str) -> Option<&ModelManifestEntry> {
+        self.models.get(model_id)
+    }
+}
+
+pub fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(to_hex(&hasher.finalize()))
+}
+
+/// Pure function validating that a model download URL conforms strictly to the URL policy:
+/// - Must begin with 'https://'
+/// - Host up to '/', '?', '#', or ':' must be exactly 'github.com' or end with '.githubusercontent.com' on a dot boundary
+/// - Must not contain userinfo ('@') before authority ends
+pub fn validate_download_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("URL scheme must be exactly 'https://'".into());
+    }
+    let after_scheme = &url["https://".len()..];
+
+    let authority_end = after_scheme
+        .find(['/', '?', '#', ':'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+
+    if authority.contains('@') {
+        return Err("Userinfo ('@') is not allowed in model download URL".into());
+    }
+
+    let host = authority.to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("Host cannot be empty".into());
+    }
+
+    let is_allowed = host == "github.com"
+        || (host.ends_with(".githubusercontent.com")
+            && host.len() > ".githubusercontent.com".len()
+            && !host[..host.len() - ".githubusercontent.com".len()].is_empty()
+            && !host[..host.len() - ".githubusercontent.com".len()].ends_with('.'));
+
+    if !is_allowed {
+        return Err(format!(
+            "Host '{}' is not an allowlisted GitHub download domain",
+            host
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn compute_available_disk_space(bavail: u64, frsize: u64) -> u64 {
+    bavail.saturating_mul(frsize)
+}
+
+pub fn compute_required_disk_space(archive_size: u64, max_extracted_bytes: u64) -> u64 {
+    let archive_part = (archive_size as f64 * 2.5) as u64;
+    archive_part.saturating_add(max_extracted_bytes)
+}
+
+pub fn check_disk_space(target_dir: &Path, required_bytes: u64) -> Result<u64, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut check_dir = target_dir.to_path_buf();
+    while !check_dir.exists() {
+        if let Some(parent) = check_dir.parent() {
+            check_dir = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    let c_path = CString::new(check_dir.as_os_str().as_bytes())
+        .map_err(|e| format!("Invalid path for statvfs: {}", e))?;
+
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if res != 0 {
+        return Err(format!(
+            "statvfs failed on {}: {}",
+            check_dir.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let available = compute_available_disk_space(stat.f_bavail as u64, stat.f_frsize as u64);
+    if available < required_bytes {
+        let req_mb = required_bytes as f64 / (1024.0 * 1024.0);
+        let avail_mb = available as f64 / (1024.0 * 1024.0);
+        return Err(format!(
+            "Insufficient disk space in {}: required {:.1} MB, available {:.1} MB",
+            check_dir.display(),
+            req_mb,
+            avail_mb
+        ));
+    }
+
+    Ok(available)
+}
+
+pub trait Fetcher {
+    fn fetch(
+        &self,
+        url: &str,
+        dest: &Path,
+        max_bytes: u64,
+        progress_cb: Option<&mut dyn FnMut(u64)>,
+    ) -> Result<String, String>;
+}
+
+pub struct UreqFetcher;
+
+impl Fetcher for UreqFetcher {
+    fn fetch(
+        &self,
+        initial_url: &str,
+        dest: &Path,
+        max_bytes: u64,
+        mut progress_cb: Option<&mut dyn FnMut(u64)>,
+    ) -> Result<String, String> {
+        let mut current_url = initial_url.to_string();
+        let mut redirect_count = 0;
+
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(30))
+            .build();
+
+        loop {
+            validate_download_url(&current_url)?;
+
+            let mut attempts = 0;
+            let mut last_err = String::new();
+            let mut response = None;
+
+            while attempts < 3 {
+                attempts += 1;
+                match agent.get(&current_url).call() {
+                    Ok(resp) => {
+                        response = Some(resp);
+                        break;
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        if (301..=308).contains(&code) {
+                            if let Some(loc) = resp.header("location") {
+                                redirect_count += 1;
+                                if redirect_count > 5 {
+                                    return Err(format!(
+                                        "Too many redirects (exceeded 5) while fetching {}",
+                                        initial_url
+                                    ));
+                                }
+                                let next_url = if loc.starts_with("http://") || loc.starts_with("https://") {
+                                    loc.to_string()
+                                } else if loc.starts_with('/') {
+                                    let authority_end = current_url["https://".len()..]
+                                        .find('/')
+                                        .map(|idx| idx + "https://".len())
+                                        .unwrap_or(current_url.len());
+                                    format!("{}{}", &current_url[..authority_end], loc)
+                                } else {
+                                    format!("{}/{}", current_url.trim_end_matches('/'), loc)
+                                };
+                                current_url = next_url;
+                                response = None;
+                                break;
+                            }
+                        }
+                        return Err(format!(
+                            "HTTP error {} fetching {}: {}",
+                            code, current_url, resp.status_text()
+                        ));
+                    }
+                    Err(ureq::Error::Transport(e)) => {
+                        last_err = format!("Network failure on {}: {}", current_url, e);
+                        if attempts < 3 {
+                            let backoff = Duration::from_millis(500 * (1 << (attempts - 1)));
+                            std::thread::sleep(backoff);
+                        }
+                    }
+                }
+            }
+
+            if let Some(resp) = response {
+                if dest.exists() {
+                    let _ = fs::remove_file(dest);
+                }
+                if let Some(p) = dest.parent() {
+                    fs::create_dir_all(p)
+                        .map_err(|e| format!("Failed to create staging dir {}: {}", p.display(), e))?;
+                }
+
+                let mut dest_file = File::create(dest)
+                    .map_err(|e| format!("Failed to create staging file {}: {}", dest.display(), e))?;
+
+                let mut reader = resp.into_reader();
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; 65536];
+                let mut total_bytes = 0u64;
+
+                loop {
+                    let n = reader
+                        .read(&mut buf)
+                        .map_err(|e| format!("Failed reading stream from {}: {}", current_url, e))?;
+                    if n == 0 {
+                        break;
+                    }
+                    total_bytes += n as u64;
+                    if total_bytes > max_bytes {
+                        drop(dest_file);
+                        let _ = fs::remove_file(dest);
+                        return Err(format!(
+                            "Download aborted: received {} bytes, exceeding allowed maximum of {} bytes",
+                            total_bytes, max_bytes
+                        ));
+                    }
+                    hasher.update(&buf[..n]);
+                    dest_file
+                        .write_all(&buf[..n])
+                        .map_err(|e| format!("Failed to write to {}: {}", dest.display(), e))?;
+
+                    if let Some(ref mut cb) = progress_cb {
+                        cb(total_bytes);
+                    }
+                }
+
+                dest_file
+                    .flush()
+                    .map_err(|e| format!("Failed to flush {}: {}", dest.display(), e))?;
+                let computed_hash = to_hex(&hasher.finalize());
+                return Ok(computed_hash);
+            }
+
+            if attempts >= 3 && !last_err.is_empty() {
+                return Err(format!("Download failed after 3 attempts: {}", last_err));
+            }
+        }
+    }
+}
+
+pub fn clean_stale_staging_dirs(staging_root: &Path) {
+    if !staging_root.exists() {
+        return;
+    }
+    let entries = match fs::read_dir(staging_root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let pid_opt = dir_name.rsplit('-').next().and_then(|p| p.parse::<libc::pid_t>().ok());
+        let mut should_clean = false;
+
+        if let Some(pid) = pid_opt {
+            let res = unsafe { libc::kill(pid, 0) };
+            if res != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    should_clean = true;
+                }
+            }
         }
 
-        let mut reader = pb.wrap_read(resp.into_reader());
-        let mut dest_file = fs::File::create(&temp_archive_path).map_err(|e| {
-            format!(
-                "Failed to create temp archive {}: {}",
-                temp_archive_path.display(),
-                e
-            )
-        })?;
+        if let Ok(meta) = fs::metadata(&path) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
+                    if elapsed >= Duration::from_secs(86400) {
+                        should_clean = true;
+                    }
+                }
+            }
+        }
 
-        std::io::copy(&mut reader, &mut dest_file).map_err(|e| {
-            let _ = fs::remove_file(&temp_archive_path);
-            format!("Failed to download archive: {}", e)
-        })?;
-        drop(dest_file);
+        if should_clean {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
 
-        pb.set_message("Extracting archive...");
+pub fn safe_extract_tar_bz2(
+    archive_path: &Path,
+    dest_dir: &Path,
+    max_files: usize,
+    max_extracted_bytes: u64,
+) -> Result<usize, String> {
+    if dest_dir.exists() {
+        let _ = fs::remove_dir_all(dest_dir);
+    }
+    fs::create_dir_all(dest_dir)
+        .map_err(|e| format!("Failed to create extraction directory {}: {}", dest_dir.display(), e))?;
 
-        let archive_file = fs::File::open(&temp_archive_path).map_err(|e| {
-            let _ = fs::remove_file(&temp_archive_path);
-            format!(
-                "Failed to open downloaded archive {}: {}",
-                temp_archive_path.display(),
-                e
-            )
-        })?;
-        let decompressor = bzip2::read::BzDecoder::new(archive_file);
-        let mut archive = tar::Archive::new(decompressor);
+    let file = File::open(archive_path)
+        .map_err(|e| format!("Failed to open archive {}: {}", archive_path.display(), e))?;
+    let decompressor = bzip2::read::BzDecoder::new(file);
+    let mut archive = tar::Archive::new(decompressor);
 
-        for entry in archive
-            .entries()
-            .map_err(|e| {
-                let _ = fs::remove_file(&temp_archive_path);
-                format!("Failed to read tar archive: {}", e)
-            })?
-        {
-            let mut entry = entry.map_err(|e| {
-                let _ = fs::remove_file(&temp_archive_path);
-                format!("Failed to read tar entry: {}", e)
-            })?;
-            let path = entry
-                .path()
-                .map_err(|e| {
-                    let _ = fs::remove_file(&temp_archive_path);
-                    format!("Invalid path in tar: {}", e)
-                })?;
-            let components: Vec<_> = path.components().collect();
-            let relative_path: PathBuf = if components.len() > 1 {
-                components[1..].iter().collect()
-            } else {
-                path.to_path_buf()
-            };
-            if relative_path.as_os_str().is_empty() {
+    let mut file_count = 0usize;
+    let mut total_bytes_written = 0u64;
+
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Corrupted tar archive {}: {}", archive_path.display(), e))?;
+
+    for entry_res in entries {
+        let mut entry = entry_res.map_err(|e| format!("Failed to read archive entry: {}", e))?;
+        let entry_type = entry.header().entry_type();
+
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(format!(
+                "Archive contains forbidden entry type '{:?}'",
+                entry_type
+            ));
+        }
+
+        let raw_path = entry
+            .path()
+            .map_err(|e| format!("Invalid path in archive: {}", e))?
+            .to_path_buf();
+
+        let mut normalized_parts = Vec::new();
+        for comp in raw_path.components() {
+            match comp {
+                Component::CurDir => continue,
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(format!(
+                        "Archive entry '{}' contains illegal absolute path component",
+                        raw_path.display()
+                    ));
+                }
+                Component::ParentDir => {
+                    return Err(format!(
+                        "Archive entry '{}' contains illegal path traversal component '..'",
+                        raw_path.display()
+                    ));
+                }
+                Component::Normal(c) => {
+                    normalized_parts.push(PathBuf::from(c));
+                }
+            }
+        }
+
+        if normalized_parts.is_empty() {
+            continue;
+        }
+
+        let relative_path: PathBuf = if normalized_parts.len() > 1 {
+            normalized_parts[1..].iter().collect()
+        } else {
+            if entry_type.is_dir() {
                 continue;
             }
-            let dest = target_dir.join(relative_path);
-            if entry.header().entry_type().is_dir() {
-                let _ = fs::create_dir_all(&dest);
-            } else {
-                if let Some(parent) = dest.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                entry
-                    .unpack(&dest)
-                    .map_err(|e| {
-                        let _ = fs::remove_file(&temp_archive_path);
-                        format!("Failed to extract file {}: {}", dest.display(), e)
-                    })?;
+            normalized_parts[0].clone()
+        };
+
+        let target_path = dest_dir.join(&relative_path);
+
+        if entry_type.is_dir() {
+            fs::create_dir_all(&target_path)
+                .map_err(|e| format!("Failed to create directory {}: {}", target_path.display(), e))?;
+            let _ = fs::set_permissions(&target_path, fs::Permissions::from_mode(0o755));
+        } else if entry_type.is_file() {
+            file_count += 1;
+            if file_count > max_files {
+                return Err(format!(
+                    "Decompression rejected: archive exceeded file count cap of {}",
+                    max_files
+                ));
             }
+
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!("Failed to create parent dir {}: {}", parent.display(), e)
+                })?;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
+            }
+
+            let mut out_file = File::create(&target_path)
+                .map_err(|e| format!("Failed to create file {}: {}", target_path.display(), e))?;
+            let _ = fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644));
+
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = entry
+                    .read(&mut buf)
+                    .map_err(|e| format!("Decompression read error on {}: {}", relative_path.display(), e))?;
+                if n == 0 {
+                    break;
+                }
+                total_bytes_written += n as u64;
+                if total_bytes_written > max_extracted_bytes {
+                    drop(out_file);
+                    let _ = fs::remove_file(&target_path);
+                    return Err(format!(
+                        "Decompression bomb aborted: extracted bytes exceeded cap of {} bytes",
+                        max_extracted_bytes
+                    ));
+                }
+                out_file
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("Failed writing {}: {}", target_path.display(), e))?;
+            }
+            out_file
+                .flush()
+                .map_err(|e| format!("Failed to flush {}: {}", target_path.display(), e))?;
         }
-
-        let _ = fs::remove_file(&temp_archive_path);
-
-        let info = Self::verify_model_files(model_type, target_dir)?;
-        let completion_msg = format!(
-            "[✓] Successfully installed {} to {}",
-            model_type.folder_name(),
-            target_dir.display()
-        );
-        pb.finish_with_message(completion_msg.clone());
-        println!("{}", completion_msg);
-
-        Ok(info)
     }
+
+    Ok(file_count)
+}
+
+pub fn recover_interrupted_install(model_dir: &Path, model_id: &str) -> Result<(), String> {
+    let old_dir = PathBuf::from(format!("{}.old", model_dir.display()));
+    if old_dir.exists() && !model_dir.exists() {
+        fs::rename(&old_dir, model_dir).map_err(|e| {
+            format!(
+                "Failed to restore interrupted model backup from {}: {}",
+                old_dir.display(),
+                e
+            )
+        })?;
+        println!(
+            "[✓] Restored previous model '{}' from .old backup after an interrupted install.",
+            model_id
+        );
+    } else if old_dir.exists() && model_dir.exists() {
+        let _ = fs::remove_dir_all(&old_dir);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChecksumInfo {
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledModelInfo {
+    pub model_id: String,
+    pub source_url: String,
+    pub archive_sha256: String,
+    pub files: HashMap<String, FileChecksumInfo>,
+    pub license: String,
+    pub license_url: String,
+    pub attribution: String,
+    pub installed_at: String,
+}
+
+impl InstalledModelInfo {
+    pub fn load(model_dir: &Path) -> Result<Self, String> {
+        let path = model_dir.join("MODEL_INFO.json");
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Corrupt {}: {}", path.display(), e))
+    }
+}
+
+pub fn generate_and_save_model_info(
+    manifest_entry: &ModelManifestEntry,
+    archive_sha256: &str,
+    model_dir: &Path,
+) -> Result<(), String> {
+    let mut files_map = HashMap::new();
+    let entries = fs::read_dir(model_dir)
+        .map_err(|e| format!("Failed to read {}: {}", model_dir.display(), e))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if name == "MODEL_INFO.json" {
+                continue;
+            }
+            let size = match fs::metadata(&path) {
+                Ok(m) => m.len(),
+                Err(e) => return Err(format!("Failed to stat {}: {}", path.display(), e)),
+            };
+            let hash = compute_file_sha256(&path)?;
+            files_map.insert(
+                name,
+                FileChecksumInfo {
+                    sha256: hash,
+                    size_bytes: size,
+                },
+            );
+        }
+    }
+
+    let now_ts = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(dur) => dur.as_secs().to_string(),
+        Err(_) => "0".to_string(),
+    };
+
+    let info = InstalledModelInfo {
+        model_id: manifest_entry.id.clone(),
+        source_url: manifest_entry.url.clone(),
+        archive_sha256: archive_sha256.to_string(),
+        files: files_map,
+        license: manifest_entry.license.clone(),
+        license_url: manifest_entry.license_url.clone(),
+        attribution: manifest_entry.attribution.clone(),
+        installed_at: now_ts,
+    };
+
+    let json_content = serde_json::to_string_pretty(&info)
+        .map_err(|e| format!("Failed to serialize MODEL_INFO.json: {}", e))?;
+    let info_path = model_dir.join("MODEL_INFO.json");
+    fs::write(&info_path, json_content)
+        .map_err(|e| format!("Failed to write {}: {}", info_path.display(), e))?;
+
+    Ok(())
+}
+
+pub fn download_and_install_model<F: Fetcher>(
+    model_type: LocalModelType,
+    target_dir: &Path,
+    fetcher: &F,
+    manifest: Option<&ModelsManifest>,
+) -> Result<ModelInfo, String> {
+    let embedded = ModelsManifest::embedded()?;
+    let manifest = manifest.unwrap_or(&embedded);
+    let entry = manifest.get(model_type.folder_name()).ok_or_else(|| {
+        format!(
+            "error: model '{}' does not have a pinned checksum in this build.\nhint: run 'scripts/update-model-manifest.sh' or set up a verified build.",
+            model_type.folder_name()
+        )
+    })?;
+
+    entry.validate_for_download()?;
+
+    println!("Model: {}", model_type.display_name());
+    println!("License: {} ({})", entry.license, entry.license_url);
+    println!("Attribution: {}", entry.attribution);
+
+    let models_root = target_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let staging_root = models_root.join(".staging");
+    fs::create_dir_all(&staging_root).map_err(|e| {
+        format!("Failed to create staging directory {}: {}", staging_root.display(), e)
+    })?;
+
+    clean_stale_staging_dirs(&staging_root);
+
+    let required_bytes = compute_required_disk_space(entry.size_bytes, entry.max_extracted_bytes);
+    check_disk_space(target_dir, required_bytes)?;
+
+    recover_interrupted_install(target_dir, model_type.folder_name())?;
+
+    let pid = std::process::id();
+    let attempt_staging = staging_root.join(format!("{}-{}", model_type.folder_name(), pid));
+    if attempt_staging.exists() {
+        let _ = fs::remove_dir_all(&attempt_staging);
+    }
+    fs::create_dir_all(&attempt_staging).map_err(|e| {
+        format!("Failed to create staging attempt directory {}: {}", attempt_staging.display(), e)
+    })?;
+
+    let archive_path = attempt_staging.join("archive.tar.bz2");
+    let extracted_dir = attempt_staging.join("extracted");
+
+    let pb = ProgressBar::new(entry.size_bytes);
+    let style = ProgressStyle::with_template(
+        "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("##-");
+    pb.set_style(style);
+    pb.set_message("Downloading verified model archive...");
+
+    let mut on_progress = |bytes: u64| {
+        pb.set_position(bytes);
+    };
+
+    let fetch_res = fetcher.fetch(
+        &entry.url,
+        &archive_path,
+        entry.size_bytes,
+        Some(&mut on_progress),
+    );
+
+    let actual_sha256 = match fetch_res {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&attempt_staging);
+            return Err(e);
+        }
+    };
+    pb.finish_with_message("Download complete. Verifying SHA-256 integrity...");
+
+    if !actual_sha256.eq_ignore_ascii_case(&entry.sha256) {
+        let _ = fs::remove_dir_all(&attempt_staging);
+        return Err(format!(
+            "SHA-256 checksum mismatch for '{}': expected {}, got {}. Nothing was extracted.",
+            entry.id, entry.sha256, actual_sha256
+        ));
+    }
+
+    let archive_size = match fs::metadata(&archive_path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&attempt_staging);
+            return Err(format!("Failed to inspect staging archive {}: {}", archive_path.display(), e));
+        }
+    };
+    if archive_size != entry.size_bytes {
+        let _ = fs::remove_dir_all(&attempt_staging);
+        return Err(format!(
+            "Archive size mismatch for '{}': expected {} bytes, got {}. Nothing was extracted.",
+            entry.id, entry.size_bytes, archive_size
+        ));
+    }
+
+    println!("[✓] Checksum verified: {}", actual_sha256);
+    println!("Extracting archive safely...");
+
+    if let Err(e) = safe_extract_tar_bz2(
+        &archive_path,
+        &extracted_dir,
+        entry.max_files,
+        entry.max_extracted_bytes,
+    ) {
+        let _ = fs::remove_dir_all(&attempt_staging);
+        return Err(format!("Safe extraction failed: {}", e));
+    }
+
+    let verified_info = match ModelManager::verify_model_files(model_type, &extracted_dir) {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&attempt_staging);
+            return Err(format!("Extracted assets failed file verification: {}", e));
+        }
+    };
+
+    let old_dir = PathBuf::from(format!("{}.old", target_dir.display()));
+    if old_dir.exists() {
+        let _ = fs::remove_dir_all(&old_dir);
+    }
+
+    let had_previous = target_dir.exists();
+    if had_previous {
+        fs::rename(target_dir, &old_dir).map_err(|e| {
+            let _ = fs::remove_dir_all(&attempt_staging);
+            format!("Failed to backup current model to {}: {}", old_dir.display(), e)
+        })?;
+    }
+
+    if let Err(e) = fs::rename(&extracted_dir, target_dir) {
+        if had_previous && old_dir.exists() {
+            let _ = fs::rename(&old_dir, target_dir);
+        }
+        let _ = fs::remove_dir_all(&attempt_staging);
+        return Err(format!("Failed to promote model directory: {}", e));
+    }
+
+    if old_dir.exists() {
+        let _ = fs::remove_dir_all(&old_dir);
+    }
+
+    if let Err(e) = generate_and_save_model_info(entry, &actual_sha256, target_dir) {
+        eprintln!("Warning: Failed to write MODEL_INFO.json: {}", e);
+    }
+
+    let _ = fs::remove_dir_all(&attempt_staging);
+
+    let completion_msg = format!(
+        "[✓] Successfully installed {} to {}",
+        model_type.folder_name(),
+        target_dir.display()
+    );
+    println!("{}", completion_msg);
+
+    Ok(verified_info)
 }
 
 /// Checks if a model identifier refers to the Sarvam AI cloud provider.

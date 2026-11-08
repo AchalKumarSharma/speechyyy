@@ -19,6 +19,7 @@ tar = "0.4"
 flate2 = "1.0"
 bzip2 = "0.4"
 indicatif = "0.17"
+sha2 = "0.10"
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
 smithay-client-toolkit = "0.21"
 tiny-skia = "0.12"

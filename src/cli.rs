@@ -50,7 +50,11 @@ pub enum Command {
     /// Stream real-time daemon events in NDJSON format
     Events,
     /// Inspect system permissions, audio inputs, and model weights
-    Doctor,
+    Doctor {
+        /// Perform deep integrity check, re-verifying file SHA-256 checksums
+        #[arg(long)]
+        deep: bool,
+    },
     /// List available speech recognition models (alias: model)
     #[command(alias = "model")]
     Models {
@@ -255,7 +259,11 @@ mod tests {
     #[test]
     fn test_parse_doctor() {
         let cli = Cli::try_parse_from(["speechyyy", "doctor"]).expect("parse doctor");
-        assert_eq!(cli.command, Command::Doctor);
+        assert_eq!(cli.command, Command::Doctor { deep: false });
+
+        let cli_deep =
+            Cli::try_parse_from(["speechyyy", "doctor", "--deep"]).expect("parse doctor --deep");
+        assert_eq!(cli_deep.command, Command::Doctor { deep: true });
     }
 
     #[test]

@@ -308,10 +308,19 @@ impl DoctorReport {
 
 pub fn run_doctor<E: SysEnv>(env: &E) -> DoctorReport {
     let config = crate::config::Config::load();
-    run_doctor_with_config(env, &config)
+    run_doctor_opts(env, &config, false, None)
 }
 
 pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config) -> DoctorReport {
+    run_doctor_opts(env, config, false, None)
+}
+
+pub fn run_doctor_opts<E: SysEnv>(
+    env: &E,
+    config: &crate::config::Config,
+    deep: bool,
+    models_dir: Option<&Path>,
+) -> DoctorReport {
     let mut items = Vec::new();
     let mut fix_instructions = Vec::new();
 
@@ -474,6 +483,13 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
         }
     }
 
+    // 7. Installed models integrity check
+    let models_dir_path = match models_dir {
+        Some(d) => d.to_path_buf(),
+        None => crate::model::ModelManager::default_models_dir(),
+    };
+    check_installed_models_integrity(&models_dir_path, deep, &mut items, &mut fix_instructions);
+
     let udev_rule_content =
         r#"# Speechyyy uinput rule for unprivileged virtual keyboard caret injection
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
@@ -485,6 +501,169 @@ KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinpu
         items,
         fix_instructions,
         udev_rule_content,
+    }
+}
+
+pub fn check_installed_models_integrity(
+    models_dir: &Path,
+    deep: bool,
+    items: &mut Vec<DiagnosticItem>,
+    fix_instructions: &mut Vec<String>,
+) {
+    if !models_dir.exists() {
+        return;
+    }
+
+    let entries = match fs::read_dir(models_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        paths.push(entry.path());
+    }
+    paths.sort();
+
+    for path in paths {
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if file_name.starts_with('.') {
+            continue;
+        }
+
+        if file_name.ends_with(".old") && path.is_dir() {
+            let model_name = file_name.trim_end_matches(".old");
+            items.push(DiagnosticItem {
+                name: format!("Dangling backup: {}", file_name),
+                status: CheckStatus::Warn(format!(
+                    "Dangling backup directory detected. Run 'speechyyy download {}' to recover or clean.",
+                    model_name
+                )),
+            });
+            fix_instructions.push(format!(
+                "Re-run 'speechyyy download {}' to resolve the dangling backup directory.",
+                model_name
+            ));
+            continue;
+        }
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        let model_id = file_name;
+        let model_info_path = path.join("MODEL_INFO.json");
+        if !model_info_path.exists() {
+            items.push(DiagnosticItem {
+                name: format!("Installed model '{}'", model_id),
+                status: CheckStatus::Warn(format!(
+                    "unverified legacy install, re-run 'speechyyy download {} -f' to verify",
+                    model_id
+                )),
+            });
+            continue;
+        }
+
+        let content = match fs::read_to_string(&model_info_path) {
+            Ok(c) => c,
+            Err(e) => {
+                items.push(DiagnosticItem {
+                    name: format!("Installed model '{}' (MODEL_INFO.json)", model_id),
+                    status: CheckStatus::Fail(format!("Failed to read MODEL_INFO.json: {}", e)),
+                });
+                fix_instructions.push(format!(
+                    "Re-run 'speechyyy download {} -f' to reinstall and verify model metadata.",
+                    model_id
+                ));
+                continue;
+            }
+        };
+
+        let info: crate::model::InstalledModelInfo = match serde_json::from_str(&content) {
+            Ok(i) => i,
+            Err(e) => {
+                items.push(DiagnosticItem {
+                    name: format!("Installed model '{}' (MODEL_INFO.json)", model_id),
+                    status: CheckStatus::Fail(format!("Corrupt MODEL_INFO.json: {}", e)),
+                });
+                fix_instructions.push(format!(
+                    "Re-run 'speechyyy download {} -f' to reinstall and verify model metadata.",
+                    model_id
+                ));
+                continue;
+            }
+        };
+
+        let mut model_failed = false;
+        let mut model_fail_msg = String::new();
+
+        for (rel_name, file_meta) in &info.files {
+            let file_path = path.join(rel_name);
+            if !file_path.exists() {
+                model_failed = true;
+                model_fail_msg = format!("Missing file '{}'", rel_name);
+                break;
+            }
+
+            let disk_meta = match fs::metadata(&file_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    model_failed = true;
+                    model_fail_msg = format!("Failed to stat file '{}': {}", rel_name, e);
+                    break;
+                }
+            };
+
+            if disk_meta.len() != file_meta.size_bytes {
+                model_failed = true;
+                model_fail_msg = format!(
+                    "File '{}' size mismatch: expected {} bytes, found {}",
+                    rel_name, file_meta.size_bytes, disk_meta.len()
+                );
+                break;
+            }
+
+            if deep {
+                match crate::model::compute_file_sha256(&file_path) {
+                    Ok(hash) => {
+                        if !hash.eq_ignore_ascii_case(&file_meta.sha256) {
+                            model_failed = true;
+                            model_fail_msg = format!(
+                                "File '{}' SHA-256 mismatch (corrupted): expected {}, found {}",
+                                rel_name, file_meta.sha256, hash
+                            );
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        model_failed = true;
+                        model_fail_msg = format!("Failed to hash file '{}': {}", rel_name, e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if model_failed {
+            items.push(DiagnosticItem {
+                name: format!("Installed model '{}'", model_id),
+                status: CheckStatus::Fail(model_fail_msg),
+            });
+            fix_instructions.push(format!(
+                "Re-run 'speechyyy download {} -f' to repair corrupted model files.",
+                model_id
+            ));
+        } else {
+            let check_type = if deep { "verified (deep)" } else { "verified" };
+            items.push(DiagnosticItem {
+                name: format!("Installed model '{}' ({})", model_id, check_type),
+                status: CheckStatus::Pass,
+            });
+        }
     }
 }
 
