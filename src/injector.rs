@@ -849,10 +849,12 @@ pub fn has_wl_copy() -> bool {
 
 pub fn create_injector(config: &crate::config::Config) -> Result<Box<dyn TextInjector>, String> {
     let pacing = Duration::from_millis(config.pacing_delay_ms);
-    let mode = if let Ok(m) = config.injector.method.parse::<crate::config::InjectionMode>() {
-        m
+    let mode = if config.injector.method.eq_ignore_ascii_case("typewriter")
+        || config.injection_mode == crate::config::InjectionMode::Typewriter
+    {
+        crate::config::InjectionMode::Typewriter
     } else {
-        config.injection_mode
+        crate::config::InjectionMode::Clipboard
     };
 
     match mode {
@@ -861,18 +863,10 @@ pub fn create_injector(config: &crate::config::Config) -> Result<Box<dyn TextInj
                 eprintln!("[!] Warning: 'wl-copy' is missing from PATH.");
                 eprintln!("[!] Falling back to Typewriter injection mode for this session.");
                 eprintln!("[!] Install 'wl-clipboard' to enable direct clipboard pasting.");
-                match UinputInjector::new(pacing) {
-                    Ok(inj) => Ok(Box::new(inj.with_mode(InjectionMode::Typewriter {
-                        delay_ms: config.pacing_delay_ms,
-                    }))),
-                    Err(e) => {
-                        eprintln!(
-                            "UinputInjector initialization failed ({}); attempting Wayland clipboard injector",
-                            e
-                        );
-                        Ok(Box::new(WaylandClipboardInjector::new(pacing)))
-                    }
-                }
+                let inj = UinputInjector::new(pacing)?.with_mode(InjectionMode::Typewriter {
+                    delay_ms: config.pacing_delay_ms,
+                });
+                Ok(Box::new(inj))
             } else {
                 Ok(Box::new(WaylandClipboardInjector::new(pacing)))
             }

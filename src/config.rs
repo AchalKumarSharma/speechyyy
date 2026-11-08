@@ -153,11 +153,16 @@ fn default_pacing_ms() -> u64 {
     15
 }
 
+/// Delivery mechanism for emitting dictation into the focused window/caret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InjectionMode {
+    /// Fast paste via `Ctrl+V`; leaves the transcription in the clipboard and is immune
+    /// to browser hotkey hijacking. Does not work in most terminals (they need `Ctrl+Shift+V`).
     #[default]
     Clipboard,
+    /// Character-by-character typing via `/dev/uinput`. Works in terminals, but triggers
+    /// page shortcuts if no text field is focused.
     Typewriter,
 }
 
@@ -329,6 +334,7 @@ fn default_ui_config() -> UiConfig {
 pub struct Config {
     pub hotkey: String,
     pub pacing_delay_ms: u64,
+    /// Active text injection mode (`clipboard` paste vs `typewriter` uinput typing).
     #[serde(default)]
     pub injection_mode: InjectionMode,
     pub input: InputConfig,
