@@ -1,4 +1,5 @@
 use crate::engine::{Modifier, TargetChord};
+use crate::inference::wire::Secret;
 use evdev::KeyCode;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -252,18 +253,47 @@ pub struct CustomModelConfig {
     pub tokens: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Config,
+    Env,
+}
+
+impl std::fmt::Display for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeySource::Config => write!(f, "config"),
+            KeySource::Env => write!(f, "environment"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferenceConfig {
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default, alias = "sarvam_api_key")]
-    pub api_key: String,
+    pub api_key: Secret,
     #[serde(default = "default_model", alias = "sarvam_model")]
     pub model: String,
     #[serde(default = "default_language_code")]
     pub language_code: String,
     #[serde(default = "default_mode", alias = "sarvam_mode")]
     pub mode: String,
+    #[serde(default)]
+    pub groq_api_key: Option<Secret>,
+    #[serde(default)]
+    pub openai_api_key: Option<Secret>,
+    #[serde(default)]
+    pub openai_compatible_endpoint: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_model: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_api_key: Option<Secret>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
     #[serde(default)]
     pub custom: Option<CustomModelConfig>,
 }
@@ -272,24 +302,84 @@ impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             provider: default_provider(),
-            api_key: String::new(),
+            api_key: Secret::default(),
             model: default_model(),
             language_code: default_language_code(),
             mode: default_mode(),
+            groq_api_key: None,
+            openai_api_key: None,
+            openai_compatible_endpoint: None,
+            openai_compatible_model: None,
+            openai_compatible_api_key: None,
+            language: None,
+            request_timeout_secs: None,
             custom: None,
         }
     }
 }
 
 impl InferenceConfig {
-    pub fn resolve_api_key(&self) -> Option<String> {
-        if !self.api_key.trim().is_empty() {
-            Some(self.api_key.trim().to_string())
-        } else {
-            std::env::var("SARVAM_API_KEY")
-                .ok()
-                .filter(|k| !k.trim().is_empty())
+    /// Pure key resolution function:
+    /// - Returns Option<(Secret, KeySource)>
+    /// - For sarvam: config api_key, env SARVAM_API_KEY
+    /// - For groq: config groq_api_key, env GROQ_API_KEY
+    /// - For openai: config openai_api_key, env OPENAI_API_KEY
+    /// - For openai-compatible: config openai_compatible_api_key, env OPENAI_COMPATIBLE_API_KEY (optional: None if missing)
+    /// - Strict isolation: a Sarvam key must never resolve for Groq or OpenAI, and vice versa.
+    /// - Empty strings count as unset.
+    pub fn resolve_key_for_provider(&self, provider: &str) -> Option<(Secret, KeySource)> {
+        match provider.to_lowercase().as_str() {
+            "sarvam" => {
+                if !self.api_key.trim().is_empty() {
+                    Some((self.api_key.clone(), KeySource::Config))
+                } else {
+                    std::env::var("SARVAM_API_KEY")
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .map(|k| (Secret::new(k.trim()), KeySource::Env))
+                }
+            }
+            "groq" => {
+                if let Some(k) = self.groq_api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    Some((k.clone(), KeySource::Config))
+                } else {
+                    std::env::var("GROQ_API_KEY")
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .map(|k| (Secret::new(k.trim()), KeySource::Env))
+                }
+            }
+            "openai" => {
+                if let Some(k) = self.openai_api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    Some((k.clone(), KeySource::Config))
+                } else {
+                    std::env::var("OPENAI_API_KEY")
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .map(|k| (Secret::new(k.trim()), KeySource::Env))
+                }
+            }
+            "openai-compatible" => {
+                if let Some(k) = self.openai_compatible_api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    Some((k.clone(), KeySource::Config))
+                } else {
+                    std::env::var("OPENAI_COMPATIBLE_API_KEY")
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .map(|k| (Secret::new(k.trim()), KeySource::Env))
+                }
+            }
+            _ => None,
         }
+    }
+
+    pub fn resolve_provider_key(&self) -> Option<(Secret, KeySource)> {
+        self.resolve_key_for_provider(&self.provider)
+    }
+
+    pub fn resolve_api_key(&self) -> Option<String> {
+        self.resolve_key_for_provider("sarvam")
+            .map(|(k, _)| k.expose().to_string())
     }
 }
 
@@ -382,7 +472,7 @@ impl From<RawConfig> for Config {
             inference.provider = p;
         }
         if let Some(k) = raw.sarvam_api_key {
-            inference.api_key = k;
+            inference.api_key = Secret::new(k);
         }
         if let Some(m) = raw.sarvam_mode {
             inference.mode = m;
@@ -538,7 +628,11 @@ impl Config {
         write_secure_config(path, &table)
     }
 
-    pub fn save_sarvam_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+    fn mutate_inference_table<F: FnOnce(&mut toml::Table)>(
+        path: &Path,
+        cleanup_legacy: bool,
+        f: F,
+    ) -> Result<(), String> {
         let mut table = read_toml_table(path)?;
 
         let inf_val = table
@@ -546,18 +640,67 @@ impl Config {
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
 
         if let toml::Value::Table(ref mut inf_table) = inf_val {
-            inf_table.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
+            f(inf_table);
         } else {
             let mut inf_table = toml::Table::new();
-            inf_table.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
+            f(&mut inf_table);
             table.insert("inference".into(), toml::Value::Table(inf_table));
         }
 
-        table.remove("provider");
-        table.remove("sarvam_api_key");
-        table.remove("sarvam_model");
+        if cleanup_legacy {
+            table.remove("provider");
+            table.remove("sarvam_api_key");
+            table.remove("sarvam_model");
+        }
 
         write_secure_config(path, &table)
+    }
+
+    pub fn save_sarvam_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+        Self::mutate_inference_table(path, true, |inf| {
+            inf.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
+        })
+    }
+
+    pub fn save_groq_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+        Self::mutate_inference_table(path, false, |inf| {
+            inf.insert("groq_api_key".into(), toml::Value::String(api_key.trim().to_string()));
+        })
+    }
+
+    pub fn save_openai_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+        Self::mutate_inference_table(path, false, |inf| {
+            inf.insert("openai_api_key".into(), toml::Value::String(api_key.trim().to_string()));
+        })
+    }
+
+    pub fn save_openai_compatible_config_in_file(
+        path: &Path,
+        endpoint: &str,
+        model: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Result<(), String> {
+        Self::mutate_inference_table(path, false, |inf| {
+            inf.insert(
+                "openai_compatible_endpoint".into(),
+                toml::Value::String(endpoint.trim().to_string()),
+            );
+            if let Some(m) = model {
+                inf.insert(
+                    "openai_compatible_model".into(),
+                    toml::Value::String(m.trim().to_string()),
+                );
+            }
+            if let Some(k) = api_key {
+                let trimmed = k.trim();
+                if !trimmed.is_empty() {
+                    inf.insert(
+                        "openai_compatible_api_key".into(),
+                        toml::Value::String(trimmed.to_string()),
+                    );
+                }
+            }
+        })
     }
 
     pub fn to_target_chord(&self) -> TargetChord {
@@ -621,31 +764,58 @@ fn write_secure_config(path: &Path, table: &toml::Table) -> Result<(), String> {
     let serialized = toml::to_string_pretty(&toml::Value::Table(table.clone()))
         .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
 
+    let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_path = parent_dir.join(format!(
+        ".config.toml.tmp.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         let mut file = fs::OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .mode(0o600)
-            .open(path)
-            .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+            .open(&temp_path)
+            .map_err(|e| {
+                format!(
+                    "Failed to create secure temp config {}: {}",
+                    temp_path.display(),
+                    e
+                )
+            })?;
 
-        file.write_all(serialized.as_bytes())
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        file.write_all(serialized.as_bytes()).map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            format!("Failed to write to {}: {}", temp_path.display(), e)
+        })?;
 
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Failed to set permissions on {}: {}", path.display(), e))?;
+        file.sync_all().map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            format!("Failed to sync {}: {}", temp_path.display(), e)
+        })?;
     }
 
     #[cfg(not(unix))]
     {
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        fs::write(&temp_path, &serialized)
+            .map_err(|e| format!("Failed to write to {}: {}", temp_path.display(), e))?;
     }
+
+    fs::rename(&temp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "Failed to atomically rename config to {}: {}",
+            path.display(),
+            e
+        )
+    })?;
 
     Ok(())
 }

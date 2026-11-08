@@ -1,15 +1,18 @@
 use crate::audio::AudioChunk;
-use crate::audio::wav::encode_wav_16k_mono;
+use crate::inference::wire::{build_in_memory_wav, Secret};
 use crate::inference::{InferenceError, SpeechInference};
 use serde::Deserialize;
+
+pub use crate::inference::wire::build_multipart_body;
 
 pub const DEFAULT_SARVAM_ENDPOINT: &str = "https://api.sarvam.ai/speech-to-text";
 pub const DEFAULT_SARVAM_MODEL: &str = "saaras:v4";
 pub const DEFAULT_SARVAM_MODE: &str = "translit";
 pub const DEFAULT_SARVAM_LANGUAGE: &str = "unknown";
 
+#[derive(Debug)]
 pub struct SarvamSpeechInference {
-    pub api_key: String,
+    pub api_key: Secret,
     pub model: String,
     pub language_code: String,
     pub mode: String,
@@ -18,8 +21,8 @@ pub struct SarvamSpeechInference {
 }
 
 impl SarvamSpeechInference {
-    pub fn new(api_key: String, model: String, language_code: String, mode: String) -> Self {
-        let sanitized_key = api_key.trim().trim_matches('"').to_string();
+    pub fn new(api_key: Secret, model: String, language_code: String, mode: String) -> Self {
+        let sanitized_key = Secret::new(api_key.expose().trim().trim_matches('"'));
         Self {
             api_key: sanitized_key,
             model,
@@ -35,7 +38,7 @@ impl SarvamSpeechInference {
             InferenceError::MissingApiKey("SARVAM_API_KEY is not configured".to_string())
         })?;
         Ok(Self::new(
-            api_key,
+            Secret::new(api_key),
             config.model.clone(),
             config.language_code.clone(),
             config.mode.clone(),
@@ -60,57 +63,13 @@ pub struct SarvamResponse {
     pub language_code: Option<String>,
 }
 
-/// Constructs a valid RFC 7578 multipart/form-data payload with boundaries.
-pub fn build_multipart_body(
-    boundary: &str,
-    wav_bytes: &[u8],
-    model: &str,
-    mode: &str,
-    language_code: &str,
-) -> Vec<u8> {
-    let mut body = Vec::new();
-
-    // 1. file field
-    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    body.extend_from_slice(
-        b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
-    );
-    body.extend_from_slice(b"Content-Type: audio/wav\r\n\r\n");
-    body.extend_from_slice(wav_bytes);
-    body.extend_from_slice(b"\r\n");
-
-    // 2. model field
-    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
-    body.extend_from_slice(model.as_bytes());
-    body.extend_from_slice(b"\r\n");
-
-    // 3. mode field
-    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"mode\"\r\n\r\n");
-    body.extend_from_slice(mode.as_bytes());
-    body.extend_from_slice(b"\r\n");
-
-    // 4. language_code field (if not "unknown" or empty)
-    if !language_code.is_empty() && language_code != "unknown" {
-        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-        body.extend_from_slice(b"Content-Disposition: form-data; name=\"language_code\"\r\n\r\n");
-        body.extend_from_slice(language_code.as_bytes());
-        body.extend_from_slice(b"\r\n");
-    }
-
-    // End boundary
-    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
-    body
-}
-
 impl SpeechInference for SarvamSpeechInference {
     fn transcribe(&mut self, chunk: &AudioChunk) -> Result<String, InferenceError> {
         if self.api_key.is_empty() {
             return Err(InferenceError::MissingApiKey("SARVAM_API_KEY".to_string()));
         }
 
-        let wav_bytes = encode_wav_16k_mono(&chunk.samples);
+        let wav_bytes = build_in_memory_wav(&chunk.samples);
         let boundary = format!(
             "----Speechyyy{:x}",
             std::time::SystemTime::now()
@@ -134,7 +93,7 @@ impl SpeechInference for SarvamSpeechInference {
 
         let response = agent
             .post(&self.endpoint)
-            .set("api-subscription-key", &self.api_key)
+            .set("api-subscription-key", self.api_key.expose())
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={}", boundary),

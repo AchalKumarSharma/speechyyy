@@ -132,15 +132,19 @@ pub fn mask_credential(key: &str) -> String {
 }
 
 pub fn check_inference_for_config(config: &crate::config::Config) -> Result<String, String> {
-    if config.inference.provider != "mock"
-        && config.inference.provider != "custom"
+    let prov = config.inference.provider.to_lowercase();
+    if prov != "mock"
+        && prov != "custom"
+        && prov != "groq"
+        && prov != "openai"
+        && prov != "openai-compatible"
         && config.inference.model.trim().is_empty()
     {
         return Err(
             "No active model configured. Run 'speechyyy use <model>' to choose one.".to_string(),
         );
     }
-    match config.inference.provider.to_lowercase().as_str() {
+    match prov.as_str() {
         "sarvam" => {
             if let Some(key) = config.inference.resolve_api_key() {
                 let masked = mask_credential(&key);
@@ -151,6 +155,84 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
                         .into(),
                 )
             }
+        }
+        "groq" => {
+            let key_info = config.inference.resolve_key_for_provider("groq");
+            match key_info {
+                Some((_, source)) => {
+                    let endpoint = crate::inference::DEFAULT_GROQ_ENDPOINT;
+                    let policy_ok = crate::inference::validate_endpoint(endpoint).is_ok();
+                    let host = crate::inference::extract_endpoint_host(endpoint)
+                        .unwrap_or_else(|| "api.groq.com".into());
+                    Ok(format!(
+                        "Groq: key configured (source: {}), host: {} (policy: {})",
+                        source,
+                        host,
+                        if policy_ok { "valid HTTPS" } else { "invalid" }
+                    ))
+                }
+                None => Err(
+                    "Groq API key missing. Set GROQ_API_KEY in config.toml or environment. Run 'speechyyy use groq' to set it.".into(),
+                ),
+            }
+        }
+        "openai" => {
+            let key_info = config.inference.resolve_key_for_provider("openai");
+            match key_info {
+                Some((_, source)) => {
+                    let endpoint = crate::inference::DEFAULT_OPENAI_ENDPOINT;
+                    let policy_ok = crate::inference::validate_endpoint(endpoint).is_ok();
+                    let host = crate::inference::extract_endpoint_host(endpoint)
+                        .unwrap_or_else(|| "api.openai.com".into());
+                    Ok(format!(
+                        "OpenAI: key configured (source: {}), host: {} (policy: {})",
+                        source,
+                        host,
+                        if policy_ok { "valid HTTPS" } else { "invalid" }
+                    ))
+                }
+                None => Err(
+                    "OpenAI API key missing. Set OPENAI_API_KEY in config.toml or environment. Run 'speechyyy use openai' to set it.".into(),
+                ),
+            }
+        }
+        "openai-compatible" => {
+            let endpoint = match config
+                .inference
+                .openai_compatible_endpoint
+                .as_deref()
+                .filter(|e| !e.trim().is_empty())
+            {
+                Some(e) => e,
+                None => {
+                    return Err(
+                        "OpenAI-compatible endpoint missing. Set 'openai_compatible_endpoint' in config.toml or run 'speechyyy use openai-compatible'.".into(),
+                    )
+                }
+            };
+            let policy_result = match crate::inference::validate_endpoint(endpoint) {
+                Ok(_) => {
+                    let host = crate::inference::extract_endpoint_host(endpoint)
+                        .unwrap_or_else(|| "endpoint".into());
+                    let is_loopback = crate::inference::is_loopback_host(&host);
+                    if is_loopback {
+                        "valid loopback HTTP"
+                    } else {
+                        "valid HTTPS"
+                    }
+                }
+                Err(err) => return Err(format!("Invalid OpenAI-compatible endpoint: {}", err)),
+            };
+            let host = crate::inference::extract_endpoint_host(endpoint)
+                .unwrap_or_else(|| "endpoint".into());
+            let key_status = match config.inference.resolve_key_for_provider("openai-compatible") {
+                Some((_, source)) => format!("key configured (source: {})", source),
+                None => "no key (keyless)".to_string(),
+            };
+            Ok(format!(
+                "OpenAI-compatible: {}, host: {} (policy: {})",
+                key_status, host, policy_result
+            ))
         }
         "mock" => Ok("Mock provider (mock)".into()),
         "local" => {
@@ -271,7 +353,7 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
         #[cfg(not(target_os = "macos"))]
         "apple" => Err("Apple Speech provider is only supported on macOS".into()),
         other => Err(format!(
-            "Unknown inference provider '{}'. Supported providers are 'mock', 'sarvam', 'local', 'custom'{}.",
+            "Unknown inference provider '{}'. Supported providers are 'mock', 'sarvam', 'groq', 'openai', 'openai-compatible', 'local', 'custom'{}.",
             other,
             if cfg!(target_os = "macos") { ", 'apple'" } else { "" }
         )),

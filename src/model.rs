@@ -987,12 +987,20 @@ pub fn is_sarvam_cloud_model(name: &str) -> bool {
     )
 }
 
+/// Checks if a model identifier refers to another cloud provider (Groq or OpenAI).
+pub fn is_cloud_provider(name: &str) -> bool {
+    matches!(
+        name.trim().to_lowercase().replace('_', "-").as_str(),
+        "groq" | "openai"
+    )
+}
+
 /// Generates a descriptive error message listing all supported local and cloud models.
 pub fn unsupported_model_error(model: &str) -> String {
     #[cfg(target_os = "macos")]
-    let supported = "Cloud: saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base, apple-speech.";
+    let supported = "Cloud: groq, openai, openai-compatible, saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base, apple-speech.";
     #[cfg(not(target_os = "macos"))]
-    let supported = "Cloud: saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base.";
+    let supported = "Cloud: groq, openai, openai-compatible, saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base.";
     format!(
         "Unsupported model '{}'. Supported models: {}",
         model, supported
@@ -1075,6 +1083,57 @@ where
             "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
             nickname
         );
+        Ok(())
+    } else if is_cloud_provider(trimmed) {
+        let (prov_name, env_var) = if trimmed.eq_ignore_ascii_case("groq") {
+            ("Groq", "GROQ_API_KEY")
+        } else {
+            ("OpenAI", "OPENAI_API_KEY")
+        };
+        let key_opt = cfg.inference.resolve_key_for_provider(trimmed);
+        println!(
+            "[i] {} is a cloud provider — there are no weights to download onto your machine.",
+            prov_name
+        );
+        match key_opt {
+            Some((_, source)) => {
+                println!("[✓] {} API key is configured (source: {}).", prov_name, source);
+                println!(
+                    "[✓] Run 'speechyyy use {}' whenever you want me to speak it, {}!",
+                    trimmed.to_lowercase(),
+                    nickname
+                );
+            }
+            None => {
+                println!("[!] No {} API key is configured.", prov_name);
+                use std::io::{stdin, IsTerminal};
+                if stdin().is_terminal() {
+                    let raw_key = prompt_key_fn()?;
+                    let key = raw_key.trim().trim_matches('"');
+                    if !key.is_empty() {
+                        if trimmed.eq_ignore_ascii_case("groq") {
+                            crate::config::Config::save_groq_credentials_in_file(config_path, key)?;
+                        } else {
+                            crate::config::Config::save_openai_credentials_in_file(config_path, key)?;
+                        }
+                        println!("[✓] {} API key configured successfully.", prov_name);
+                        println!(
+                            "[✓] Run 'speechyyy use {}' whenever you want me to speak it, {}!",
+                            trimmed.to_lowercase(),
+                            nickname
+                        );
+                    } else {
+                        println!("[!] Blank key entered. Configuration unchanged.");
+                    }
+                } else {
+                    println!(
+                        "[i] To configure, set {} in your environment or run 'speechyyy use {}' in an interactive terminal.",
+                        env_var,
+                        trimmed.to_lowercase()
+                    );
+                }
+            }
+        }
         Ok(())
     } else if let Some(local_type) = LocalModelType::from_str_name(trimmed) {
         let target_dir = match models_dir {
@@ -1264,6 +1323,61 @@ pub fn resolve_model_use(
 ) -> Result<(String, String, Option<String>), String> {
     let lower = model_arg.trim().to_lowercase().replace('_', "-");
     match lower.as_str() {
+        "groq" => {
+            let cfg = match config_path {
+                Some(p) => crate::config::Config::load_from_path(p),
+                None => crate::config::Config::load(),
+            };
+            let has_key = cfg.inference.resolve_key_for_provider("groq").is_some();
+            let notice = if !has_key {
+                Some("[!] No Groq API key found. Set GROQ_API_KEY in config.toml or environment.".to_string())
+            } else {
+                None
+            };
+            Ok((
+                "groq".to_string(),
+                crate::inference::DEFAULT_GROQ_MODEL.to_string(),
+                notice,
+            ))
+        }
+        "openai" => {
+            let cfg = match config_path {
+                Some(p) => crate::config::Config::load_from_path(p),
+                None => crate::config::Config::load(),
+            };
+            let has_key = cfg.inference.resolve_key_for_provider("openai").is_some();
+            let notice = if !has_key {
+                Some("[!] No OpenAI API key found. Set OPENAI_API_KEY in config.toml or environment.".to_string())
+            } else {
+                None
+            };
+            Ok((
+                "openai".to_string(),
+                crate::inference::DEFAULT_OPENAI_MODEL.to_string(),
+                notice,
+            ))
+        }
+        "openai-compatible" => {
+            let cfg = match config_path {
+                Some(p) => crate::config::Config::load_from_path(p),
+                None => crate::config::Config::load(),
+            };
+            let has_endpoint = cfg
+                .inference
+                .openai_compatible_endpoint
+                .as_ref()
+                .is_some_and(|e| !e.trim().is_empty());
+            let notice = if !has_endpoint {
+                Some("[!] No OpenAI-compatible endpoint configured. Set 'openai_compatible_endpoint' in config.toml.".to_string())
+            } else {
+                None
+            };
+            let model = cfg
+                .inference
+                .openai_compatible_model
+                .unwrap_or_else(|| crate::inference::DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string());
+            Ok(("openai-compatible".to_string(), model, notice))
+        }
         s if is_sarvam_cloud_model(s) => {
             let cfg = match config_path {
                 Some(p) => crate::config::Config::load_from_path(p),
@@ -1357,6 +1471,86 @@ pub fn handle_model_use_command_internal(
 
 pub fn handle_model_use_command(model_arg: &str) -> Result<(), String> {
     let config_path = crate::config::Config::config_path();
+    let lower = model_arg.trim().to_lowercase().replace('_', "-");
+
+    // 1. If key / endpoint missing for cloud providers, prompt interactively
+    if lower == "groq" {
+        let cfg = crate::config::Config::load_from_path(&config_path);
+        if cfg.inference.resolve_key_for_provider("groq").is_none() {
+            use std::io::{stdin, IsTerminal};
+            if !stdin().is_terminal() {
+                return Err("GROQ_API_KEY is not configured. Set GROQ_API_KEY in environment or run 'speechyyy use groq' in an interactive terminal.".to_string());
+            }
+            let key = rpassword::prompt_password("✦ Enter your Groq API Key: ")
+                .map_err(|e| format!("Failed to read API key: {}", e))?;
+            let trimmed = key.trim().trim_matches('"');
+            if trimmed.is_empty() {
+                return Err("Blank entry. Cancelled — configuration unchanged.".to_string());
+            }
+            crate::config::Config::save_groq_credentials_in_file(&config_path, trimmed)?;
+        }
+    } else if lower == "openai" {
+        let cfg = crate::config::Config::load_from_path(&config_path);
+        if cfg.inference.resolve_key_for_provider("openai").is_none() {
+            use std::io::{stdin, IsTerminal};
+            if !stdin().is_terminal() {
+                return Err("OPENAI_API_KEY is not configured. Set OPENAI_API_KEY in environment or run 'speechyyy use openai' in an interactive terminal.".to_string());
+            }
+            let key = rpassword::prompt_password("✦ Enter your OpenAI API Key: ")
+                .map_err(|e| format!("Failed to read API key: {}", e))?;
+            let trimmed = key.trim().trim_matches('"');
+            if trimmed.is_empty() {
+                return Err("Blank entry. Cancelled — configuration unchanged.".to_string());
+            }
+            crate::config::Config::save_openai_credentials_in_file(&config_path, trimmed)?;
+        }
+    } else if lower == "openai-compatible" {
+        let cfg = crate::config::Config::load_from_path(&config_path);
+        if cfg
+            .inference
+            .openai_compatible_endpoint
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            use std::io::{stdin, stdout, IsTerminal, Write};
+            if !stdin().is_terminal() {
+                return Err("OpenAI-compatible endpoint is not configured. Set 'openai_compatible_endpoint' in config.toml or run 'speechyyy use openai-compatible' in an interactive terminal.".to_string());
+            }
+            print!("✦ Enter your OpenAI-compatible endpoint URL (e.g. http://localhost:11434/v1): ");
+            let _ = stdout().flush();
+            let mut line = String::new();
+            stdin()
+                .read_line(&mut line)
+                .map_err(|e| format!("Failed to read endpoint: {}", e))?;
+            let endpoint = line.trim();
+            if endpoint.is_empty() {
+                return Err("Blank entry. Cancelled — configuration unchanged.".to_string());
+            }
+            crate::inference::validate_endpoint(endpoint)
+                .map_err(|e| format!("Invalid endpoint: {}", e))?;
+
+            let key_input = rpassword::prompt_password(
+                "✦ Enter an optional API Key (press Enter to skip): ",
+            )
+            .unwrap_or_default();
+            let trimmed_key = key_input.trim().trim_matches('"');
+            let key_opt = if trimmed_key.is_empty() {
+                None
+            } else {
+                Some(trimmed_key)
+            };
+
+            crate::config::Config::save_openai_compatible_config_in_file(
+                &config_path,
+                endpoint,
+                Some("whisper-1"),
+                key_opt,
+            )?;
+        }
+    }
+
     let result = handle_model_use_command_internal(
         model_arg,
         &config_path,
@@ -1367,9 +1561,39 @@ pub fn handle_model_use_command(model_arg: &str) -> Result<(), String> {
         println!("{}", notice);
     }
 
-    let config = crate::config::Config::load_from_path(&config_path);
-    let nickname = config.nickname();
+    // Privacy notice
+    let cfg = crate::config::Config::load_from_path(&config_path);
+    match result.provider.as_str() {
+        "groq" => {
+            println!("[i] Privacy notice: Audio will be streamed to api.groq.com for transcription.");
+        }
+        "openai" => {
+            println!("[i] Privacy notice: Audio will be streamed to api.openai.com for transcription.");
+        }
+        "sarvam" => {
+            println!("[i] Privacy notice: Audio will be streamed to api.sarvam.ai for transcription.");
+        }
+        "openai-compatible" => {
+            if let Some(endpoint) = cfg.inference.openai_compatible_endpoint.as_deref() {
+                let host = crate::inference::extract_endpoint_host(endpoint)
+                    .unwrap_or_else(|| "endpoint".to_string());
+                if crate::inference::is_loopback_host(&host) {
+                    println!(
+                        "[i] Privacy notice: Audio stays on this machine ({}) — no external network calls.",
+                        host
+                    );
+                } else {
+                    println!(
+                        "[i] Privacy notice: Audio will be streamed to {} for transcription.",
+                        host
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
 
+    let nickname = cfg.nickname();
     let paths = crate::ipc::RuntimePaths::new();
     let is_running = crate::ipc::PidFile::read_pid(&paths.pid_path)
         .is_some_and(crate::ipc::PidFile::is_process_running);

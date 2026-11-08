@@ -947,6 +947,8 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
                 println!("  State:        {}", state);
                 println!("  Hotkey:       {}", hotkey);
                 println!("  Pacing Delay: {}ms", pacing_delay_ms);
+                println!("  Provider:     {}", config.inference.provider);
+                println!("  Model:        {}", config.inference.model);
                 println!("  Socket:       {}", paths.socket_path.display());
                 return Ok(());
             }
@@ -967,6 +969,8 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
                 "[ACTIVE] Speechyyy is active and ready for you, {} (PID: {}).",
                 nickname, pid
             );
+            println!("  Provider:     {}", config.inference.provider);
+            println!("  Model:        {}", config.inference.model);
             return Ok(());
         }
     }
@@ -975,6 +979,8 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
         "[INACTIVE] Speechyyy is sleeping, {}. Run 'speechyyy start' to wake me up.",
         nickname
     );
+    println!("  Provider:     {}", config.inference.provider);
+    println!("  Model:        {}", config.inference.model);
     Ok(())
 }
 
