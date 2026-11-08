@@ -1,6 +1,6 @@
 use evdev::KeyCode;
 use speechyyy::config::Config;
-use speechyyy::injector::{char_to_key, KeyStroke, RecordingInjector, TextInjector};
+use speechyyy::injector::{char_to_key, is_whitespace_or_empty, KeyStroke, RecordingInjector, TextInjector};
 use std::time::Duration;
 
 #[test]
@@ -324,7 +324,7 @@ fn test_typewriter_shift_chord_verification() {
 fn test_typewriter_whitespace_and_digits() {
     use speechyyy::injector::InjectionMode;
 
-    let test_chars = [
+    let test_digits = [
         ('0', KeyCode::KEY_0),
         ('1', KeyCode::KEY_1),
         ('2', KeyCode::KEY_2),
@@ -335,16 +335,13 @@ fn test_typewriter_whitespace_and_digits() {
         ('7', KeyCode::KEY_7),
         ('8', KeyCode::KEY_8),
         ('9', KeyCode::KEY_9),
-        (' ', KeyCode::KEY_SPACE),
-        ('\t', KeyCode::KEY_TAB),
-        ('\n', KeyCode::KEY_ENTER),
     ];
 
-    for (c, expected_key) in test_chars {
+    for (c, expected_key) in test_digits {
         let mut injector =
             RecordingInjector::with_mode(InjectionMode::Typewriter { delay_ms: 0 }, false);
         let s = c.to_string();
-        injector.inject(&s).expect("inject whitespace/digit");
+        injector.inject(&s).expect("inject digit");
 
         let events = injector.emitted_events.lock().unwrap().clone();
         assert_eq!(
@@ -357,6 +354,42 @@ fn test_typewriter_whitespace_and_digits() {
         assert!(events[0].is_down);
         assert_eq!(events[1].key, expected_key);
         assert!(!events[1].is_down);
+
+        // Assert Shift is NOT emitted
+        for ev in &events {
+            assert_ne!(
+                ev.key,
+                KeyCode::KEY_LEFTSHIFT,
+                "Shift must not be emitted for '{}'",
+                c
+            );
+        }
+    }
+
+    let test_whitespace = [
+        (' ', KeyCode::KEY_SPACE),
+        ('\t', KeyCode::KEY_TAB),
+        ('\n', KeyCode::KEY_ENTER),
+    ];
+
+    for (c, expected_key) in test_whitespace {
+        let mut injector =
+            RecordingInjector::with_mode(InjectionMode::Typewriter { delay_ms: 0 }, false);
+        // Non-empty string with leading digit to ensure whitespace character is emitted
+        let s = format!("1{}", c);
+        injector.inject(&s).expect("inject whitespace with prefix");
+
+        let events = injector.emitted_events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            4,
+            "Character '{}' with digit prefix must emit exactly 4 events without Shift",
+            c
+        );
+        assert_eq!(events[2].key, expected_key);
+        assert!(events[2].is_down);
+        assert_eq!(events[3].key, expected_key);
+        assert!(!events[3].is_down);
 
         // Assert Shift is NOT emitted
         for ev in &events {
@@ -482,4 +515,50 @@ fn test_create_injector_supports_typewriter_method() {
             );
         }
     }
+}
+
+#[test]
+fn test_empty_text_skips_emission() {
+    let mut injector = RecordingInjector::new(Duration::ZERO);
+
+    assert!(is_whitespace_or_empty(""));
+    assert!(is_whitespace_or_empty("   "));
+    assert!(is_whitespace_or_empty("\n\t "));
+
+    assert!(injector.inject("").is_ok());
+    assert_eq!(injector.emitted_events.lock().unwrap().len(), 0);
+    assert_eq!(injector.injected_strings.lock().unwrap().len(), 0);
+
+    assert!(injector.inject("   ").is_ok());
+    assert_eq!(injector.emitted_events.lock().unwrap().len(), 0);
+    assert_eq!(injector.injected_strings.lock().unwrap().len(), 0);
+
+    assert!(injector.inject("\n\t ").is_ok());
+    assert_eq!(injector.emitted_events.lock().unwrap().len(), 0);
+    assert_eq!(injector.injected_strings.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn test_non_empty_text_is_unchanged() {
+    let mut injector = RecordingInjector::new(Duration::ZERO);
+
+    assert!(!is_whitespace_or_empty("hello"));
+    assert!(!is_whitespace_or_empty(" hello "));
+
+    injector.inject("hello").unwrap();
+    let events_hello = injector.emitted_events.lock().unwrap().clone();
+    assert!(!events_hello.is_empty());
+    // 'h', 'e', 'l', 'l', 'o' -> 5 characters, each has down and up = 10 events
+    assert_eq!(events_hello.len(), 10);
+
+    let mut injector2 = RecordingInjector::new(Duration::ZERO);
+    injector2.inject(" hello ").unwrap();
+    let events_spaced = injector2.emitted_events.lock().unwrap().clone();
+    // space, 'h', 'e', 'l', 'l', 'o', space -> 7 characters = 14 events
+    assert_eq!(events_spaced.len(), 14);
+    // First event is space down, last is space up
+    assert_eq!(events_spaced[0].key, KeyCode::KEY_SPACE);
+    assert!(events_spaced[0].is_down);
+    assert_eq!(events_spaced[13].key, KeyCode::KEY_SPACE);
+    assert!(!events_spaced[13].is_down);
 }

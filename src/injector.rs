@@ -30,6 +30,11 @@ pub trait TextInjector: Send + Sync {
     }
 }
 
+/// Returns true if text is empty or contains only whitespace characters.
+pub fn is_whitespace_or_empty(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
 impl TextInjector for Box<dyn TextInjector> {
     fn inject(&mut self, text: &str) -> Result<(), String> {
         (**self).inject(text)
@@ -282,6 +287,11 @@ impl RecordingInjector {
 
 impl TextInjector for RecordingInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
+        if is_whitespace_or_empty(text) {
+            eprintln!("debug: Skipping keystroke injection on empty / whitespace text");
+            return Ok(());
+        }
+
         self.injected_strings.lock().unwrap().push(text.to_string());
 
         if self.settle_modifiers {
@@ -467,6 +477,11 @@ impl UinputInjector {
 
 impl TextInjector for UinputInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
+        if is_whitespace_or_empty(text) {
+            eprintln!("debug: Skipping keystroke injection on empty / whitespace text");
+            return Ok(());
+        }
+
         self.reset_modifiers()?;
 
         let res = match self.mode {
@@ -611,6 +626,11 @@ impl WaylandClipboardInjector {
 
 impl TextInjector for WaylandClipboardInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
+        if is_whitespace_or_empty(text) {
+            eprintln!("debug: Skipping keystroke injection on empty / whitespace text");
+            return Ok(());
+        }
+
         Self::copy_to_clipboard(text)?;
         thread::sleep(self.settle_delay);
 

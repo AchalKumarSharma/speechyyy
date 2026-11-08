@@ -174,70 +174,7 @@ where
                         }
                     }
                     Ok(Some(IpcRequest::Toggle)) => {
-                        let prev = controller.state;
-                        match prev {
-                            DictationState::Idle => {
-                                if let Err(e) = controller.start_recording() {
-                                    eprintln!("Failed to start recording on Toggle: {}", e);
-                                } else if let Some(b) = broadcaster {
-                                    b.broadcast(DaemonEvent::StateChanged {
-                                        state: DictationState::Recording,
-                                        previous: Some(DictationState::Idle),
-                                    });
-                                }
-                            }
-                            DictationState::Recording => {
-                                if let Some(b) = broadcaster {
-                                    b.broadcast(DaemonEvent::StateChanged {
-                                        state: DictationState::Processing,
-                                        previous: Some(DictationState::Recording),
-                                    });
-                                }
-                                match controller.stop_and_transcribe() {
-                                    Ok(Some(text)) => {
-                                        if let Some(b) = broadcaster {
-                                            b.broadcast(DaemonEvent::StateChanged {
-                                                state: DictationState::Emitting,
-                                                previous: Some(DictationState::Processing),
-                                            });
-                                        }
-                                        if let Err(e) = injector.inject(&text) {
-                                            eprintln!("Failed to inject text: {}", e);
-                                        }
-                                        controller.finish_emission();
-                                        if let Some(b) = broadcaster {
-                                            b.broadcast(DaemonEvent::StateChanged {
-                                                state: DictationState::Idle,
-                                                previous: Some(DictationState::Emitting),
-                                            });
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        if let Some(b) = broadcaster {
-                                            b.broadcast(DaemonEvent::StateChanged {
-                                                state: DictationState::Idle,
-                                                previous: Some(DictationState::Processing),
-                                            });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Engine error on Toggle: {}", e);
-                                        if let Some(b) = broadcaster {
-                                            b.broadcast(DaemonEvent::Error {
-                                                code: "inference_failed".into(),
-                                                message: e,
-                                            });
-                                            b.broadcast(DaemonEvent::StateChanged {
-                                                state: DictationState::Idle,
-                                                previous: Some(DictationState::Error),
-                                            });
-                                        }
-                                        controller.reset_to_idle();
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                        handle_toggle(controller, injector, broadcaster, Instant::now());
                     }
                     Ok(Some(IpcRequest::Cancel)) => {
                         if controller.state == DictationState::Recording || controller.state == DictationState::Processing {
@@ -316,6 +253,86 @@ where
         }
     }
     Ok(())
+}
+
+/// Handles a `Command::Toggle` / `IpcRequest::Toggle` with debouncing against rapid double-toggles.
+/// Returns the resulting DictationState.
+pub fn handle_toggle<J: TextInjector, E: DictationEngine>(
+    controller: &mut StateMachineController<E>,
+    injector: &mut J,
+    broadcaster: Option<&EventBroadcaster>,
+    now: Instant,
+) -> DictationState {
+    if controller.should_debounce_toggle(now) {
+        return controller.state;
+    }
+    controller.record_toggle(now);
+
+    let prev = controller.state;
+    match prev {
+        DictationState::Idle => {
+            if let Err(e) = controller.start_recording() {
+                eprintln!("Failed to start recording on Toggle: {}", e);
+            } else if let Some(b) = broadcaster {
+                b.broadcast(DaemonEvent::StateChanged {
+                    state: DictationState::Recording,
+                    previous: Some(DictationState::Idle),
+                });
+            }
+        }
+        DictationState::Recording => {
+            if let Some(b) = broadcaster {
+                b.broadcast(DaemonEvent::StateChanged {
+                    state: DictationState::Processing,
+                    previous: Some(DictationState::Recording),
+                });
+            }
+            match controller.stop_and_transcribe() {
+                Ok(Some(text)) => {
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Emitting,
+                            previous: Some(DictationState::Processing),
+                        });
+                    }
+                    if let Err(e) = injector.inject(&text) {
+                        eprintln!("Failed to inject text: {}", e);
+                    }
+                    controller.finish_emission();
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Idle,
+                            previous: Some(DictationState::Emitting),
+                        });
+                    }
+                }
+                Ok(None) => {
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Idle,
+                            previous: Some(DictationState::Processing),
+                        });
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Engine error on Toggle: {}", e);
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::Error {
+                            code: "inference_failed".into(),
+                            message: e,
+                        });
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Idle,
+                            previous: Some(DictationState::Error),
+                        });
+                    }
+                    controller.reset_to_idle();
+                }
+            }
+        }
+        _ => {}
+    }
+    controller.state
 }
 
 pub fn start_daemon(
@@ -1023,7 +1040,8 @@ mod tests {
             other => panic!("Expected Recording, got {:?}", other),
         }
 
-        // 2. Second toggle stops recording and injects
+        // 2. Second toggle stops recording and injects (spaced past 150ms debounce threshold)
+        std::thread::sleep(Duration::from_millis(160));
         let toggle2 = IpcClient::send_request(&client_sock, &IpcRequest::Toggle);
         assert!(matches!(toggle2, Ok(IpcResponse::Ok { .. })));
 
@@ -1034,6 +1052,116 @@ mod tests {
         assert_eq!(injected, vec!["Toggled Transcription".to_string()]);
 
         let _ = std::fs::remove_file(sock_path);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_toggle_debounce_ignores_rapid_second_toggle() {
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let engine = MockDictationEngine::with_payload("Debounced Payload");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        let t0 = Instant::now();
+        // 1. First toggle at t0: starts recording
+        let state1 = handle_toggle(&mut controller, &mut injector, None, t0);
+        assert_eq!(state1, DictationState::Recording);
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // 2. Rapid second toggle 50ms later (< 150ms): MUST be ignored
+        let t1 = t0 + Duration::from_millis(50);
+        let state2 = handle_toggle(&mut controller, &mut injector, None, t1);
+        assert_eq!(state2, DictationState::Recording);
+        assert_eq!(controller.state, DictationState::Recording);
+        assert_eq!(injector.injected_strings.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_toggle_debounce_allows_spaced_toggles() {
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let engine = MockDictationEngine::with_payload("Spaced Payload");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        let t0 = Instant::now();
+        // 1. First toggle at t0: Idle -> Recording
+        let state1 = handle_toggle(&mut controller, &mut injector, None, t0);
+        assert_eq!(state1, DictationState::Recording);
+
+        // 2. Second toggle 200ms later (> 150ms): Recording -> Idle (via Processing & Emitting)
+        let t1 = t0 + Duration::from_millis(200);
+        let state2 = handle_toggle(&mut controller, &mut injector, None, t1);
+        assert_eq!(state2, DictationState::Idle);
+        assert_eq!(controller.state, DictationState::Idle);
+        assert_eq!(injector.injected_strings.lock().unwrap().as_slice(), &["Spaced Payload"]);
+    }
+
+    #[test]
+    fn test_debounce_is_toggle_only() {
+        let engine = MockDictationEngine::with_payload("Non Toggle Payload");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        let t0 = Instant::now();
+        // 1. Toggle into recording at t0
+        controller.toggle_at(t0).unwrap();
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // 2. Non-toggle command (stop_and_transcribe) immediately 10ms later is NOT debounced
+        let text = controller.stop_and_transcribe().unwrap();
+        assert_eq!(text, Some("Non Toggle Payload".to_string()));
+        assert_eq!(controller.state, DictationState::Emitting);
+    }
+
+    #[test]
+    fn test_skip_path_still_completes_the_cycle() {
+        let temp_dir = std::env::temp_dir().join(format!("test_empty_cycle_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        let broadcaster = EventBroadcaster::bind(&paths.events_socket_path).unwrap();
+
+        let event_stream = UnixStream::connect(&paths.events_socket_path).unwrap();
+        event_stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut event_reader = BufReader::new(event_stream);
+        broadcaster.accept_subscribers();
+
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        // Engine returns whitespace-only payload
+        let engine = MockDictationEngine::with_payload("   ");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        let t0 = Instant::now();
+        // 1. Start recording
+        handle_toggle(&mut controller, &mut injector, Some(&broadcaster), t0);
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // 2. Stop recording and transcribe with whitespace output
+        let t1 = t0 + Duration::from_millis(200);
+        handle_toggle(&mut controller, &mut injector, Some(&broadcaster), t1);
+
+        // State must return to Idle
+        assert_eq!(controller.state, DictationState::Idle);
+        // Zero keycodes emitted!
+        assert_eq!(injector.emitted_events.lock().unwrap().len(), 0);
+
+        // Post-emission events must be published: Recording, Processing, Emitting, Idle
+        let mut received_states = Vec::new();
+        for _ in 0..4 {
+            let mut line = String::new();
+            if event_reader.read_line(&mut line).is_ok() && !line.is_empty() {
+                if let Ok(DaemonEvent::StateChanged { state, .. }) = serde_json::from_str(line.trim()) {
+                    received_states.push(state);
+                }
+            }
+        }
+
+        assert_eq!(
+            received_states,
+            vec![
+                DictationState::Recording,
+                DictationState::Processing,
+                DictationState::Emitting,
+                DictationState::Idle,
+            ]
+        );
+
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
