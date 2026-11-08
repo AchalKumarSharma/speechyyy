@@ -1164,4 +1164,68 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
+
+    #[test]
+    fn test_clipboard_write_failure_still_completes_the_cycle() {
+        use crate::injector::{MockClipboardWriter, MockKeySink, WaylandClipboardInjector};
+
+        let temp_dir = std::env::temp_dir().join(format!("test_clip_fail_cycle_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        let broadcaster = EventBroadcaster::bind(&paths.events_socket_path).unwrap();
+
+        let event_stream = UnixStream::connect(&paths.events_socket_path).unwrap();
+        event_stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut event_reader = BufReader::new(event_stream);
+        broadcaster.accept_subscribers();
+
+        let sink = MockKeySink::new();
+        let emitted_ref = Arc::clone(&sink.emitted);
+        let mut injector = WaylandClipboardInjector::with_parts(
+            Box::new(MockClipboardWriter::failing()),
+            Box::new(sink),
+            Duration::ZERO,
+        );
+
+        let engine = MockDictationEngine::with_payload("Text with failed clipboard");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        let t0 = Instant::now();
+        // 1. Start recording
+        handle_toggle(&mut controller, &mut injector, Some(&broadcaster), t0);
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // 2. Stop recording and transcribe; clipboard fails
+        let t1 = t0 + Duration::from_millis(200);
+        let final_state = handle_toggle(&mut controller, &mut injector, Some(&broadcaster), t1);
+
+        // State must return to Idle cleanly without panic
+        assert_eq!(final_state, DictationState::Idle);
+        assert_eq!(controller.state, DictationState::Idle);
+        // Zero keys emitted
+        assert_eq!(emitted_ref.lock().unwrap().len(), 0);
+
+        // Events must still transition through Processing -> Emitting -> Idle
+        let mut received_states = Vec::new();
+        for _ in 0..4 {
+            let mut line = String::new();
+            if event_reader.read_line(&mut line).is_ok() && !line.is_empty() {
+                if let Ok(DaemonEvent::StateChanged { state, .. }) = serde_json::from_str(line.trim()) {
+                    received_states.push(state);
+                }
+            }
+        }
+
+        assert_eq!(
+            received_states,
+            vec![
+                DictationState::Recording,
+                DictationState::Processing,
+                DictationState::Emitting,
+                DictationState::Idle,
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 }

@@ -24,10 +24,14 @@ fn test_config_defaults() {
 
     assert_eq!(cfg.inference.model, "saaras:v4");
 
-    // Default text injection mode must be "typewriter"
+    // Default text injection mode must be "clipboard"
     assert_eq!(
-        cfg.injector.method, "typewriter",
-        "Default injector method must be 'typewriter'"
+        cfg.injection_mode,
+        speechyyy::config::InjectionMode::Clipboard
+    );
+    assert_eq!(
+        cfg.injector.method, "clipboard",
+        "Default injector method must be 'clipboard'"
     );
 
     // Default typing delay must be 15ms

@@ -318,12 +318,14 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
     // 1. /dev/uinput write access or Wayland clipboard fallback
     let uinput_path = Path::new("/dev/uinput");
     let uinput_writable = env.can_write_path(uinput_path);
+    let has_wl_copy = env.has_command("wl-copy");
+
     if uinput_writable {
         items.push(DiagnosticItem {
             name: "Virtual keyboard permissions (/dev/uinput)".into(),
             status: CheckStatus::Pass,
         });
-    } else if env.is_wayland() && env.has_command("wl-copy") {
+    } else if env.is_wayland() && has_wl_copy {
         items.push(DiagnosticItem {
             name: "Virtual keyboard permissions (/dev/uinput)".into(),
             status: CheckStatus::Warn("Cannot write to /dev/uinput (using Wayland clipboard fallback)".into()),
@@ -340,9 +342,15 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
         fix_instructions.push("sudo cp /etc/udev/rules.d/99-speechyyy-uinput.rules (or generate below) && sudo udevadm control --reload-rules && sudo udevadm trigger".into());
     }
 
-    // Typewriter specific check
-    let is_typewriter = config.injector.method.eq_ignore_ascii_case("typewriter");
+    // Active injection mode & tools check
+    let is_typewriter = config.injection_mode == crate::config::InjectionMode::Typewriter
+        || config.injector.method.eq_ignore_ascii_case("typewriter");
+
     if is_typewriter {
+        items.push(DiagnosticItem {
+            name: "Active injection mode: typewriter (/dev/uinput)".into(),
+            status: CheckStatus::Pass,
+        });
         if uinput_writable {
             items.push(DiagnosticItem {
                 name: "Typewriter Injection: /dev/uinput writable".into(),
@@ -357,6 +365,24 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
             });
             fix_instructions.push(
                 "For hardware typewriter keystrokes, grant /dev/uinput write permissions (e.g. via udev rules). Currently falling back to clipboard paste.".into(),
+            );
+        }
+    } else {
+        // Clipboard mode (default)
+        if has_wl_copy {
+            items.push(DiagnosticItem {
+                name: "Active injection mode: clipboard (wl-copy installed)".into(),
+                status: CheckStatus::Pass,
+            });
+        } else {
+            items.push(DiagnosticItem {
+                name: "Active injection mode: clipboard (wl-copy missing)".into(),
+                status: CheckStatus::Warn(
+                    "wl-copy is missing; daemon will fall back to typewriter (/dev/uinput)".into(),
+                ),
+            });
+            fix_instructions.push(
+                "Install 'wl-clipboard' for direct clipboard paste (e.g. 'sudo pacman -S wl-clipboard' or 'sudo apt install wl-clipboard'), or set injection_mode = 'typewriter' in config.toml.".into(),
             );
         }
     }
@@ -417,6 +443,10 @@ pub fn run_doctor_with_config<E: SysEnv>(env: &E, config: &crate::config::Config
             } else {
                 "Typewriter fallback (Wayland clipboard)"
             }
+        } else if has_wl_copy {
+            "Clipboard paste (wl-copy + Ctrl+V)"
+        } else if uinput_writable {
+            "Clipboard fallback to Typewriter (uinput sequential)"
         } else {
             "Text injector"
         };
@@ -525,6 +555,38 @@ mod tests {
         }
         fn check_inference(&self) -> Result<String, String> {
             self.inference_result.clone()
+        }
+        fn has_command(&self, cmd: &str) -> bool {
+            cmd == "wl-copy"
+        }
+    }
+
+    struct MockMissingWlCopyEnv {
+        user: String,
+        groups: Vec<String>,
+        writable_paths: Vec<PathBuf>,
+        audio_input: Result<String, String>,
+        inference_result: Result<String, String>,
+    }
+
+    impl SysEnv for MockMissingWlCopyEnv {
+        fn current_username(&self) -> String {
+            self.user.clone()
+        }
+        fn user_groups(&self) -> Vec<String> {
+            self.groups.clone()
+        }
+        fn can_write_path(&self, path: &Path) -> bool {
+            self.writable_paths.iter().any(|p| p == path)
+        }
+        fn check_audio_input(&self) -> Result<String, String> {
+            self.audio_input.clone()
+        }
+        fn check_inference(&self) -> Result<String, String> {
+            self.inference_result.clone()
+        }
+        fn has_command(&self, _cmd: &str) -> bool {
+            false
         }
     }
 
@@ -797,6 +859,47 @@ mod tests {
         assert!(report.items.iter().any(|i| i.name
             == "/dev/uinput not writable: typewriter mode will fall back to clipboard paste."
             && matches!(i.status, CheckStatus::Warn(_))));
+    }
+
+    #[test]
+    fn test_doctor_clipboard_mode_with_wl_copy_passes() {
+        let env = MockWaylandEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into(), "uinput".into()],
+            audio_input: Ok("PipeWire Source".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
+        };
+
+        let config = crate::config::Config::default(); // defaults to InjectionMode::Clipboard
+        let report = run_doctor_with_config(&env, &config);
+
+        assert!(report.is_ready());
+        assert!(report.items.iter().any(|i| i.name
+            == "Active injection mode: clipboard (wl-copy installed)"
+            && matches!(i.status, CheckStatus::Pass)));
+    }
+
+    #[test]
+    fn test_doctor_clipboard_mode_without_wl_copy_warns_and_explains_fallback() {
+        let env = MockMissingWlCopyEnv {
+            user: "alfred".into(),
+            groups: vec!["input".into(), "uinput".into()],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            audio_input: Ok("PipeWire Source".into()),
+            inference_result: Ok("Mock provider (mock)".into()),
+        };
+
+        let config = crate::config::Config::default(); // defaults to InjectionMode::Clipboard, but MockMissingWlCopyEnv does not have wl-copy
+        let report = run_doctor_with_config(&env, &config);
+
+        assert!(report.is_ready());
+        assert!(report.items.iter().any(|i| i.name
+            == "Active injection mode: clipboard (wl-copy missing)"
+            && matches!(i.status, CheckStatus::Warn(ref msg) if msg.contains("typewriter"))));
+        assert!(report
+            .fix_instructions
+            .iter()
+            .any(|f| f.contains("wl-clipboard")));
     }
 
     #[test]

@@ -200,6 +200,11 @@ mkdir -p ~/.config/speechyyy
 hotkey = "RightAlt"
 pacing_delay_ms = 15
 
+# Injection mode:
+# - "clipboard" (default): fast paste via Ctrl+V; leaves transcription in clipboard and immune to browser hotkey hijacking. (Requires wl-clipboard on Wayland; does not paste in standard terminals).
+# - "typewriter": character-by-character typing via /dev/uinput. Works in terminals, but triggers page shortcuts if no text field is focused.
+injection_mode = "clipboard"
+
 [input]
 hotkey = "RightAlt"
 grab_key = true
@@ -217,7 +222,7 @@ language_code = "unknown"
 mode = "translit"
 
 [injector]
-method = "typewriter"
+method = "clipboard"
 pacing_delay_ms = 15
 
 [ui]
@@ -226,6 +231,15 @@ EOF
 )
 chmod 600 ~/.config/speechyyy/config.toml
 ```
+
+### Injection Modes (`injection_mode`)
+
+Speechyyy supports two delivery modes for inserting dictation into focused windows:
+
+| Mode | Mechanism | Best For | Behavior & Known Limitations |
+|---|---|---|---|
+| `clipboard` *(default)* | `wl-copy` + `Ctrl+V` | Browsers, web apps, desktop editors, Electron apps | **Wispr Flow pattern:** Instant direct paste via simulated `Ctrl+V`. Immune to browser hotkey hijacking (e.g. YouTube playback toggling when no text field is focused). **Known limits:** Overwrites user's active clipboard item with transcript; does not paste into standard terminal emulators or Vim normal mode (which require `Ctrl+Shift+V` or `p`). |
+| `typewriter` | `/dev/uinput` virtual keyboard | Terminal emulators, CLI tools, Vim/Neovim | Emits keystrokes sequentially character-by-character via kernel `/dev/uinput`. Works in terminals. **Known limits:** If no text field is focused, keystrokes may be interpreted as application hotkeys (e.g. page shortcuts). |
 
 </details>
 

@@ -52,6 +52,14 @@ else
     echo "[!] Warning: Wayland session not detected (\$WAYLAND_DISPLAY / \$XDG_CURRENT_DESKTOP unset). speechyyy-dock requires a Wayland compositor supporting wlr-layer-shell."
 fi
 
+# Clipboard tool check (wl-clipboard / wl-copy)
+if command -v wl-copy >/dev/null 2>&1; then
+    echo "[✓] wl-clipboard (wl-copy) detected for instant paste."
+else
+    echo "[!] Warning: wl-copy not found. Speechyyy defaults to clipboard paste via 'wl-clipboard'."
+    echo "    Please install the 'wl-clipboard' package (e.g. 'sudo pacman -S wl-clipboard' or 'sudo apt install wl-clipboard'), or set injection_mode = \"typewriter\" in config.toml."
+fi
+
 # 2. Binary Installation
 IS_LOCAL_CHECKOUT=0
 if [ -f "Cargo.toml" ] && grep -q 'name = "speechyyy"' Cargo.toml 2>/dev/null; then
@@ -249,6 +257,10 @@ else
             cat > "$CONFIG_FILE" <<EOF
 hotkey = "RightAlt"
 pacing_delay_ms = 15
+# Injection mode:
+# - "clipboard" (default): fast paste via Ctrl+V; leaves transcription in clipboard and immune to browser hotkey hijacking. (Requires wl-clipboard on Wayland; does not paste in standard terminals).
+# - "typewriter": character-by-character typing via /dev/uinput. Works in terminals, but triggers page shortcuts if no text field is focused.
+injection_mode = "clipboard"
 
 [input]
 hotkey = "RightAlt"
@@ -267,7 +279,7 @@ language_code = "unknown"
 mode = "translit"
 
 [injector]
-method = "typewriter"
+method = "clipboard"
 pacing_delay_ms = 15
 
 [ui]

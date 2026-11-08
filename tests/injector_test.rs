@@ -1,6 +1,10 @@
 use evdev::KeyCode;
 use speechyyy::config::Config;
-use speechyyy::injector::{char_to_key, is_whitespace_or_empty, KeyStroke, RecordingInjector, TextInjector};
+use speechyyy::injector::{
+    char_to_key, is_whitespace_or_empty, KeyStroke, MockClipboardWriter, MockKeySink,
+    RecordingInjector, TextInjector, WaylandClipboardInjector,
+};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[test]
@@ -561,4 +565,80 @@ fn test_non_empty_text_is_unchanged() {
     assert!(events_spaced[0].is_down);
     assert_eq!(events_spaced[13].key, KeyCode::KEY_SPACE);
     assert!(!events_spaced[13].is_down);
+}
+
+#[test]
+fn test_clipboard_injector_mocks_sequence_and_empty_guard() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let writer = MockClipboardWriter::with_order(Arc::clone(&order));
+    let written_ref = Arc::clone(&writer.written);
+    let sink = MockKeySink::with_order(Arc::clone(&order));
+    let emitted_ref = Arc::clone(&sink.emitted);
+
+    let mut injector = WaylandClipboardInjector::with_parts(
+        Box::new(writer),
+        Box::new(sink),
+        Duration::ZERO,
+    );
+
+    // 1. Empty / whitespace inputs do neither clipboard write nor key emission
+    for empty_input in ["", "   ", "\n\t "] {
+        assert!(injector.inject(empty_input).is_ok());
+        assert!(written_ref.lock().unwrap().is_empty());
+        assert!(emitted_ref.lock().unwrap().is_empty());
+        assert!(order.lock().unwrap().is_empty());
+    }
+
+    // 2. Non-empty text writes clipboard first, then emits LEFTCTRL↓, V↓, V↑, LEFTCTRL↑
+    let text = "Hello Wispr Flow";
+    assert!(injector.inject(text).is_ok());
+
+    let written = written_ref.lock().unwrap().clone();
+    assert_eq!(written, vec![text.to_string()]);
+
+    let emitted = emitted_ref.lock().unwrap().clone();
+    assert_eq!(
+        emitted,
+        vec![
+            (KeyCode::KEY_LEFTCTRL, true),
+            (KeyCode::KEY_V, true),
+            (KeyCode::KEY_V, false),
+            (KeyCode::KEY_LEFTCTRL, false),
+        ],
+        "Key sequence must be exactly LEFTCTRL down, V down, V up, LEFTCTRL up"
+    );
+
+    // Verify ordering: clipboard write occurred BEFORE any key events
+    let ops = order.lock().unwrap().clone();
+    assert_eq!(ops.len(), 5);
+    assert_eq!(ops[0], format!("clipboard:{}", text));
+    assert_eq!(ops[1], "key:KEY_LEFTCTRL:down");
+    assert_eq!(ops[2], "key:KEY_V:down");
+    assert_eq!(ops[3], "key:KEY_V:up");
+    assert_eq!(ops[4], "key:KEY_LEFTCTRL:up");
+}
+
+#[test]
+fn test_clipboard_write_failure_emits_no_keys_and_does_not_panic() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let writer = MockClipboardWriter::failing();
+    let sink = MockKeySink::with_order(Arc::clone(&order));
+    let emitted_ref = Arc::clone(&sink.emitted);
+
+    let mut injector = WaylandClipboardInjector::with_parts(
+        Box::new(writer),
+        Box::new(sink),
+        Duration::ZERO,
+    );
+
+    let result = injector.inject("Failed paste");
+    assert!(result.is_err(), "Must return Err on clipboard write failure");
+    assert!(
+        emitted_ref.lock().unwrap().is_empty(),
+        "Must emit zero keys if clipboard writing fails"
+    );
+    assert!(
+        order.lock().unwrap().is_empty(),
+        "No keys should be recorded in order"
+    );
 }

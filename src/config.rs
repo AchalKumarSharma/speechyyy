@@ -153,8 +153,40 @@ fn default_pacing_ms() -> u64 {
     15
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InjectionMode {
+    #[default]
+    Clipboard,
+    Typewriter,
+}
+
+impl std::fmt::Display for InjectionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InjectionMode::Clipboard => write!(f, "clipboard"),
+            InjectionMode::Typewriter => write!(f, "typewriter"),
+        }
+    }
+}
+
+impl std::str::FromStr for InjectionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "clipboard" | "paste" | "wayland" => Ok(InjectionMode::Clipboard),
+            "typewriter" | "uinput" => Ok(InjectionMode::Typewriter),
+            other => Err(format!(
+                "Unknown injection mode '{}'. Supported: 'clipboard', 'typewriter'.",
+                other
+            )),
+        }
+    }
+}
+
 fn default_injector_method() -> String {
-    "typewriter".to_string()
+    "clipboard".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -297,6 +329,8 @@ fn default_ui_config() -> UiConfig {
 pub struct Config {
     pub hotkey: String,
     pub pacing_delay_ms: u64,
+    #[serde(default)]
+    pub injection_mode: InjectionMode,
     pub input: InputConfig,
     pub audio: AudioConfig,
     pub inference: InferenceConfig,
@@ -332,7 +366,7 @@ struct RawConfig {
     #[serde(default)]
     sarvam_model: Option<String>,
     #[serde(default)]
-    injection_mode: Option<String>,
+    injection_mode: Option<InjectionMode>,
 }
 
 impl From<RawConfig> for Config {
@@ -351,9 +385,14 @@ impl From<RawConfig> for Config {
             inference.model = mdl;
         }
 
+        let injection_mode = raw
+            .injection_mode
+            .or_else(|| raw.injector.method.parse::<InjectionMode>().ok())
+            .unwrap_or_default();
+
         let mut injector = raw.injector;
-        if let Some(inj) = raw.injection_mode {
-            injector.method = inj;
+        if raw.injection_mode.is_some() {
+            injector.method = injection_mode.to_string();
         }
 
         let delay = raw
@@ -384,6 +423,7 @@ impl From<RawConfig> for Config {
         Config {
             hotkey,
             pacing_delay_ms: delay,
+            injection_mode,
             input,
             audio: raw.audio,
             inference,
@@ -398,6 +438,7 @@ impl Default for Config {
         Self {
             hotkey: default_hotkey(),
             pacing_delay_ms: default_pacing_ms(),
+            injection_mode: InjectionMode::default(),
             input: InputConfig::default(),
             audio: AudioConfig::default(),
             inference: InferenceConfig::default(),
@@ -533,7 +574,12 @@ impl Config {
             self.inference.mode = m.to_string();
         }
         if let Some(inj) = injection {
-            self.injector.method = inj.to_string();
+            if let Ok(m) = inj.parse::<InjectionMode>() {
+                self.injection_mode = m;
+                self.injector.method = m.to_string();
+            } else {
+                self.injector.method = inj.to_string();
+            }
         }
         if let Some(d) = typing_delay {
             self.pacing_delay_ms = d;
@@ -701,7 +747,8 @@ grab_key = false
         let default_cfg = Config::default();
         assert_eq!(default_cfg.hotkey, "RightAlt");
         assert_eq!(default_cfg.pacing_delay_ms, 15);
-        assert_eq!(default_cfg.injector.method, "typewriter");
+        assert_eq!(default_cfg.injection_mode, InjectionMode::Clipboard);
+        assert_eq!(default_cfg.injector.method, "clipboard");
         assert_eq!(default_cfg.to_target_chord(), TargetChord::right_alt());
 
         let toml_data = r#"
@@ -900,5 +947,36 @@ model = "parakeet-tdt-v3"
         assert_eq!(mode, 0o600, "Config file permissions must be 0600");
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_injection_mode_defaults_and_parsing() {
+        // Missing from TOML defaults to Clipboard
+        let toml_empty = "";
+        let cfg: Config = toml::from_str(toml_empty).unwrap();
+        assert_eq!(cfg.injection_mode, InjectionMode::Clipboard);
+        assert_eq!(cfg.injector.method, "clipboard");
+
+        // Parses explicit "clipboard"
+        let toml_clip = "injection_mode = \"clipboard\"";
+        let cfg_clip: Config = toml::from_str(toml_clip).unwrap();
+        assert_eq!(cfg_clip.injection_mode, InjectionMode::Clipboard);
+        assert_eq!(cfg_clip.injector.method, "clipboard");
+
+        // Parses explicit "typewriter"
+        let toml_type = "injection_mode = \"typewriter\"";
+        let cfg_type: Config = toml::from_str(toml_type).unwrap();
+        assert_eq!(cfg_type.injection_mode, InjectionMode::Typewriter);
+        assert_eq!(cfg_type.injector.method, "typewriter");
+
+        // Parses legacy [injector] method = "typewriter"
+        let toml_legacy = "[injector]\nmethod = \"typewriter\"";
+        let cfg_legacy: Config = toml::from_str(toml_legacy).unwrap();
+        assert_eq!(cfg_legacy.injection_mode, InjectionMode::Typewriter);
+
+        // String parsing
+        assert_eq!("clipboard".parse::<InjectionMode>(), Ok(InjectionMode::Clipboard));
+        assert_eq!("typewriter".parse::<InjectionMode>(), Ok(InjectionMode::Typewriter));
+        assert!("invalid".parse::<InjectionMode>().is_err());
     }
 }
