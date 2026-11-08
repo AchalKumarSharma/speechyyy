@@ -32,6 +32,12 @@ pub enum Command {
         /// Keystroke typing delay in milliseconds for typewriter mode
         #[arg(long)]
         typing_delay: Option<u64>,
+        /// Disable companion dock launch on start
+        #[arg(long)]
+        no_dock: bool,
+        /// Launch companion dock even when running in foreground mode
+        #[arg(long)]
+        with_dock: bool,
     },
     /// Stop running Speechyyy
     Stop,
@@ -176,6 +182,8 @@ mod tests {
                 mode: None,
                 injection: None,
                 typing_delay: None,
+                no_dock: false,
+                with_dock: false,
             }
         );
     }
@@ -192,6 +200,24 @@ mod tests {
                 mode: None,
                 injection: None,
                 typing_delay: None,
+                no_dock: false,
+                with_dock: false,
+            }
+        );
+
+        let cli_with_dock =
+            Cli::try_parse_from(["speechyyy", "start", "--foreground", "--with-dock"])
+                .expect("parse start with dock");
+        assert_eq!(
+            cli_with_dock.command,
+            Command::Start {
+                foreground: true,
+                provider: None,
+                mode: None,
+                injection: None,
+                typing_delay: None,
+                no_dock: false,
+                with_dock: true,
             }
         );
     }
@@ -207,6 +233,23 @@ mod tests {
                 mode: None,
                 injection: None,
                 typing_delay: None,
+                no_dock: false,
+                with_dock: false,
+            }
+        );
+
+        let cli_no_dock =
+            Cli::try_parse_from(["speechyyy", "start", "--no-dock"]).expect("parse start no dock");
+        assert_eq!(
+            cli_no_dock.command,
+            Command::Start {
+                foreground: false,
+                provider: None,
+                mode: None,
+                injection: None,
+                typing_delay: None,
+                no_dock: true,
+                with_dock: false,
             }
         );
     }

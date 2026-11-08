@@ -139,12 +139,16 @@ fn test_cli_flags_parsing_on_start() {
             mode,
             injection,
             typing_delay,
+            no_dock,
+            with_dock,
         } => {
             assert!(!foreground);
             assert_eq!(provider, Some("sarvam".into()));
             assert_eq!(mode, Some("codemix".into()));
             assert_eq!(injection, Some("paste".into()));
             assert_eq!(typing_delay, Some(25));
+            assert!(!no_dock);
+            assert!(!with_dock);
         }
         other => panic!("Expected Command::Start, got {:?}", other),
     }

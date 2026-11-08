@@ -12,6 +12,7 @@ use std::time::Duration;
 pub enum IpcRequest {
     Status,
     Stop,
+    Restart,
     Ping,
     PushDown,
     PushUp,
@@ -45,6 +46,7 @@ pub struct RuntimePaths {
     pub socket_path: PathBuf,
     pub events_socket_path: PathBuf,
     pub pid_path: PathBuf,
+    pub dock_pid_path: PathBuf,
     pub binary_path: Option<PathBuf>,
 }
 
@@ -73,11 +75,13 @@ impl RuntimePaths {
         let socket_path = dir.join("speechyyy.sock");
         let events_socket_path = dir.join("events.sock");
         let pid_path = dir.join("speechyyy.pid");
+        let dock_pid_path = dir.join("speechyyy-dock.pid");
         Self {
             dir,
             socket_path,
             events_socket_path,
             pid_path,
+            dock_pid_path,
             binary_path: None,
         }
     }
@@ -98,7 +102,13 @@ impl RuntimePaths {
     }
 
     pub fn cleanup(&self) {
-        PidFile::remove(&self.pid_path);
+        if let Some(pid) = PidFile::read_pid(&self.pid_path) {
+            if pid == std::process::id() || !PidFile::is_process_running(pid) {
+                PidFile::remove(&self.pid_path);
+            }
+        } else {
+            PidFile::remove(&self.pid_path);
+        }
         let _ = fs::remove_file(&self.socket_path);
         let _ = fs::remove_file(&self.events_socket_path);
     }
@@ -133,6 +143,10 @@ impl PidFile {
     }
 
     pub fn acquire(path: &Path) -> Result<(), String> {
+        Self::acquire_for_service(path, "Speechyyy")
+    }
+
+    pub fn acquire_for_service(path: &Path, service_name: &str) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             create_secure_dir(parent)
                 .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
@@ -141,8 +155,8 @@ impl PidFile {
         if let Some(existing_pid) = Self::read_pid(path) {
             if Self::is_process_running(existing_pid) {
                 return Err(format!(
-                    "Speechyyy is already running with PID {}",
-                    existing_pid
+                    "{} is already running with PID {}",
+                    service_name, existing_pid
                 ));
             }
             let _ = fs::remove_file(path);
@@ -155,6 +169,16 @@ impl PidFile {
 
     pub fn remove(path: &Path) {
         let _ = fs::remove_file(path);
+    }
+
+    pub fn remove_if_dead(path: &Path) {
+        if let Some(pid) = Self::read_pid(path) {
+            if !Self::is_process_running(pid) {
+                let _ = fs::remove_file(path);
+            }
+        } else {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -286,7 +310,16 @@ impl IpcServer {
                     IpcResponse::Ok {
                         message: "Speechyyy stopping".into(),
                     },
-                    None,
+                    Some(IpcRequest::Stop),
+                )
+            }
+            Ok(IpcRequest::Restart) => {
+                running.store(false, Ordering::SeqCst);
+                (
+                    IpcResponse::Ok {
+                        message: "Speechyyy restarting".into(),
+                    },
+                    Some(IpcRequest::Restart),
                 )
             }
             Ok(IpcRequest::PushDown) => (IpcResponse::PushDown, Some(IpcRequest::PushDown)),
@@ -553,6 +586,90 @@ mod tests {
         assert!(paths.socket_path.exists());
 
         paths.cleanup();
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_ipc_request_parsing_restart_and_existing() {
+        let restart_json = "{\"cmd\":\"restart\"}";
+        let parsed_restart: IpcRequest =
+            serde_json::from_str(restart_json).expect("parse restart");
+        assert_eq!(parsed_restart, IpcRequest::Restart);
+
+        let stop_json = "{\"cmd\":\"stop\"}";
+        let parsed_stop: IpcRequest = serde_json::from_str(stop_json).expect("parse stop");
+        assert_eq!(parsed_stop, IpcRequest::Stop);
+
+        let ping_json = "{\"cmd\":\"ping\"}";
+        let parsed_ping: IpcRequest = serde_json::from_str(ping_json).expect("parse ping");
+        assert_eq!(parsed_ping, IpcRequest::Ping);
+
+        let status_json = "{\"cmd\":\"status\"}";
+        let parsed_status: IpcRequest = serde_json::from_str(status_json).expect("parse status");
+        assert_eq!(parsed_status, IpcRequest::Status);
+
+        let push_down_json = "{\"cmd\":\"push_down\"}";
+        let parsed_pd: IpcRequest = serde_json::from_str(push_down_json).expect("parse push_down");
+        assert_eq!(parsed_pd, IpcRequest::PushDown);
+
+        let push_up_json = "{\"cmd\":\"push_up\"}";
+        let parsed_pu: IpcRequest = serde_json::from_str(push_up_json).expect("parse push_up");
+        assert_eq!(parsed_pu, IpcRequest::PushUp);
+
+        let toggle_json = "{\"cmd\":\"toggle\"}";
+        let parsed_toggle: IpcRequest = serde_json::from_str(toggle_json).expect("parse toggle");
+        assert_eq!(parsed_toggle, IpcRequest::Toggle);
+
+        let cancel_json = "{\"cmd\":\"cancel\"}";
+        let parsed_cancel: IpcRequest = serde_json::from_str(cancel_json).expect("parse cancel");
+        assert_eq!(parsed_cancel, IpcRequest::Cancel);
+    }
+
+    #[test]
+    fn test_dock_pid_file_lifecycle() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("speechyyy_dock_pid_test_{}", std::process::id()));
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        paths.ensure_dir().expect("ensure dir");
+
+        let pid_path = paths.dock_pid_path.clone();
+
+        // 1. Initial acquire should succeed and write current PID
+        let res = PidFile::acquire_for_service(&pid_path, "speechyyy-dock");
+        assert!(res.is_ok(), "First acquire should succeed: {:?}", res);
+        assert_eq!(PidFile::read_pid(&pid_path), Some(std::process::id()));
+
+        // 2. Second acquire while current PID is running should fail with refusal
+        let res2 = PidFile::acquire_for_service(&pid_path, "speechyyy-dock");
+        assert!(res2.is_err(), "Acquire while process is live must fail");
+        assert!(res2.unwrap_err().contains("already running"));
+
+        // 3. Stale PID file (with dead PID 9999999) should be overwritten cleanly
+        fs::write(&pid_path, "9999999").expect("write stale pid");
+        assert!(!PidFile::is_process_running(9999999));
+        let res3 = PidFile::acquire_for_service(&pid_path, "speechyyy-dock");
+        assert!(res3.is_ok(), "Stale PID should be overwritten");
+        assert_eq!(PidFile::read_pid(&pid_path), Some(std::process::id()));
+
+        // 4. Removal on clean exit
+        PidFile::remove(&pid_path);
+        assert!(!pid_path.exists());
+
+        // 5. remove_if_dead should not delete if process is live, but deletes if dead
+        fs::write(&pid_path, std::process::id().to_string()).expect("write live pid");
+        PidFile::remove_if_dead(&pid_path);
+        assert!(
+            pid_path.exists(),
+            "remove_if_dead must leave live process PID file alone"
+        );
+
+        fs::write(&pid_path, "9999999").expect("write dead pid");
+        PidFile::remove_if_dead(&pid_path);
+        assert!(
+            !pid_path.exists(),
+            "remove_if_dead must delete dead process PID file"
+        );
+
         let _ = fs::remove_dir_all(temp_dir);
     }
 }

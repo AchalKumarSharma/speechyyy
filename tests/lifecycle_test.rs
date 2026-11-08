@@ -7,6 +7,7 @@ use std::time::Duration;
 #[test]
 fn test_daemon_full_lifecycle_on_temp_paths() {
     let temp_dir = std::env::temp_dir().join(format!("speechyyy_life_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
     let paths = RuntimePaths::with_dir(temp_dir.clone());
 
     assert_eq!(PidFile::read_pid(&paths.pid_path), None);

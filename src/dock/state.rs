@@ -79,6 +79,9 @@ impl DockModel {
                 self.transition_to(DictationState::Idle);
             }
             DaemonEvent::TranscriptPreview { .. } => {}
+            DaemonEvent::Shutdown { .. } => {
+                self.transition_to(DictationState::Idle);
+            }
         }
     }
 
