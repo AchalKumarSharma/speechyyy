@@ -338,11 +338,26 @@ pub fn unsupported_model_error(model: &str) -> String {
 }
 
 /// Handler for the CLI `model download` command.
-pub fn handle_model_download_command(model_name: &str) -> Result<(), String> {
+pub fn handle_model_download_command(model_name: &str, force: bool) -> Result<(), String> {
     handle_model_download_internal(
         model_name,
+        force,
         &crate::config::Config::config_path(),
         None,
+        &mut || {
+            use std::io::{stdin, stdout, IsTerminal, Write};
+            if !stdin().is_terminal() {
+                return Ok(false);
+            }
+            print!("Sarvam API key is already configured. Replace it? [y/N] ");
+            let _ = stdout().flush();
+            let mut line = String::new();
+            if stdin().read_line(&mut line).is_err() {
+                return Ok(false);
+            }
+            let trimmed = line.trim().to_lowercase();
+            Ok(trimmed == "y" || trimmed == "yes")
+        },
         &mut || {
             rpassword::prompt_password("Enter your Sarvam API Key: ")
                 .map_err(|e| format!("Failed to read API key: {}", e))
@@ -351,13 +366,16 @@ pub fn handle_model_download_command(model_name: &str) -> Result<(), String> {
 }
 
 /// Internal handler for model downloading with dependency injection for prompting and paths.
-pub fn handle_model_download_internal<F>(
+pub fn handle_model_download_internal<C, F>(
     model_name: &str,
+    force: bool,
     config_path: &Path,
     models_dir: Option<&Path>,
+    confirm_replace_fn: &mut C,
     prompt_key_fn: &mut F,
 ) -> Result<(), String>
 where
+    C: FnMut() -> Result<bool, String>,
     F: FnMut() -> Result<String, String>,
 {
     let trimmed = model_name.trim();
@@ -366,17 +384,25 @@ where
     if is_sarvam_cloud_model(trimmed) {
         if let Some(key) = cfg.inference.resolve_api_key() {
             if !key.trim().is_empty() {
-                println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
-                println!(
-                    "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
-                    nickname
-                );
-                return Ok(());
+                let should_replace = if force {
+                    true
+                } else {
+                    confirm_replace_fn()?
+                };
+
+                if !should_replace {
+                    println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
+                    println!(
+                        "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
+                        nickname
+                    );
+                    return Ok(());
+                }
             }
         }
 
         let raw_key = prompt_key_fn()?;
-        let key = raw_key.trim();
+        let key = raw_key.trim().trim_matches('"');
         if key.is_empty() {
             return Err("Sarvam API key cannot be empty.".to_string());
         }
@@ -1103,10 +1129,13 @@ mod tests {
             prompt_called = true;
             Ok("my_entered_sarvam_key_999".to_string())
         };
+        let mut confirm_noop = || Ok(false);
         let res = handle_model_download_internal(
             "saaras:v4",
+            false,
             &config_file,
             Some(&models_dir),
+            &mut confirm_noop,
             &mut prompter,
         );
         assert!(res.is_ok());
@@ -1115,28 +1144,73 @@ mod tests {
         assert_eq!(cfg.inference.provider, "local");
         assert_eq!(cfg.inference.api_key, "my_entered_sarvam_key_999");
 
-        // 2. sarvam:saaras-v4 when key is already configured -> returns Ok without calling prompt
+        // 2a. sarvam:saaras-v4 when key is already configured and confirm is false -> does not prompt
         let mut prompt_called2 = false;
         let mut prompter2 = || {
             prompt_called2 = true;
             Ok("should_not_be_called".to_string())
         };
+        let mut confirm_decline = || Ok(false);
         let res2 = handle_model_download_internal(
             "sarvam:saaras-v4",
+            false,
             &config_file,
             Some(&models_dir),
+            &mut confirm_decline,
             &mut prompter2,
         );
         assert!(res2.is_ok());
         assert!(!prompt_called2);
+
+        // 2b. saaras:v4 with confirm = true -> prompts and overwrites key
+        let mut prompt_called_confirm = false;
+        let mut prompter_confirm = || {
+            prompt_called_confirm = true;
+            Ok("  \"overwritten_key_with_quotes\"  ".to_string())
+        };
+        let mut confirm_accept = || Ok(true);
+        let res_confirm = handle_model_download_internal(
+            "saaras:v4",
+            false,
+            &config_file,
+            Some(&models_dir),
+            &mut confirm_accept,
+            &mut prompter_confirm,
+        );
+        assert!(res_confirm.is_ok());
+        assert!(prompt_called_confirm);
+        let cfg_updated = crate::config::Config::load_from_path(&config_file);
+        assert_eq!(cfg_updated.inference.api_key, "overwritten_key_with_quotes");
+
+        // 2c. saaras:v4 with force = true -> prompts and overwrites key even if confirm is false
+        let mut prompt_called_force = false;
+        let mut prompter_force = || {
+            prompt_called_force = true;
+            Ok("forced_key_123".to_string())
+        };
+        let mut confirm_false = || Ok(false);
+        let res_force = handle_model_download_internal(
+            "saaras:v4",
+            true,
+            &config_file,
+            Some(&models_dir),
+            &mut confirm_false,
+            &mut prompter_force,
+        );
+        assert!(res_force.is_ok());
+        assert!(prompt_called_force);
+        let cfg_forced = crate::config::Config::load_from_path(&config_file);
+        assert_eq!(cfg_forced.inference.api_key, "forced_key_123");
 
         // 3. saaras:v4 when user enters empty key -> returns error
         let empty_cfg_file = temp_dir.join("empty_config.toml");
         let mut empty_prompter = || Ok("   ".to_string());
         let res_empty = handle_model_download_internal(
             "saaras:v4",
+            false,
             &empty_cfg_file,
             Some(&models_dir),
+            &mut confirm_noop,
             &mut empty_prompter,
         );
         assert!(res_empty.is_err());
@@ -1149,8 +1223,10 @@ mod tests {
         let mut dummy_prompter = || Ok("dummy".to_string());
         let res_unsupported = handle_model_download_internal(
             "nonexistent-model",
+            false,
             &config_file,
             Some(&models_dir),
+            &mut confirm_noop,
             &mut dummy_prompter,
         );
         assert!(res_unsupported.is_err());

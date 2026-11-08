@@ -8,16 +8,26 @@ use std::time::Duration;
 
 pub trait InputEventSource {
     fn poll_event(&mut self, timeout: Duration) -> Option<(KeyCode, bool)>;
+
+    fn grab(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn ungrab(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct FakeInputSource {
     events: VecDeque<(KeyCode, bool)>,
+    pub grabbed: bool,
 }
 
 impl FakeInputSource {
     pub fn new() -> Self {
         Self {
             events: VecDeque::new(),
+            grabbed: false,
         }
     }
 
@@ -35,6 +45,35 @@ impl Default for FakeInputSource {
 impl InputEventSource for FakeInputSource {
     fn poll_event(&mut self, _timeout: Duration) -> Option<(KeyCode, bool)> {
         self.events.pop_front()
+    }
+
+    fn grab(&mut self) -> Result<(), String> {
+        self.grabbed = true;
+        Ok(())
+    }
+
+    fn ungrab(&mut self) -> Result<(), String> {
+        self.grabbed = false;
+        Ok(())
+    }
+}
+
+/// No-op input source for compositor IPC mode where the daemon does not iterate /dev/input/event*
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopInputSource;
+
+impl InputEventSource for NoopInputSource {
+    fn poll_event(&mut self, timeout: Duration) -> Option<(KeyCode, bool)> {
+        std::thread::sleep(timeout);
+        None
+    }
+
+    fn grab(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn ungrab(&mut self) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -55,14 +94,55 @@ pub fn is_keyboard_device(device: &Device) -> bool {
     }
 }
 
+pub struct EvdevGrabGuard {
+    fds: Vec<std::os::fd::RawFd>,
+    grabbed_at: std::time::Instant,
+}
+
+impl EvdevGrabGuard {
+    pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
+
+    pub fn new(devices: &mut [Device]) -> std::io::Result<Self> {
+        let mut fds = Vec::new();
+        for dev in devices.iter_mut() {
+            if dev.grab().is_ok() {
+                fds.push(dev.as_raw_fd());
+            }
+        }
+        Ok(Self {
+            fds,
+            grabbed_at: std::time::Instant::now(),
+        })
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.grabbed_at.elapsed() >= Self::WATCHDOG_TIMEOUT
+    }
+}
+
+impl Drop for EvdevGrabGuard {
+    fn drop(&mut self) {
+        for &fd in &self.fds {
+            unsafe {
+                libc::ioctl(fd, Self::EVIOCGRAB, 0);
+            }
+        }
+    }
+}
+
 pub struct EvdevListener {
     input_dir: PathBuf,
     devices: Vec<Device>,
     inotify_fd: Option<i32>,
     pending_events: VecDeque<(KeyCode, bool)>,
+    grab_enabled: bool,
+    active_grab: Option<EvdevGrabGuard>,
 }
 
 impl EvdevListener {
+    pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(60);
+
     pub fn new() -> Self {
         Self::with_dir(PathBuf::from("/dev/input"))
     }
@@ -81,11 +161,46 @@ impl EvdevListener {
             devices: Vec::new(),
             inotify_fd: None,
             pending_events: VecDeque::new(),
+            grab_enabled: true,
+            active_grab: None,
         };
 
         listener.init_inotify(&dir);
         listener.scan_devices();
         listener
+    }
+
+    pub fn set_grab_enabled(&mut self, enabled: bool) {
+        self.grab_enabled = enabled;
+    }
+
+    pub fn is_grab_enabled(&self) -> bool {
+        self.grab_enabled
+    }
+
+    pub fn is_grabbed(&self) -> bool {
+        self.active_grab.is_some()
+    }
+
+    pub fn grab(&mut self) -> std::io::Result<()> {
+        if !self.grab_enabled || self.active_grab.is_some() {
+            return Ok(());
+        }
+        self.active_grab = Some(EvdevGrabGuard::new(&mut self.devices)?);
+        Ok(())
+    }
+
+    pub fn ungrab(&mut self) -> std::io::Result<()> {
+        self.active_grab = None;
+        Ok(())
+    }
+
+    pub fn check_grab_watchdog(&mut self) {
+        if let Some(ref guard) = self.active_grab {
+            if guard.is_expired() {
+                self.active_grab = None;
+            }
+        }
     }
 
     fn init_inotify(&mut self, dir: &Path) {
@@ -158,6 +273,7 @@ impl EvdevListener {
 
 impl Drop for EvdevListener {
     fn drop(&mut self) {
+        let _ = self.ungrab();
         if let Some(fd) = self.inotify_fd {
             unsafe {
                 libc::close(fd);
@@ -168,6 +284,8 @@ impl Drop for EvdevListener {
 
 impl InputEventSource for EvdevListener {
     fn poll_event(&mut self, timeout: Duration) -> Option<(KeyCode, bool)> {
+        self.check_grab_watchdog();
+
         if let Some(ev) = self.pending_events.pop_front() {
             return Some(ev);
         }
@@ -249,6 +367,14 @@ impl InputEventSource for EvdevListener {
 
         self.pending_events.pop_front()
     }
+
+    fn grab(&mut self) -> Result<(), String> {
+        EvdevListener::grab(self).map_err(|e| e.to_string())
+    }
+
+    fn ungrab(&mut self) -> Result<(), String> {
+        EvdevListener::ungrab(self).map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -283,5 +409,38 @@ mod tests {
         assert_eq!(listener.poll_event(Duration::from_millis(5)), None);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_fake_input_source_grab() {
+        let mut source = FakeInputSource::new();
+        assert!(!source.grabbed);
+        assert!(source.grab().is_ok());
+        assert!(source.grabbed);
+        assert!(source.ungrab().is_ok());
+        assert!(!source.grabbed);
+    }
+
+    #[test]
+    fn test_evdev_listener_grab_state_and_watchdog() {
+        let mut listener = EvdevListener::with_dir(PathBuf::from("/nonexistent/dev/input"));
+        assert!(listener.is_grab_enabled());
+        assert!(!listener.is_grabbed());
+
+        assert!(listener.grab().is_ok());
+        assert!(listener.is_grabbed());
+
+        // Fast-forward grab time to simulate 61 seconds elapsed
+        if let Some(ref mut guard) = listener.active_grab {
+            guard.grabbed_at = std::time::Instant::now() - Duration::from_secs(61);
+        }
+        listener.check_grab_watchdog();
+        assert!(!listener.is_grabbed());
+
+        // Test disable grab
+        listener.set_grab_enabled(false);
+        assert!(!listener.is_grab_enabled());
+        assert!(listener.grab().is_ok());
+        assert!(!listener.is_grabbed());
     }
 }

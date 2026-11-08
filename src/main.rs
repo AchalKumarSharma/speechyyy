@@ -1,6 +1,9 @@
 use clap::Parser;
 use speechyyy::cli::{Cli, Command, ModelCommands};
-use speechyyy::daemon::{check_status, handle_uninstall_command, start_daemon, stop_daemon};
+use speechyyy::daemon::{
+    check_status, handle_uninstall_command, send_cancel, send_push_down, send_push_up, send_toggle,
+    start_daemon, stop_daemon, stream_events,
+};
 use speechyyy::doctor::{print_doctor_report, run_doctor, RealSysEnv};
 use speechyyy::history::{handle_fix_command_opts, handle_history_command};
 use speechyyy::ipc::RuntimePaths;
@@ -33,21 +36,29 @@ fn main() {
             Ok(())
         }
         Command::Models { action } => match action {
-            Some(ModelCommands::Download { model, model_flag }) => {
+            Some(ModelCommands::Download {
+                model,
+                model_flag,
+                force,
+            }) => {
                 let target = ModelCommands::resolved_download_model(model, model_flag);
-                handle_model_download_command(&target)
+                handle_model_download_command(&target, force)
             }
             Some(ModelCommands::List) | None => handle_model_list_command(),
             Some(ModelCommands::Use { model }) => handle_model_use_command(&model),
             Some(ModelCommands::Remove { model }) => handle_model_remove(&model),
         },
-        Command::Download { model, model_flag } => {
+        Command::Download {
+            model,
+            model_flag,
+            force,
+        } => {
             let target = ModelCommands::resolved_download_model(model, model_flag);
-            handle_model_download_command(&target)
+            handle_model_download_command(&target, force)
         }
         Command::Use { model } => handle_model_use_command(&model),
         Command::Remove { model } => handle_model_remove(&model),
-        Command::Uninstall { purge: _, yes } => handle_uninstall_command(yes),
+        Command::Uninstall { yes } => handle_uninstall_command(yes),
         Command::Start {
             foreground,
             provider,
@@ -64,6 +75,11 @@ fn main() {
         ),
         Command::Stop => stop_daemon(&paths),
         Command::Status => check_status(&paths),
+        Command::PushDown => send_push_down(&paths),
+        Command::PushUp => send_push_up(&paths),
+        Command::Toggle => send_toggle(&paths),
+        Command::Cancel => send_cancel(&paths),
+        Command::Events => stream_events(&paths),
         Command::Update { force } => speechyyy::update::handle_update_command(force),
     };
 

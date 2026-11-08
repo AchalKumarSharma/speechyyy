@@ -3,17 +3,39 @@ use crate::audio::vad::EnergyVad;
 use crate::config::Config;
 use crate::doctor::{run_doctor, RealSysEnv};
 use crate::engine::{AudioDictationEngine, DictationEngine, StateMachineController};
+use crate::events::{DaemonEvent, DictationState, EventBroadcaster};
 use crate::history::HistoryLogger;
 use crate::inference::create_inference_provider;
 use crate::injector::{create_injector, TextInjector};
-use crate::input::{EvdevListener, InputEventSource};
+use crate::input::{InputEventSource, NoopInputSource};
 use crate::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer, PidFile, RuntimePaths};
 use crate::text::{LearningDictionary, TextFormatter, TextPipeline};
-use std::os::unix::net::UnixListener;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+pub fn register_termination_signals(
+    running: Arc<AtomicBool>,
+) -> Result<signal_hook::iterator::backend::Handle, std::io::Error> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])?;
+
+    let handle = signals.handle();
+    std::thread::spawn(move || {
+        if let Some(sig) = signals.forever().next() {
+            eprintln!("\nReceived termination signal ({}), shutting down daemon...", sig);
+            running.store(false, Ordering::SeqCst);
+        }
+    });
+    Ok(handle)
+}
 
 pub fn run_session_loop<I, J, E>(
     listener: &UnixListener,
@@ -29,18 +51,214 @@ where
     J: TextInjector,
     E: DictationEngine,
 {
+    run_session_loop_with_broadcaster(
+        listener,
+        input_source,
+        injector,
+        controller,
+        running,
+        hotkey,
+        pacing_delay_ms,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_session_loop_with_broadcaster<I, J, E>(
+    listener: &UnixListener,
+    input_source: &mut I,
+    injector: &mut J,
+    controller: &mut StateMachineController<E>,
+    running: &AtomicBool,
+    hotkey: &str,
+    pacing_delay_ms: u64,
+    broadcaster: Option<&EventBroadcaster>,
+) -> Result<(), String>
+where
+    I: InputEventSource,
+    J: TextInjector,
+    E: DictationEngine,
+{
+    let mut last_rms_tick = Instant::now();
+
     while running.load(Ordering::SeqCst) {
+        // Broadcast audio level tick if recording
+        if let Some(b) = broadcaster {
+            b.accept_subscribers();
+            if controller.state == DictationState::Recording
+                && last_rms_tick.elapsed() >= Duration::from_millis(25)
+            {
+                last_rms_tick = Instant::now();
+                if let Some(active_rms) = controller.active_rms() {
+                    let bits = active_rms.load(Ordering::Relaxed);
+                    let rms = f32::from_bits(bits);
+                    b.broadcast(DaemonEvent::audio_level(rms, rms * 1.5));
+                }
+            }
+        }
+
         // 1. Process IPC socket connections
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let state_str = controller.state.as_str();
-                let _ = IpcServer::handle_connection(
+                match IpcServer::handle_connection(
                     &mut stream,
                     running,
                     state_str,
                     hotkey,
                     pacing_delay_ms,
-                );
+                ) {
+                    Ok(Some(IpcRequest::PushDown)) => {
+                        let prev = controller.state;
+                        if let Err(e) = controller.start_recording() {
+                            eprintln!("Failed to start recording on PushDown: {}", e);
+                        } else if controller.state == DictationState::Recording && prev != DictationState::Recording {
+                            if let Some(b) = broadcaster {
+                                b.broadcast(DaemonEvent::StateChanged {
+                                    state: DictationState::Recording,
+                                    previous: Some(prev),
+                                });
+                            }
+                        }
+                    }
+                    Ok(Some(IpcRequest::PushUp)) => {
+                        if controller.state == DictationState::Recording {
+                            if let Some(b) = broadcaster {
+                                b.broadcast(DaemonEvent::StateChanged {
+                                    state: DictationState::Processing,
+                                    previous: Some(DictationState::Recording),
+                                });
+                            }
+                            match controller.stop_and_transcribe() {
+                                Ok(Some(text)) => {
+                                    if let Some(b) = broadcaster {
+                                        b.broadcast(DaemonEvent::StateChanged {
+                                            state: DictationState::Emitting,
+                                            previous: Some(DictationState::Processing),
+                                        });
+                                    }
+                                    if let Err(e) = injector.inject(&text) {
+                                        eprintln!("Failed to inject text: {}", e);
+                                    }
+                                    controller.finish_emission();
+                                    if let Some(b) = broadcaster {
+                                        b.broadcast(DaemonEvent::StateChanged {
+                                            state: DictationState::Idle,
+                                            previous: Some(DictationState::Emitting),
+                                        });
+                                    }
+                                }
+                                Ok(None) => {
+                                    if let Some(b) = broadcaster {
+                                        b.broadcast(DaemonEvent::StateChanged {
+                                            state: DictationState::Idle,
+                                            previous: Some(DictationState::Processing),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Engine error on PushUp: {}", e);
+                                    if let Some(b) = broadcaster {
+                                        b.broadcast(DaemonEvent::Error {
+                                            code: "inference_failed".into(),
+                                            message: e,
+                                        });
+                                        b.broadcast(DaemonEvent::StateChanged {
+                                            state: DictationState::Idle,
+                                            previous: Some(DictationState::Error),
+                                        });
+                                    }
+                                    controller.reset_to_idle();
+                                }
+                            }
+                        }
+                    }
+                    Ok(Some(IpcRequest::Toggle)) => {
+                        let prev = controller.state;
+                        match prev {
+                            DictationState::Idle => {
+                                if let Err(e) = controller.start_recording() {
+                                    eprintln!("Failed to start recording on Toggle: {}", e);
+                                } else if let Some(b) = broadcaster {
+                                    b.broadcast(DaemonEvent::StateChanged {
+                                        state: DictationState::Recording,
+                                        previous: Some(DictationState::Idle),
+                                    });
+                                }
+                            }
+                            DictationState::Recording => {
+                                if let Some(b) = broadcaster {
+                                    b.broadcast(DaemonEvent::StateChanged {
+                                        state: DictationState::Processing,
+                                        previous: Some(DictationState::Recording),
+                                    });
+                                }
+                                match controller.stop_and_transcribe() {
+                                    Ok(Some(text)) => {
+                                        if let Some(b) = broadcaster {
+                                            b.broadcast(DaemonEvent::StateChanged {
+                                                state: DictationState::Emitting,
+                                                previous: Some(DictationState::Processing),
+                                            });
+                                        }
+                                        if let Err(e) = injector.inject(&text) {
+                                            eprintln!("Failed to inject text: {}", e);
+                                        }
+                                        controller.finish_emission();
+                                        if let Some(b) = broadcaster {
+                                            b.broadcast(DaemonEvent::StateChanged {
+                                                state: DictationState::Idle,
+                                                previous: Some(DictationState::Emitting),
+                                            });
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        if let Some(b) = broadcaster {
+                                            b.broadcast(DaemonEvent::StateChanged {
+                                                state: DictationState::Idle,
+                                                previous: Some(DictationState::Processing),
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Engine error on Toggle: {}", e);
+                                        if let Some(b) = broadcaster {
+                                            b.broadcast(DaemonEvent::Error {
+                                                code: "inference_failed".into(),
+                                                message: e,
+                                            });
+                                            b.broadcast(DaemonEvent::StateChanged {
+                                                state: DictationState::Idle,
+                                                previous: Some(DictationState::Error),
+                                            });
+                                        }
+                                        controller.reset_to_idle();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Some(IpcRequest::Cancel)) => {
+                        if controller.state == DictationState::Recording || controller.state == DictationState::Processing {
+                            let prev = controller.state;
+                            controller.cancel();
+                            if let Some(b) = broadcaster {
+                                b.broadcast(DaemonEvent::Canceled {
+                                    reason: "ipc_cancel".into(),
+                                });
+                                b.broadcast(DaemonEvent::StateChanged {
+                                    state: DictationState::Idle,
+                                    previous: Some(prev),
+                                });
+                            }
+                        }
+                    }
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("IPC connection error: {}", e);
+                    }
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
@@ -48,18 +266,51 @@ where
             }
         }
 
-        // 2. Poll input events (10ms tick)
+        // 2. Poll input events (10ms tick) without hardware EVIOCGRAB
         if let Some((keycode, is_down)) = input_source.poll_event(Duration::from_millis(10)) {
+            let prev = controller.state;
             match controller.handle_key_event(keycode, is_down) {
                 Ok(Some(text)) => {
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Emitting,
+                            previous: Some(DictationState::Processing),
+                        });
+                    }
                     if let Err(e) = injector.inject(&text) {
                         eprintln!("Failed to inject text: {}", e);
                     }
                     controller.finish_emission();
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Idle,
+                            previous: Some(DictationState::Emitting),
+                        });
+                    }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if controller.state != prev {
+                        if let Some(b) = broadcaster {
+                            b.broadcast(DaemonEvent::StateChanged {
+                                state: controller.state,
+                                previous: Some(prev),
+                            });
+                        }
+                    }
+                }
                 Err(e) => {
                     eprintln!("Engine error: {}", e);
+                    if let Some(b) = broadcaster {
+                        b.broadcast(DaemonEvent::Error {
+                            code: "inference_failed".into(),
+                            message: e,
+                        });
+                        b.broadcast(DaemonEvent::StateChanged {
+                            state: DictationState::Idle,
+                            previous: Some(DictationState::Error),
+                        });
+                    }
+                    controller.reset_to_idle();
                 }
             }
         }
@@ -75,24 +326,13 @@ pub fn start_daemon(
     typing_delay: Option<u64>,
     paths: &RuntimePaths,
 ) -> Result<(), String> {
-    if let Some(parent) = paths.pid_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create runtime directory {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
-    if let Some(parent) = paths.socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "Failed to create runtime directory {}: {}",
-                parent.display(),
-                e
-            )
-        })?;
-    }
+    paths.ensure_dir().map_err(|e| {
+        format!(
+            "Failed to create runtime directory {}: {}",
+            paths.dir.display(),
+            e
+        )
+    })?;
 
     // Pre-flight check
     let mut check_config = Config::load();
@@ -187,20 +427,28 @@ pub fn start_daemon(
             }
         }
     } else {
-        PidFile::acquire(&paths.pid_path)?;
-
         let server = IpcServer::new(paths.clone());
         let listener = match server.start_listener() {
             Ok(l) => l,
-            Err(e) => {
-                paths.cleanup();
+            Err(ref e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(format!(
-                    "Failed to bind Speechyyy socket at {}: {:?}",
+                    "Active Speechyyy daemon is already running (listening on {})",
+                    paths.socket_path.display()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to bind Speechyyy socket at {}: {}",
                     paths.socket_path.display(),
                     e
                 ));
             }
         };
+
+        if let Err(e) = PidFile::acquire(&paths.pid_path) {
+            paths.cleanup();
+            return Err(e);
+        }
 
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let running = server.running_flag();
@@ -217,7 +465,7 @@ pub fn start_daemon(
             }
         };
 
-        let mut input_source = EvdevListener::new();
+        let mut input_source = NoopInputSource;
         let capture = match CpalAudioCapture::new() {
             Ok(c) => c,
             Err(e) => {
@@ -247,7 +495,7 @@ pub fn start_daemon(
             "Speechyyy running in foreground (PID: {}).",
             std::process::id()
         );
-        println!("Push-to-Talk Hotkey: {:?}", config.hotkey);
+        println!("Trigger Mode: Compositor IPC (speechyyy push-down / push-up / toggle)");
         println!("Pacing Delay: {}ms", config.pacing_delay_ms);
         println!("Text Injector: {}", injector.name());
         println!("Inference Provider: {}", config.inference.provider);
@@ -256,7 +504,23 @@ pub fn start_daemon(
             println!("Sarvam Language: {}", config.inference.language_code);
         }
 
-        let _ = run_session_loop(
+        #[cfg(unix)]
+        let signal_handle = register_termination_signals(Arc::clone(&running))
+            .map_err(|e| format!("Failed to register POSIX signal handlers: {}", e))?;
+
+        let broadcaster = match EventBroadcaster::bind(&paths.events_socket_path) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to bind events socket at {}: {}",
+                    paths.events_socket_path.display(),
+                    e
+                );
+                None
+            }
+        };
+
+        let _ = run_session_loop_with_broadcaster(
             &listener,
             &mut input_source,
             &mut injector,
@@ -264,7 +528,11 @@ pub fn start_daemon(
             &running,
             &config.hotkey,
             config.pacing_delay_ms,
+            broadcaster.as_ref(),
         );
+
+        #[cfg(unix)]
+        signal_handle.close();
 
         println!("Shutting down Speechyyy...");
         paths.cleanup();
@@ -435,4 +703,337 @@ pub fn check_status(paths: &RuntimePaths) -> Result<(), String> {
     Ok(())
 }
 
+pub fn send_push_down(paths: &RuntimePaths) -> Result<(), String> {
+    if !paths.socket_path.exists() {
+        return Err("Speechyyy is not running. Start it first with 'speechyyy start'.".into());
+    }
+    match IpcClient::send_request(&paths.socket_path, &IpcRequest::PushDown) {
+        Ok(IpcResponse::PushDown) | Ok(IpcResponse::Ok { .. }) => {
+            println!("[✓] Recording started.");
+            Ok(())
+        }
+        Ok(IpcResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Err(e) => Err(format!("Failed to communicate with Speechyyy daemon: {}", e)),
+    }
+}
+
+pub fn send_push_up(paths: &RuntimePaths) -> Result<(), String> {
+    if !paths.socket_path.exists() {
+        return Err("Speechyyy is not running. Start it first with 'speechyyy start'.".into());
+    }
+    match IpcClient::send_request(&paths.socket_path, &IpcRequest::PushUp) {
+        Ok(IpcResponse::PushUp) | Ok(IpcResponse::Ok { .. }) => {
+            println!("[✓] Recording stopped, transcribing...");
+            Ok(())
+        }
+        Ok(IpcResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Err(e) => Err(format!("Failed to communicate with Speechyyy daemon: {}", e)),
+    }
+}
+
+pub fn send_toggle(paths: &RuntimePaths) -> Result<(), String> {
+    if !paths.socket_path.exists() {
+        return Err("Speechyyy is not running. Start it first with 'speechyyy start'.".into());
+    }
+    match IpcClient::send_request(&paths.socket_path, &IpcRequest::Toggle) {
+        Ok(IpcResponse::Ok { message }) => {
+            println!("[✓] {}", message);
+            Ok(())
+        }
+        Ok(IpcResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Err(e) => Err(format!("Failed to communicate with Speechyyy daemon: {}", e)),
+    }
+}
+
+pub fn send_cancel(paths: &RuntimePaths) -> Result<(), String> {
+    if !paths.socket_path.exists() {
+        return Err("Speechyyy is not running. Start it first with 'speechyyy start'.".into());
+    }
+    match IpcClient::send_request(&paths.socket_path, &IpcRequest::Cancel) {
+        Ok(IpcResponse::Ok { message }) => {
+            println!("[✓] {}", message);
+            Ok(())
+        }
+        Ok(IpcResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("Unexpected response: {:?}", other)),
+        Err(e) => Err(format!("Failed to communicate with Speechyyy daemon: {}", e)),
+    }
+}
+
+pub fn stream_events(paths: &RuntimePaths) -> Result<(), String> {
+    if !paths.events_socket_path.exists() {
+        return Err(format!(
+            "Speechyyy daemon is not running (events socket not found at {}). Start it first with 'speechyyy start'.",
+            paths.events_socket_path.display()
+        ));
+    }
+    let stream = UnixStream::connect(&paths.events_socket_path).map_err(|e| {
+        format!(
+            "Failed to connect to events socket at {}: {}",
+            paths.events_socket_path.display(),
+            e
+        )
+    })?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    while let Ok(bytes) = reader.read_line(&mut line) {
+        if bytes == 0 {
+            break;
+        }
+        print!("{}", line);
+        let _ = std::io::stdout().flush();
+        line.clear();
+    }
+    Ok(())
+}
+
 pub use crate::uninstall::{handle_uninstall_command, handle_uninstall_command_internal};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{MockDictationEngine, TargetChord};
+    use crate::injector::RecordingInjector;
+    use crate::input::FakeInputSource;
+    use evdev::KeyCode;
+
+    #[test]
+    fn test_run_session_loop_grab_and_release() {
+        let temp_dir = std::env::temp_dir().join(format!("daemon_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let sock_path = temp_dir.join("test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let mut input_source = FakeInputSource::new();
+        input_source.push_event(KeyCode::KEY_RIGHTALT, true);
+        input_source.push_event(KeyCode::KEY_RIGHTALT, false);
+
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let engine = MockDictationEngine::with_payload("test transcription");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+        let running = Arc::new(AtomicBool::new(true));
+
+        let running_clone = Arc::clone(&running);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            running_clone.store(false, Ordering::SeqCst);
+        });
+
+        let _ = run_session_loop(
+            &listener,
+            &mut input_source,
+            &mut injector,
+            &mut controller,
+            &running,
+            "RightAlt",
+            15,
+        );
+
+        assert!(!input_source.grabbed);
+        assert_eq!(
+            injector.injected_strings.lock().unwrap().as_slice(),
+            &["test transcription".to_string()]
+        );
+
+        let _ = std::fs::remove_file(sock_path);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_immediate_ungrab_on_keyup_before_transcription() {
+        let temp_dir = std::env::temp_dir().join(format!("daemon_ungrab_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let sock_path = temp_dir.join("test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        struct ObservableInputSource {
+            events: std::collections::VecDeque<(KeyCode, bool)>,
+            grabbed: Arc<AtomicBool>,
+        }
+        impl InputEventSource for ObservableInputSource {
+            fn poll_event(&mut self, _timeout: Duration) -> Option<(KeyCode, bool)> {
+                self.events.pop_front()
+            }
+            fn grab(&mut self) -> Result<(), String> {
+                self.grabbed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn ungrab(&mut self) -> Result<(), String> {
+                self.grabbed.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let grabbed_flag = Arc::new(AtomicBool::new(false));
+        let mut input_source = ObservableInputSource {
+            events: std::collections::VecDeque::from(vec![
+                (KeyCode::KEY_RIGHTALT, true),
+                (KeyCode::KEY_RIGHTALT, false),
+            ]),
+            grabbed: Arc::clone(&grabbed_flag),
+        };
+
+        struct InspectingEngine {
+            grabbed: Arc<AtomicBool>,
+            was_ungrabbed_during_transcription: Arc<AtomicBool>,
+        }
+        impl DictationEngine for InspectingEngine {
+            fn on_press(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn on_release(&mut self) -> Result<Option<String>, String> {
+                if !self.grabbed.load(Ordering::SeqCst) {
+                    self.was_ungrabbed_during_transcription.store(true, Ordering::SeqCst);
+                }
+                Ok(Some("immediate ungrab verified".to_string()))
+            }
+        }
+
+        let was_ungrabbed = Arc::new(AtomicBool::new(false));
+        let engine = InspectingEngine {
+            grabbed: Arc::clone(&grabbed_flag),
+            was_ungrabbed_during_transcription: Arc::clone(&was_ungrabbed),
+        };
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let running = Arc::new(AtomicBool::new(true));
+
+        let running_clone = Arc::clone(&running);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            running_clone.store(false, Ordering::SeqCst);
+        });
+
+        let _ = run_session_loop(
+            &listener,
+            &mut input_source,
+            &mut injector,
+            &mut controller,
+            &running,
+            "RightAlt",
+            15,
+        );
+
+        assert!(
+            was_ungrabbed.load(Ordering::SeqCst),
+            "Keyboard MUST be ungrabbed before on_release/transcription begins!"
+        );
+        assert!(!grabbed_flag.load(Ordering::SeqCst));
+
+        let _ = std::fs::remove_file(sock_path);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_run_session_loop_ipc_push_down_and_up() {
+        let temp_dir = std::env::temp_dir().join(format!("daemon_ipc_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let sock_path = temp_dir.join("test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let mut input_source = NoopInputSource;
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let engine = MockDictationEngine::with_payload("IPC Transcribed Output");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+        let running = Arc::new(AtomicBool::new(true));
+
+        let loop_running = Arc::clone(&running);
+        let client_sock = sock_path.clone();
+        let loop_thread = std::thread::spawn(move || {
+            let _ = run_session_loop(
+                &listener,
+                &mut input_source,
+                &mut injector,
+                &mut controller,
+                &loop_running,
+                "RightAlt",
+                15,
+            );
+            injector.injected_strings.lock().unwrap().clone()
+        });
+
+        // 1. Send PushDown via IPC
+        let down_res = IpcClient::send_request(&client_sock, &IpcRequest::PushDown);
+        assert_eq!(down_res, Ok(IpcResponse::PushDown));
+
+        // 2. Query Status via IPC to verify Recording state
+        let status_res = IpcClient::send_request(&client_sock, &IpcRequest::Status);
+        match status_res {
+            Ok(IpcResponse::Status { state, .. }) => assert_eq!(state, "Recording"),
+            other => panic!("Expected status Recording, got {:?}", other),
+        }
+
+        // 3. Send PushUp via IPC
+        let up_res = IpcClient::send_request(&client_sock, &IpcRequest::PushUp);
+        assert_eq!(up_res, Ok(IpcResponse::PushUp));
+
+        // 4. Send Stop
+        let stop_res = IpcClient::send_request(&client_sock, &IpcRequest::Stop);
+        assert!(matches!(stop_res, Ok(IpcResponse::Ok { .. })));
+
+        let injected = loop_thread.join().unwrap();
+        assert_eq!(injected, vec!["IPC Transcribed Output".to_string()]);
+
+        let _ = std::fs::remove_file(sock_path);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_run_session_loop_ipc_toggle() {
+        let temp_dir = std::env::temp_dir().join(format!("daemon_toggle_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let sock_path = temp_dir.join("test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let mut input_source = NoopInputSource;
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let engine = MockDictationEngine::with_payload("Toggled Transcription");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+        let running = Arc::new(AtomicBool::new(true));
+
+        let loop_running = Arc::clone(&running);
+        let client_sock = sock_path.clone();
+        let loop_thread = std::thread::spawn(move || {
+            let _ = run_session_loop(
+                &listener,
+                &mut input_source,
+                &mut injector,
+                &mut controller,
+                &loop_running,
+                "RightAlt",
+                15,
+            );
+            injector.injected_strings.lock().unwrap().clone()
+        });
+
+        // 1. First toggle starts recording
+        let toggle1 = IpcClient::send_request(&client_sock, &IpcRequest::Toggle);
+        assert!(matches!(toggle1, Ok(IpcResponse::Ok { .. })));
+
+        let status1 = IpcClient::send_request(&client_sock, &IpcRequest::Status);
+        match status1 {
+            Ok(IpcResponse::Status { state, .. }) => assert_eq!(state, "Recording"),
+            other => panic!("Expected Recording, got {:?}", other),
+        }
+
+        // 2. Second toggle stops recording and injects
+        let toggle2 = IpcClient::send_request(&client_sock, &IpcRequest::Toggle);
+        assert!(matches!(toggle2, Ok(IpcResponse::Ok { .. })));
+
+        // 3. Stop daemon
+        let _ = IpcClient::send_request(&client_sock, &IpcRequest::Stop);
+
+        let injected = loop_thread.join().unwrap();
+        assert_eq!(injected, vec!["Toggled Transcription".to_string()]);
+
+        let _ = std::fs::remove_file(sock_path);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+}

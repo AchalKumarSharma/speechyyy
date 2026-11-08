@@ -44,6 +44,7 @@ fn test_cli_parsing_model_subcommands() {
         Command::Download {
             model: Some("parakeet-tdt-v3".to_string()),
             model_flag: None,
+            force: false,
         }
     );
 
@@ -54,6 +55,7 @@ fn test_cli_parsing_model_subcommands() {
         Command::Download {
             model: None,
             model_flag: Some("whisper-small".to_string()),
+            force: false,
         }
     );
 
@@ -64,6 +66,7 @@ fn test_cli_parsing_model_subcommands() {
         Command::Download {
             model: Some("saaras:v4".to_string()),
             model_flag: None,
+            force: false,
         }
     );
 
@@ -74,6 +77,7 @@ fn test_cli_parsing_model_subcommands() {
         Command::Download {
             model: Some("sarvam:saaras-v4".to_string()),
             model_flag: None,
+            force: false,
         }
     );
 
@@ -387,10 +391,13 @@ fn test_download_workflow_cloud_and_local() {
         prompter_called = true;
         Ok("sk_sarvam_live_key_555".to_string())
     };
+    let mut confirm_noop = || Ok(false);
     let res = handle_model_download_internal(
         "saaras:v4",
+        false,
         &config_file,
         Some(&models_dir),
+        &mut confirm_noop,
         &mut prompter,
     );
     assert!(res.is_ok());
@@ -405,16 +412,19 @@ fn test_download_workflow_cloud_and_local() {
         assert!(cfg.inference.resolve_api_key().is_some());
     }
 
-    // 2. Download saaras:v4 again when key is already configured -> does not prompt
+    // 2. Download saaras:v4 again when key is already configured and confirm is false -> does not prompt
     let mut prompter_called_again = false;
     let mut prompter_again = || {
         prompter_called_again = true;
         Ok("should_not_prompt".to_string())
     };
+    let mut confirm_decline = || Ok(false);
     let res_again = handle_model_download_internal(
         "saaras:v4",
+        false,
         &config_file,
         Some(&models_dir),
+        &mut confirm_decline,
         &mut prompter_again,
     );
     assert!(res_again.is_ok());
@@ -428,8 +438,10 @@ fn test_download_workflow_cloud_and_local() {
     };
     let res_full = handle_model_download_internal(
         "sarvam:saaras-v4",
+        false,
         &config_file,
         Some(&models_dir),
+        &mut confirm_decline,
         &mut prompter_full,
     );
     assert!(res_full.is_ok());
@@ -444,8 +456,10 @@ fn test_download_workflow_cloud_and_local() {
     }
     let res_empty = handle_model_download_internal(
         "saaras:v4",
+        false,
         &empty_cfg_path,
         Some(&models_dir),
+        &mut confirm_noop,
         &mut empty_prompter,
     );
     if let Some(ref k) = env_key {
@@ -458,8 +472,10 @@ fn test_download_workflow_cloud_and_local() {
     let mut dummy_prompter = || Ok("dummy".to_string());
     let res_unsupported = handle_model_download_internal(
         "whisper-nano",
+        false,
         &config_file,
         Some(&models_dir),
+        &mut confirm_noop,
         &mut dummy_prompter,
     );
     assert!(res_unsupported.is_err());

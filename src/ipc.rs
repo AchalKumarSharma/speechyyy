@@ -13,6 +13,10 @@ pub enum IpcRequest {
     Status,
     Stop,
     Ping,
+    PushDown,
+    PushUp,
+    Toggle,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +32,8 @@ pub enum IpcResponse {
         pacing_delay_ms: u64,
     },
     Pong,
+    PushDown,
+    PushUp,
     Error {
         message: String,
     },
@@ -37,19 +43,19 @@ pub enum IpcResponse {
 pub struct RuntimePaths {
     pub dir: PathBuf,
     pub socket_path: PathBuf,
+    pub events_socket_path: PathBuf,
     pub pid_path: PathBuf,
     pub binary_path: Option<PathBuf>,
 }
 
 impl RuntimePaths {
     pub fn new() -> Self {
-        let base = std::env::var("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
+        let dir = std::env::var("XDG_RUNTIME_DIR")
+            .map(|xdg| PathBuf::from(xdg).join("speechyyy"))
             .unwrap_or_else(|_| {
                 let uid = unsafe { libc::getuid() };
                 PathBuf::from(format!("/tmp/speechyyy-{}", uid))
             });
-        let dir = base.join("speechyyy");
         let mut paths = Self::with_dir(dir);
         paths.binary_path = std::env::current_exe().ok();
         paths
@@ -65,10 +71,12 @@ impl Default for RuntimePaths {
 impl RuntimePaths {
     pub fn with_dir(dir: PathBuf) -> Self {
         let socket_path = dir.join("speechyyy.sock");
+        let events_socket_path = dir.join("events.sock");
         let pid_path = dir.join("speechyyy.pid");
         Self {
             dir,
             socket_path,
+            events_socket_path,
             pid_path,
             binary_path: None,
         }
@@ -86,12 +94,30 @@ impl RuntimePaths {
     }
 
     pub fn ensure_dir(&self) -> std::io::Result<()> {
-        fs::create_dir_all(&self.dir)
+        create_secure_dir(&self.dir)
     }
 
     pub fn cleanup(&self) {
         PidFile::remove(&self.pid_path);
         let _ = fs::remove_file(&self.socket_path);
+        let _ = fs::remove_file(&self.events_socket_path);
+    }
+}
+
+pub fn create_secure_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder.create(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
     }
 }
 
@@ -108,7 +134,7 @@ impl PidFile {
 
     pub fn acquire(path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            create_secure_dir(parent)
                 .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
         }
 
@@ -180,12 +206,51 @@ impl IpcServer {
         self.running.clone()
     }
 
-    pub fn start_listener(&self) -> Result<UnixListener, std::io::Result<()>> {
+    pub fn start_listener(&self) -> Result<UnixListener, std::io::Error> {
         if let Some(parent) = self.paths.socket_path.parent() {
-            fs::create_dir_all(parent).map_err(Err)?;
+            create_secure_dir(parent)?;
         }
-        let _ = fs::remove_file(&self.paths.socket_path);
-        UnixListener::bind(&self.paths.socket_path).map_err(Err)
+        if self.paths.socket_path.exists() {
+            match IpcClient::send_request(&self.paths.socket_path, &IpcRequest::Ping) {
+                Ok(IpcResponse::Pong) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!(
+                            "Active Speechyyy daemon is already listening on {}",
+                            self.paths.socket_path.display()
+                        ),
+                    ));
+                }
+                _ => {
+                    match UnixStream::connect(&self.paths.socket_path) {
+                        Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            eprintln!(
+                                "Detected stale socket at {}, unlinking...",
+                                self.paths.socket_path.display()
+                            );
+                            let _ = fs::remove_file(&self.paths.socket_path);
+                        }
+                        Ok(_) => {
+                            eprintln!(
+                                "Detected non-responsive socket at {}, unlinking...",
+                                self.paths.socket_path.display()
+                            );
+                            let _ = fs::remove_file(&self.paths.socket_path);
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+        let listener = UnixListener::bind(&self.paths.socket_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.paths.socket_path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(listener)
     }
 
     pub fn handle_connection(
@@ -194,36 +259,64 @@ impl IpcServer {
         current_state: &str,
         hotkey: &str,
         pacing_delay_ms: u64,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Option<IpcRequest>> {
+        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Ok(());
+            return Ok(None);
         }
 
-        let resp = match serde_json::from_str::<IpcRequest>(line.trim()) {
-            Ok(IpcRequest::Ping) => IpcResponse::Pong,
-            Ok(IpcRequest::Status) => IpcResponse::Status {
-                pid: std::process::id(),
-                state: current_state.to_string(),
-                hotkey: hotkey.to_string(),
-                pacing_delay_ms,
-            },
+        let (resp, action) = match serde_json::from_str::<IpcRequest>(line.trim()) {
+            Ok(IpcRequest::Ping) => (IpcResponse::Pong, None),
+            Ok(IpcRequest::Status) => (
+                IpcResponse::Status {
+                    pid: std::process::id(),
+                    state: current_state.to_string(),
+                    hotkey: hotkey.to_string(),
+                    pacing_delay_ms,
+                },
+                None,
+            ),
             Ok(IpcRequest::Stop) => {
                 running.store(false, Ordering::SeqCst);
-                IpcResponse::Ok {
-                    message: "Speechyyy stopping".into(),
-                }
+                (
+                    IpcResponse::Ok {
+                        message: "Speechyyy stopping".into(),
+                    },
+                    None,
+                )
             }
-            Err(e) => IpcResponse::Error {
-                message: format!("Malformed command: {}", e),
-            },
+            Ok(IpcRequest::PushDown) => (IpcResponse::PushDown, Some(IpcRequest::PushDown)),
+            Ok(IpcRequest::PushUp) => (IpcResponse::PushUp, Some(IpcRequest::PushUp)),
+            Ok(IpcRequest::Toggle) => (
+                IpcResponse::Ok {
+                    message: "Toggling recording state".into(),
+                },
+                Some(IpcRequest::Toggle),
+            ),
+            Ok(IpcRequest::Cancel) => (
+                IpcResponse::Ok {
+                    message: "Dictation canceled".into(),
+                },
+                Some(IpcRequest::Cancel),
+            ),
+            Err(e) => (
+                IpcResponse::Error {
+                    message: format!("Malformed command: {}", e),
+                },
+                None,
+            ),
         };
 
-        let mut out = serde_json::to_string(&resp).unwrap();
+        let mut out = serde_json::to_string(&resp)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         out.push('\n');
         stream.write_all(out.as_bytes())?;
-        stream.flush()
+        stream.flush()?;
+        Ok(action)
     }
 }
 
@@ -294,6 +387,80 @@ mod tests {
     }
 
     #[test]
+    fn test_ipc_push_down_up_and_toggle() {
+        let temp_dir = std::env::temp_dir().join(format!("speechyyy_push_test_{}", std::process::id()));
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        let server = IpcServer::new(paths.clone());
+        let listener = server.start_listener().expect("listener should bind");
+        listener.set_nonblocking(true).unwrap();
+
+        let running = server.running_flag();
+
+        // 1. PushDown request
+        let socket_path = paths.socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            IpcClient::send_request(&socket_path, &IpcRequest::PushDown).expect("push down request")
+        });
+
+        let mut stream = loop {
+            if let Ok((s, _)) = listener.accept() {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let action = IpcServer::handle_connection(&mut stream, &running, "Idle", "RightAlt", 3)
+            .expect("handle connection");
+        assert_eq!(action, Some(IpcRequest::PushDown));
+        let resp = client_thread.join().unwrap();
+        assert_eq!(resp, IpcResponse::PushDown);
+
+        // 2. PushUp request
+        let socket_path = paths.socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            IpcClient::send_request(&socket_path, &IpcRequest::PushUp).expect("push up request")
+        });
+
+        let mut stream = loop {
+            if let Ok((s, _)) = listener.accept() {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let action = IpcServer::handle_connection(&mut stream, &running, "Recording", "RightAlt", 3)
+            .expect("handle connection");
+        assert_eq!(action, Some(IpcRequest::PushUp));
+        let resp = client_thread.join().unwrap();
+        assert_eq!(resp, IpcResponse::PushUp);
+
+        // 3. Toggle request
+        let socket_path = paths.socket_path.clone();
+        let client_thread = std::thread::spawn(move || {
+            IpcClient::send_request(&socket_path, &IpcRequest::Toggle).expect("toggle request")
+        });
+
+        let mut stream = loop {
+            if let Ok((s, _)) = listener.accept() {
+                break s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let action = IpcServer::handle_connection(&mut stream, &running, "Idle", "RightAlt", 3)
+            .expect("handle connection");
+        assert_eq!(action, Some(IpcRequest::Toggle));
+        let resp = client_thread.join().unwrap();
+        match resp {
+            IpcResponse::Ok { message } => assert!(message.contains("Toggling")),
+            other => panic!("Unexpected response for toggle: {:?}", other),
+        }
+
+        paths.cleanup();
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn test_pid_file_lifecycle() {
         let temp_dir =
             std::env::temp_dir().join(format!("speechyyy_pid_test_{}", std::process::id()));
@@ -336,5 +503,56 @@ mod tests {
         paths.cleanup();
         let root_created = temp_dir.parent().unwrap().parent().unwrap();
         let _ = fs::remove_dir_all(root_created);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ipc_directory_and_socket_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = std::env::temp_dir()
+            .join(format!("speechyyy_perm_test_{}", std::process::id()))
+            .join("sock_dir");
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        paths.ensure_dir().expect("ensure_dir should succeed");
+
+        let dir_meta = fs::metadata(&temp_dir).expect("dir metadata");
+        let dir_mode = dir_meta.permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "Runtime directory mode must be 0700");
+
+        let server = IpcServer::new(paths.clone());
+        let _listener = server.start_listener().expect("listener should bind");
+        let sock_meta = fs::metadata(&paths.socket_path).expect("socket metadata");
+        let sock_mode = sock_meta.permissions().mode() & 0o777;
+        assert_eq!(sock_mode, 0o600, "Socket file mode must be 0600");
+
+        paths.cleanup();
+        let _ = fs::remove_dir_all(temp_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn test_stale_socket_recovery() {
+        let temp_dir = std::env::temp_dir().join(format!("speechyyy_stale_sock_{}", std::process::id()));
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        paths.ensure_dir().expect("ensure dir");
+
+        // 1. Create a socket listener and immediately drop it without unlinking the file
+        {
+            let server = IpcServer::new(paths.clone());
+            let listener = server.start_listener().expect("bind initial listener");
+            assert!(paths.socket_path.exists());
+            drop(listener);
+        }
+
+        // The socket file still exists on disk, but no process is listening (ECONNREFUSED)
+        assert!(paths.socket_path.exists());
+
+        // 2. A new server should detect the stale socket, unlink it, and bind successfully
+        let server2 = IpcServer::new(paths.clone());
+        let listener2 = server2.start_listener();
+        assert!(listener2.is_ok(), "Expected stale socket to be unlinked and rebound");
+        assert!(paths.socket_path.exists());
+
+        paths.cleanup();
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

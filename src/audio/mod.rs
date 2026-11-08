@@ -4,6 +4,9 @@ pub mod ring_buffer;
 pub mod vad;
 pub mod wav;
 
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
+
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 
 /// A discrete contiguous vector of 16,000 Hz single-channel PCM audio samples
@@ -56,6 +59,20 @@ pub trait AudioCapture: Send {
     fn start_capture(&mut self) -> Result<(), AudioError>;
     fn stop_capture(&mut self) -> Result<AudioChunk, AudioError>;
     fn is_capturing(&self) -> bool;
+    fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        None
+    }
+}
+
+/// Computes Root Mean Square (RMS) energy for a block of audio samples,
+/// clamped strictly between 0.0 and 1.0.
+pub fn calculate_block_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    let raw = (sum_sq / samples.len() as f64).sqrt() as f32;
+    raw.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]

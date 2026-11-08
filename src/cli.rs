@@ -15,6 +15,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
 pub enum Command {
     /// Start Speechyyy (-f for foreground logs)
+    #[command(alias = "daemon")]
     Start {
         /// Run in foreground instead of detaching in background
         #[arg(short, long)]
@@ -36,6 +37,18 @@ pub enum Command {
     Stop,
     /// Inspect Speechyyy status
     Status,
+    /// Trigger push-to-talk press (start recording via compositor IPC)
+    #[command(name = "push-down", alias = "down")]
+    PushDown,
+    /// Trigger push-to-talk release (stop recording & transcribe via compositor IPC)
+    #[command(name = "push-up", alias = "up")]
+    PushUp,
+    /// Toggle push-to-talk recording state
+    Toggle,
+    /// Cancel active recording or processing
+    Cancel,
+    /// Stream real-time daemon events in NDJSON format
+    Events,
     /// Inspect system permissions, audio inputs, and model weights
     Doctor,
     /// List available speech recognition models (alias: model)
@@ -52,6 +65,9 @@ pub enum Command {
         /// Target model architecture flag (-m, --model)
         #[arg(short = 'm', long = "model", value_name = "MODEL")]
         model_flag: Option<String>,
+        /// Force re-download or overwrite existing credentials
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
     /// Switch active model (e.g. speechyyy use parakeet-tdt-v3)
     Use {
@@ -66,9 +82,6 @@ pub enum Command {
     },
     /// Completely uninstall Speechyyy
     Uninstall {
-        /// Purge all models, configs, dictionaries, and user-space binaries
-        #[arg(long)]
-        purge: bool,
         /// Automatic yes to prompts; run non-interactively
         #[arg(short = 'y', long = "yes")]
         yes: bool,
@@ -114,6 +127,9 @@ pub enum ModelCommands {
         /// Target model architecture flag (-m, --model)
         #[arg(short = 'm', long = "model", value_name = "MODEL")]
         model_flag: Option<String>,
+        /// Force re-download or overwrite existing credentials
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
     /// List supported speech models
     List,
@@ -139,7 +155,6 @@ impl ModelCommands {
     }
 }
 
-pub type Commands = Command;
 pub type ModelAction = ModelCommands;
 
 #[cfg(test)]
@@ -178,6 +193,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_start_daemon_alias() {
+        let cli = Cli::try_parse_from(["speechyyy", "daemon"]).expect("parse daemon alias");
+        assert_eq!(
+            cli.command,
+            Command::Start {
+                foreground: false,
+                provider: None,
+                mode: None,
+                injection: None,
+                typing_delay: None,
+            }
+        );
+    }
+
+    #[test]
     fn test_parse_stop() {
         let cli = Cli::try_parse_from(["speechyyy", "stop"]).expect("parse stop");
         assert_eq!(cli.command, Command::Stop);
@@ -187,6 +217,39 @@ mod tests {
     fn test_parse_status() {
         let cli = Cli::try_parse_from(["speechyyy", "status"]).expect("parse status");
         assert_eq!(cli.command, Command::Status);
+    }
+
+    #[test]
+    fn test_parse_push_down_and_up() {
+        let cli_down = Cli::try_parse_from(["speechyyy", "push-down"]).expect("parse push-down");
+        assert_eq!(cli_down.command, Command::PushDown);
+
+        let cli_alias_down = Cli::try_parse_from(["speechyyy", "down"]).expect("parse down alias");
+        assert_eq!(cli_alias_down.command, Command::PushDown);
+
+        let cli_up = Cli::try_parse_from(["speechyyy", "push-up"]).expect("parse push-up");
+        assert_eq!(cli_up.command, Command::PushUp);
+
+        let cli_alias_up = Cli::try_parse_from(["speechyyy", "up"]).expect("parse up alias");
+        assert_eq!(cli_alias_up.command, Command::PushUp);
+    }
+
+    #[test]
+    fn test_parse_toggle() {
+        let cli_toggle = Cli::try_parse_from(["speechyyy", "toggle"]).expect("parse toggle");
+        assert_eq!(cli_toggle.command, Command::Toggle);
+    }
+
+    #[test]
+    fn test_parse_cancel() {
+        let cli = Cli::try_parse_from(["speechyyy", "cancel"]).expect("parse cancel");
+        assert_eq!(cli.command, Command::Cancel);
+    }
+
+    #[test]
+    fn test_parse_events() {
+        let cli = Cli::try_parse_from(["speechyyy", "events"]).expect("parse events");
+        assert_eq!(cli.command, Command::Events);
     }
 
     #[test]
@@ -276,9 +339,24 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Models {
-                action: Some(ModelAction::Download {
+                action: Some(ModelCommands::Download {
                     model: None,
                     model_flag: Some("parakeet-tdt-v3".to_string()),
+                    force: false,
+                })
+            }
+        );
+
+        let cli_force =
+            Cli::try_parse_from(["speechyyy", "model", "download", "saaras:v4", "-f"])
+                .expect("parse model download force");
+        assert_eq!(
+            cli_force.command,
+            Command::Models {
+                action: Some(ModelCommands::Download {
+                    model: Some("saaras:v4".to_string()),
+                    model_flag: None,
+                    force: true,
                 })
             }
         );
@@ -335,6 +413,7 @@ mod tests {
             Command::Download {
                 model: Some("parakeet-tdt-v3".to_string()),
                 model_flag: None,
+                force: false,
             }
         );
 
@@ -345,6 +424,7 @@ mod tests {
             Command::Download {
                 model: None,
                 model_flag: Some("whisper-small".to_string()),
+                force: false,
             }
         );
 
@@ -355,6 +435,7 @@ mod tests {
             Command::Download {
                 model: Some("saaras:v4".to_string()),
                 model_flag: None,
+                force: false,
             }
         );
 
@@ -365,6 +446,18 @@ mod tests {
             Command::Download {
                 model: Some("sarvam:saaras-v4".to_string()),
                 model_flag: None,
+                force: false,
+            }
+        );
+
+        let cli_force = Cli::try_parse_from(["speechyyy", "download", "saaras:v4", "--force"])
+            .expect("parse download cloud saaras with --force");
+        assert_eq!(
+            cli_force.command,
+            Command::Download {
+                model: Some("saaras:v4".to_string()),
+                model_flag: None,
+                force: true,
             }
         );
     }
@@ -429,17 +522,6 @@ mod tests {
         assert_eq!(
             cli.command,
             Command::Uninstall {
-                purge: false,
-                yes: false
-            }
-        );
-
-        let cli_purge =
-            Cli::try_parse_from(["speechyyy", "uninstall", "--purge"]).expect("parse uninstall purge");
-        assert_eq!(
-            cli_purge.command,
-            Command::Uninstall {
-                purge: true,
                 yes: false
             }
         );
@@ -449,7 +531,6 @@ mod tests {
         assert_eq!(
             cli_yes.command,
             Command::Uninstall {
-                purge: false,
                 yes: true
             }
         );
@@ -459,7 +540,6 @@ mod tests {
         assert_eq!(
             cli_yes_long.command,
             Command::Uninstall {
-                purge: false,
                 yes: true
             }
         );

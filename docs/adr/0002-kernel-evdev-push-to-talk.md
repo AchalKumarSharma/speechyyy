@@ -5,5 +5,15 @@ Global push-to-talk hotkey detection on Wayland cannot rely on traditional X11 h
 ## Considered Options
 
 - **XDG Desktop Portal (`GlobalShortcuts`)**: Rejected because portal implementations vary significantly across compositors and typically do not expose key-release events required for push-to-talk.
-- **Exclusive Grab (`EVIOCGRAB`)**: Rejected because grabbing locks the entire keyboard, swallowing regular typing and risking an input lockup if the process hangs.
+- **Exclusive Grab (`EVIOCGRAB`)**: Originally rejected in v0.1 due to risk of process hang locking out keyboards. Re-evaluated and adopted under scoped safeguards in v0.2.0 (see Amendment below).
+
+## Amendment (v0.2.0): Scoped EVIOCGRAB with RAII Guard & Watchdog
+
+In v0.2.0, purely passive monitoring was found to leak push-to-talk chords (such as `RightAlt`, `Alt+Space`) to window managers and focused applications, triggering desktop collisions (e.g., KRunner, Alt-drag, application menu accelerators).
+
+To isolate desktop input without risking keyboard lockups:
+1. `EVIOCGRAB` is engaged exclusively during active push-to-talk chords (`DictationState::Recording`) and released immediately upon key release or text injection.
+2. The grab lifecycle is managed via an RAII `EvdevGrabGuard`. If the daemon, recording loop, or thread exits unexpectedly or panics, `Drop` guarantees immediate device ungrab.
+3. A safety watchdog automatically drops the grab if continuous recording exceeds 60 seconds.
+4. Desktop environments or users who prefer passive monitoring can toggle `grab_key = false` under `[input]` in `config.toml`.
 

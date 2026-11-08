@@ -1,5 +1,5 @@
 use crate::audio::AudioChunk;
-use crate::inference::wav::encode_wav_16k_mono;
+use crate::audio::wav::encode_wav_16k_mono;
 use crate::inference::{InferenceError, SpeechInference};
 use serde::Deserialize;
 
@@ -19,8 +19,9 @@ pub struct SarvamSpeechInference {
 
 impl SarvamSpeechInference {
     pub fn new(api_key: String, model: String, language_code: String, mode: String) -> Self {
+        let sanitized_key = api_key.trim().trim_matches('"').to_string();
         Self {
-            api_key,
+            api_key: sanitized_key,
             model,
             language_code,
             mode,
@@ -105,7 +106,7 @@ pub fn build_multipart_body(
 
 impl SpeechInference for SarvamSpeechInference {
     fn transcribe(&mut self, chunk: &AudioChunk) -> Result<String, InferenceError> {
-        if self.api_key.trim().is_empty() {
+        if self.api_key.is_empty() {
             return Err(InferenceError::MissingApiKey("SARVAM_API_KEY".to_string()));
         }
 
@@ -275,5 +276,26 @@ mod tests {
             }
             other => panic!("Expected MissingApiKey, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_api_key_sanitization_trims_quotes_and_whitespace() {
+        let sarvam = SarvamSpeechInference::new(
+            "  \"my_secret_token_123\"  ".into(),
+            "saaras:v4".into(),
+            "unknown".into(),
+            "transcribe".into(),
+        );
+        assert_eq!(sarvam.api_key, "my_secret_token_123");
+
+        let mut sarvam_empty_quotes = SarvamSpeechInference::new(
+            "  \"\"  ".into(),
+            "saaras:v4".into(),
+            "unknown".into(),
+            "transcribe".into(),
+        );
+        let chunk = AudioChunk::new(vec![0.1; 1600]);
+        let err = sarvam_empty_quotes.transcribe(&chunk).unwrap_err();
+        assert!(matches!(err, InferenceError::MissingApiKey(_)));
     }
 }

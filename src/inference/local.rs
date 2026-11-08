@@ -18,6 +18,7 @@ pub enum ActiveRecognizer {
 pub struct LocalSpeechInference {
     pub model_type: LocalModelType,
     pub model_dir: PathBuf,
+    model_verified: bool,
     recognizer: Option<ActiveRecognizer>,
 }
 
@@ -31,9 +32,11 @@ impl Default for LocalSpeechInference {
 
 impl LocalSpeechInference {
     pub fn new(model_type: LocalModelType, model_dir: PathBuf) -> Self {
+        let model_verified = ModelManager::verify_model_files(model_type, &model_dir).is_ok();
         Self {
             model_type,
             model_dir,
+            model_verified,
             recognizer: None,
         }
     }
@@ -70,16 +73,18 @@ impl LocalSpeechInference {
                     ))
                 })?;
 
-                let mut config = TransducerConfig::default();
-                config.encoder = encoder.to_string_lossy().to_string();
-                config.decoder = decoder.to_string_lossy().to_string();
-                config.joiner = joiner.to_string_lossy().to_string();
-                config.tokens = tokens.to_string_lossy().to_string();
-                config.model_type = "nemo_transducer".to_string();
-                config.feature_dim = 128;
-                config.sample_rate = 16000;
-                config.provider = Some("cpu".to_string());
-                config.num_threads = 2;
+                let config = TransducerConfig {
+                    encoder: encoder.to_string_lossy().to_string(),
+                    decoder: decoder.to_string_lossy().to_string(),
+                    joiner: joiner.to_string_lossy().to_string(),
+                    tokens: tokens.to_string_lossy().to_string(),
+                    model_type: "nemo_transducer".to_string(),
+                    feature_dim: 128,
+                    sample_rate: 16000,
+                    provider: Some("cpu".to_string()),
+                    num_threads: 2,
+                    ..Default::default()
+                };
                 let recognizer = TransducerRecognizer::new(config).map_err(|e| {
                     InferenceError::LocalEngine(format!(
                         "Failed to initialize Parakeet Transducer recognizer: {}",
@@ -212,13 +217,16 @@ impl LocalSpeechInference {
 
 impl SpeechInference for LocalSpeechInference {
     fn transcribe(&mut self, chunk: &AudioChunk) -> Result<String, InferenceError> {
-        // Guardrail: Verify model files exist on disk before attempting execution
-        if let Err(err) = ModelManager::verify_model_files(self.model_type, &self.model_dir) {
-            return Err(InferenceError::NotConfigured(format!(
-                "Local model weights missing at {}: {}. Run 'speechyyy model download' to install.",
-                self.model_dir.display(),
-                err
-            )));
+        // Fast-path guardrail: Check verified model weights status from initialization without disk I/O
+        if !self.model_verified {
+            if let Err(err) = ModelManager::verify_model_files(self.model_type, &self.model_dir) {
+                return Err(InferenceError::NotConfigured(format!(
+                    "Local model weights missing at {}: {}. Run 'speechyyy model download' to install.",
+                    self.model_dir.display(),
+                    err
+                )));
+            }
+            self.model_verified = true;
         }
 
         // Check if there is audio to transcribe
@@ -279,20 +287,22 @@ impl CustomSpeechInference {
                     )
                 })?;
                 let is_nemo = self.config.r#type.to_lowercase() == "nemo_transducer";
-                let mut cfg = TransducerConfig::default();
-                cfg.encoder = self.config.encoder.to_string_lossy().to_string();
-                cfg.decoder = self.config.decoder.to_string_lossy().to_string();
-                cfg.joiner = joiner.to_string_lossy().to_string();
-                cfg.tokens = self.config.tokens.to_string_lossy().to_string();
-                cfg.model_type = if is_nemo {
-                    "nemo_transducer".to_string()
-                } else {
-                    "transducer".to_string()
+                let cfg = TransducerConfig {
+                    encoder: self.config.encoder.to_string_lossy().to_string(),
+                    decoder: self.config.decoder.to_string_lossy().to_string(),
+                    joiner: joiner.to_string_lossy().to_string(),
+                    tokens: self.config.tokens.to_string_lossy().to_string(),
+                    model_type: if is_nemo {
+                        "nemo_transducer".to_string()
+                    } else {
+                        "transducer".to_string()
+                    },
+                    feature_dim: if is_nemo { 128 } else { 80 },
+                    sample_rate: 16000,
+                    provider: Some("cpu".to_string()),
+                    num_threads: 2,
+                    ..Default::default()
                 };
-                cfg.feature_dim = if is_nemo { 128 } else { 80 };
-                cfg.sample_rate = 16000;
-                cfg.provider = Some("cpu".to_string());
-                cfg.num_threads = 2;
                 let rec = TransducerRecognizer::new(cfg).map_err(|e| {
                     InferenceError::LocalEngine(format!("Failed to init custom transducer: {}", e))
                 })?;

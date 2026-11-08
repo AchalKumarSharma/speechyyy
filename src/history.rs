@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static ROTATION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistoryRecord {
@@ -23,7 +26,48 @@ impl Default for HistoryLogger {
     }
 }
 
+fn open_secure_history_file(
+    path: &std::path::Path,
+    append: bool,
+) -> Result<fs::File, std::io::Error> {
+    #[cfg(unix)]
+    let mut open_opts = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = fs::OpenOptions::new();
+        opts.mode(0o600);
+        opts
+    };
+    #[cfg(not(unix))]
+    let mut open_opts = fs::OpenOptions::new();
+
+    open_opts.create(true);
+    if append {
+        open_opts.append(true);
+    } else {
+        open_opts.write(true).truncate(true);
+    }
+
+    let file = open_opts.open(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = file.metadata() {
+            let mut perms = metadata.permissions();
+            if perms.mode() & 0o777 != 0o600 {
+                perms.set_mode(0o600);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+    }
+
+    Ok(file)
+}
+
 impl HistoryLogger {
+    pub const MAX_ENTRIES: usize = 500;
+    pub const MAX_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
     pub fn default_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(home)
@@ -43,20 +87,101 @@ impl HistoryLogger {
         Self { path }
     }
 
-    pub fn append(&self, record: &HistoryRecord) -> Result<(), std::io::Error> {
+    fn ensure_parent_dir(&self) -> Result<(), std::io::Error> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+            if !parent.exists() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    let mut builder = std::fs::DirBuilder::new();
+                    builder.recursive(true);
+                    builder.mode(0o700);
+                    builder.create(parent)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rotate_if_needed(&self) -> Result<(), std::io::Error> {
+        if !self.path.exists() {
+            return Ok(());
         }
 
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let metadata = fs::metadata(&self.path)?;
+        let content = fs::read_to_string(&self.path)?;
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+        if lines.len() <= Self::MAX_ENTRIES && metadata.len() <= Self::MAX_BYTES {
+            return Ok(());
+        }
+
+        let line_capped = if lines.len() > Self::MAX_ENTRIES {
+            &lines[lines.len() - Self::MAX_ENTRIES..]
+        } else {
+            &lines[..]
+        };
+
+        let mut total_bytes: u64 = 0;
+        let mut start_idx = 0;
+        for (i, line) in line_capped.iter().enumerate().rev() {
+            let line_len = (line.len() + 1) as u64;
+            if total_bytes + line_len > Self::MAX_BYTES && total_bytes > 0 {
+                start_idx = i + 1;
+                break;
+            }
+            total_bytes += line_len;
+        }
+
+        let retained = &line_capped[start_idx..];
+
+        let pid = std::process::id();
+        let counter = ROTATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = match self.path.file_name() {
+            Some(name) => self
+                .path
+                .with_file_name(format!("{}.tmp.{}.{}", name.to_string_lossy(), pid, counter)),
+            None => self.path.with_extension(format!("tmp.{}.{}", pid, counter)),
+        };
+
+        let write_res = (|| -> Result<(), std::io::Error> {
+            let mut file = open_secure_history_file(&tmp_path, false)?;
+            for line in retained {
+                writeln!(file, "{}", line)?;
+            }
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        if let Err(e) = fs::rename(&tmp_path, &self.path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub fn append(&self, record: &HistoryRecord) -> Result<(), std::io::Error> {
+        self.ensure_parent_dir()?;
+
+        let mut file = open_secure_history_file(&self.path, true)?;
 
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         writeln!(file, "{}", line)?;
+
+        self.rotate_if_needed()?;
+
         Ok(())
     }
 
@@ -360,5 +485,136 @@ mod tests {
         assert!(res_none.is_ok());
         let res_empty = handle_fix_command_opts(Some("   "));
         assert!(res_empty.is_ok());
+    }
+
+    #[test]
+    fn test_history_file_and_dir_permissions() {
+        let temp_dir = std::env::temp_dir().join(format!("hist_perm_test_{}", std::process::id()));
+        let hist_path = temp_dir.join("history.jsonl");
+        let logger = HistoryLogger::with_path(hist_path.clone());
+
+        let rec = HistoryRecord {
+            timestamp: "2026-11-06T12:00:00Z".into(),
+            raw_text: "test".into(),
+            final_text: "Test".into(),
+            provider: "mock".into(),
+            duration_secs: 0.5,
+        };
+
+        logger.append(&rec).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_meta = fs::metadata(&temp_dir).unwrap();
+            assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+
+            let file_meta = fs::metadata(&hist_path).unwrap();
+            assert_eq!(file_meta.permissions().mode() & 0o777, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_history_rotation_at_capacity() {
+        let temp_dir = std::env::temp_dir().join(format!("hist_rot_test_{}", std::process::id()));
+        let hist_path = temp_dir.join("history.jsonl");
+        let logger = HistoryLogger::with_path(hist_path.clone());
+
+        // Append 520 records
+        for i in 0..520 {
+            let rec = HistoryRecord {
+                timestamp: format!("2026-11-06T12:{:02}:00Z", i % 60),
+                raw_text: format!("record {}", i),
+                final_text: format!("Record {}", i),
+                provider: "mock".into(),
+                duration_secs: 1.0,
+            };
+            logger.append(&rec).unwrap();
+        }
+
+        let content = fs::read_to_string(&hist_path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), HistoryLogger::MAX_ENTRIES);
+
+        // Verify the oldest records were truncated and the newest preserved
+        let last_entry = logger.get_last_entry().unwrap().unwrap();
+        assert_eq!(last_entry.raw_text, "record 519");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_history_rotation_at_byte_capacity() {
+        let temp_dir = std::env::temp_dir().join(format!("hist_byte_rot_{}", std::process::id()));
+        let hist_path = temp_dir.join("history.jsonl");
+        let logger = HistoryLogger::with_path(hist_path.clone());
+
+        // Create large payload: 3 entries of 2 MB each -> 6 MB total (> MAX_BYTES 5 MB)
+        let large_str = "x".repeat(2 * 1024 * 1024);
+        for i in 0..3 {
+            let rec = HistoryRecord {
+                timestamp: format!("2026-11-06T12:{:02}:00Z", i),
+                raw_text: format!("large_{}_{}", i, &large_str[..10]),
+                final_text: format!("large_{}_{}", i, large_str),
+                provider: "mock".into(),
+                duration_secs: 1.0,
+            };
+            logger.append(&rec).unwrap();
+        }
+
+        let meta = fs::metadata(&hist_path).unwrap();
+        assert!(
+            meta.len() <= HistoryLogger::MAX_BYTES,
+            "History file size {} exceeded MAX_BYTES {}",
+            meta.len(),
+            HistoryLogger::MAX_BYTES
+        );
+
+        let recent = logger.get_recent_entries(10).unwrap();
+        // Oldest entries must have been trimmed to fit inside 5 MB
+        assert!(recent.len() < 3);
+        assert_eq!(recent.last().unwrap().raw_text, "large_2_xxxxxxxxxx");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_history_rotation_atomic_swap_and_temp_cleanup() {
+        let temp_dir = std::env::temp_dir().join(format!("hist_atomic_rot_{}", std::process::id()));
+        let hist_path = temp_dir.join("history.jsonl");
+        let logger = HistoryLogger::with_path(hist_path.clone());
+
+        // Fill past MAX_ENTRIES to trigger rotation
+        for i in 0..520 {
+            let rec = HistoryRecord {
+                timestamp: format!("2026-11-06T12:{:02}:00Z", i % 60),
+                raw_text: format!("entry {}", i),
+                final_text: format!("Entry {}", i),
+                provider: "sarvam".into(),
+                duration_secs: 0.5,
+            };
+            logger.append(&rec).unwrap();
+        }
+
+        // Verify that rotation left no temporary files behind in the parent directory
+        let entries = fs::read_dir(&temp_dir).unwrap();
+        let file_names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(file_names, vec!["history.jsonl".to_string()]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(&hist_path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "Rotated history file must retain 0600 permissions");
+        }
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

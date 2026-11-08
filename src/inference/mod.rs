@@ -1,7 +1,6 @@
 pub mod local;
 pub mod mock;
 pub mod sarvam;
-pub mod wav;
 
 use crate::audio::AudioChunk;
 

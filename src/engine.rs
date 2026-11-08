@@ -1,10 +1,13 @@
 use crate::audio::vad::EnergyVad;
 use crate::audio::AudioCapture;
+use crate::events::DictationState;
 use crate::history::HistoryLogger;
 use crate::inference::SpeechInference;
 use crate::text::TextPipeline;
 use evdev::KeyCode;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Modifier {
@@ -135,23 +138,37 @@ impl KeyChordTracker {
             }
         }
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DictationState {
-    Idle,
-    Recording,
-    Processing,
-    Emitting,
-}
-
-impl DictationState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Idle => "Idle",
-            Self::Recording => "Recording",
-            Self::Processing => "Processing",
-            Self::Emitting => "Emitting",
+    pub fn is_chord_release(&self, key: KeyCode, is_down: bool) -> bool {
+        if is_down || !self.is_chord_active {
+            return false;
+        }
+        match &self.target {
+            TargetChord::SingleKey(target_key) => key == *target_key,
+            TargetChord::Compound {
+                modifiers,
+                trigger_key,
+            } => {
+                if key == *trigger_key {
+                    true
+                } else {
+                    match key {
+                        KeyCode::KEY_LEFTCTRL | KeyCode::KEY_RIGHTCTRL => {
+                            modifiers.contains(&Modifier::Ctrl)
+                        }
+                        KeyCode::KEY_LEFTALT | KeyCode::KEY_RIGHTALT => {
+                            modifiers.contains(&Modifier::Alt)
+                        }
+                        KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT => {
+                            modifiers.contains(&Modifier::Shift)
+                        }
+                        KeyCode::KEY_LEFTMETA | KeyCode::KEY_RIGHTMETA => {
+                            modifiers.contains(&Modifier::Super)
+                        }
+                        _ => false,
+                    }
+                }
+            }
         }
     }
 }
@@ -159,6 +176,9 @@ impl DictationState {
 pub trait DictationEngine {
     fn on_press(&mut self) -> Result<(), String>;
     fn on_release(&mut self) -> Result<Option<String>, String>;
+    fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        None
+    }
 }
 
 pub struct MockDictationEngine {
@@ -278,8 +298,7 @@ impl<C: AudioCapture, I: SpeechInference> DictationEngine for AudioDictationEngi
                     }
                     Err(e) => {
                         eprintln!("Speech inference failed: {}", e);
-                        // Do not inject error string into active caret
-                        Ok(None)
+                        Err(e.to_string())
                     }
                 }
             }
@@ -288,6 +307,10 @@ impl<C: AudioCapture, I: SpeechInference> DictationEngine for AudioDictationEngi
                 Ok(None)
             }
         }
+    }
+
+    fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        self.capture.active_rms()
     }
 }
 
@@ -306,6 +329,62 @@ impl<E: DictationEngine> StateMachineController<E> {
         }
     }
 
+    pub fn start_recording(&mut self) -> Result<(), String> {
+        if self.state == DictationState::Idle {
+            self.state = DictationState::Recording;
+            self.engine.on_press()?;
+        }
+        Ok(())
+    }
+
+    pub fn stop_and_transcribe(&mut self) -> Result<Option<String>, String> {
+        if self.state == DictationState::Recording {
+            self.state = DictationState::Processing;
+            match self.engine.on_release() {
+                Ok(Some(text)) => {
+                    self.state = DictationState::Emitting;
+                    Ok(Some(text))
+                }
+                Ok(None) => {
+                    self.state = DictationState::Idle;
+                    Ok(None)
+                }
+                Err(err) => {
+                    self.state = DictationState::Error;
+                    Err(err)
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn reset_to_idle(&mut self) {
+        self.state = DictationState::Idle;
+    }
+
+    pub fn cancel(&mut self) {
+        if self.state == DictationState::Recording {
+            let _ = self.engine.on_release();
+        }
+        self.state = DictationState::Idle;
+    }
+
+    pub fn active_rms(&self) -> Option<Arc<AtomicU32>> {
+        self.engine.active_rms()
+    }
+
+    pub fn toggle(&mut self) -> Result<Option<String>, String> {
+        match self.state {
+            DictationState::Idle => {
+                self.start_recording()?;
+                Ok(None)
+            }
+            DictationState::Recording => self.stop_and_transcribe(),
+            _ => Ok(None),
+        }
+    }
+
     pub fn handle_key_event(
         &mut self,
         key: KeyCode,
@@ -313,26 +392,10 @@ impl<E: DictationEngine> StateMachineController<E> {
     ) -> Result<Option<String>, String> {
         match self.tracker.handle_key(key, is_down) {
             ChordEvent::Press => {
-                if self.state == DictationState::Idle {
-                    self.state = DictationState::Recording;
-                    self.engine.on_press()?;
-                }
+                self.start_recording()?;
                 Ok(None)
             }
-            ChordEvent::Release => {
-                if self.state == DictationState::Recording {
-                    self.state = DictationState::Processing;
-                    let text_opt = self.engine.on_release()?;
-                    if text_opt.is_some() {
-                        self.state = DictationState::Emitting;
-                    } else {
-                        self.state = DictationState::Idle;
-                    }
-                    Ok(text_opt)
-                } else {
-                    Ok(None)
-                }
-            }
+            ChordEvent::Release => self.stop_and_transcribe(),
             ChordEvent::None => Ok(None),
         }
     }
@@ -340,6 +403,14 @@ impl<E: DictationEngine> StateMachineController<E> {
     pub fn finish_emission(&mut self) {
         if self.state == DictationState::Emitting {
             self.state = DictationState::Idle;
+        }
+    }
+
+    pub fn is_chord_release(&self, key: KeyCode, is_down: bool) -> bool {
+        if self.state == DictationState::Recording {
+            self.tracker.is_chord_release(key, is_down)
+        } else {
+            false
         }
     }
 }
@@ -441,6 +512,37 @@ mod tests {
         assert_eq!(res, Some("Hello from Speechyyy".to_string()));
         assert_eq!(controller.state, DictationState::Emitting);
 
+        controller.finish_emission();
+        assert_eq!(controller.state, DictationState::Idle);
+    }
+
+    #[test]
+    fn test_controller_direct_recording_and_toggle() {
+        let engine = MockDictationEngine::with_payload("Direct IPC Payload");
+        let mut controller = StateMachineController::new(TargetChord::right_alt(), engine);
+
+        assert_eq!(controller.state, DictationState::Idle);
+
+        // 1. Direct start_recording
+        controller.start_recording().unwrap();
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // 2. Direct stop_and_transcribe
+        let text = controller.stop_and_transcribe().unwrap();
+        assert_eq!(text, Some("Direct IPC Payload".to_string()));
+        assert_eq!(controller.state, DictationState::Emitting);
+        controller.finish_emission();
+        assert_eq!(controller.state, DictationState::Idle);
+
+        // 3. Toggle from Idle -> Recording
+        let toggle_res1 = controller.toggle().unwrap();
+        assert_eq!(toggle_res1, None);
+        assert_eq!(controller.state, DictationState::Recording);
+
+        // 4. Toggle from Recording -> Processing/Emitting
+        let toggle_res2 = controller.toggle().unwrap();
+        assert_eq!(toggle_res2, Some("Direct IPC Payload".to_string()));
+        assert_eq!(controller.state, DictationState::Emitting);
         controller.finish_emission();
         assert_eq!(controller.state, DictationState::Idle);
     }
@@ -554,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_dictation_engine_inference_error_returns_none() {
+    fn test_audio_dictation_engine_inference_error_emits_error_state() {
         use crate::audio::capture::MockAudioCapture;
         use crate::audio::AudioChunk;
         use crate::inference::{InferenceError, SpeechInference};
@@ -578,12 +680,10 @@ mod tests {
         controller
             .handle_key_event(KeyCode::KEY_RIGHTALT, true)
             .unwrap();
-        // Failure shouldn't cause an unwrap or error propagation, just Ok(None) to stay resilient
-        let output = controller
-            .handle_key_event(KeyCode::KEY_RIGHTALT, false)
-            .unwrap();
-        assert_eq!(output, None);
-        assert_eq!(controller.state, DictationState::Idle);
+        // Inference error must return Err(...) and set state to DictationState::Error (no silent swallowing)
+        let res = controller.handle_key_event(KeyCode::KEY_RIGHTALT, false);
+        assert!(res.is_err());
+        assert_eq!(controller.state, DictationState::Error);
     }
 
     #[test]

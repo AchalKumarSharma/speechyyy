@@ -8,6 +8,147 @@ fn default_hotkey() -> String {
     "RightAlt".to_string()
 }
 
+fn default_grab_key() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputConfig {
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
+    #[serde(default = "default_grab_key")]
+    pub grab_key: bool,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            hotkey: default_hotkey(),
+            grab_key: default_grab_key(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputError {
+    UnknownKey(String),
+}
+
+impl std::fmt::Display for InputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputError::UnknownKey(k) => write!(f, "Unknown or unsupported key '{}'", k),
+        }
+    }
+}
+
+impl std::error::Error for InputError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputKey {
+    RightAlt,
+    LeftAlt,
+    CapsLock,
+    ScrollLock,
+    Pause,
+    RightCtrl,
+    LeftCtrl,
+    RightShift,
+    LeftShift,
+    Space,
+    Enter,
+    Tab,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
+
+impl InputKey {
+    pub fn to_keycode(&self) -> KeyCode {
+        match self {
+            InputKey::Space => KeyCode::KEY_SPACE,
+            InputKey::RightAlt => KeyCode::KEY_RIGHTALT,
+            InputKey::LeftAlt => KeyCode::KEY_LEFTALT,
+            InputKey::CapsLock => KeyCode::KEY_CAPSLOCK,
+            InputKey::ScrollLock => KeyCode::KEY_SCROLLLOCK,
+            InputKey::Pause => KeyCode::KEY_PAUSE,
+            InputKey::RightCtrl => KeyCode::KEY_RIGHTCTRL,
+            InputKey::LeftCtrl => KeyCode::KEY_LEFTCTRL,
+            InputKey::RightShift => KeyCode::KEY_RIGHTSHIFT,
+            InputKey::LeftShift => KeyCode::KEY_LEFTSHIFT,
+            InputKey::Enter => KeyCode::KEY_ENTER,
+            InputKey::Tab => KeyCode::KEY_TAB,
+            InputKey::F1 => KeyCode::KEY_F1,
+            InputKey::F2 => KeyCode::KEY_F2,
+            InputKey::F3 => KeyCode::KEY_F3,
+            InputKey::F4 => KeyCode::KEY_F4,
+            InputKey::F5 => KeyCode::KEY_F5,
+            InputKey::F6 => KeyCode::KEY_F6,
+            InputKey::F7 => KeyCode::KEY_F7,
+            InputKey::F8 => KeyCode::KEY_F8,
+            InputKey::F9 => KeyCode::KEY_F9,
+            InputKey::F10 => KeyCode::KEY_F10,
+            InputKey::F11 => KeyCode::KEY_F11,
+            InputKey::F12 => KeyCode::KEY_F12,
+        }
+    }
+}
+
+impl std::str::FromStr for InputKey {
+    type Err = InputError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "space" => Ok(InputKey::Space),
+            "rightalt" | "right_alt" | "alt_r" => Ok(InputKey::RightAlt),
+            "leftalt" | "left_alt" | "alt_l" => Ok(InputKey::LeftAlt),
+            "capslock" | "caps_lock" | "caps" => Ok(InputKey::CapsLock),
+            "scrolllock" | "scroll_lock" => Ok(InputKey::ScrollLock),
+            "pause" | "pausebreak" | "pause_break" => Ok(InputKey::Pause),
+            "rightctrl" | "right_ctrl" | "ctrl_r" => Ok(InputKey::RightCtrl),
+            "leftctrl" | "left_ctrl" | "ctrl_l" => Ok(InputKey::LeftCtrl),
+            "rightshift" | "right_shift" | "shift_r" => Ok(InputKey::RightShift),
+            "leftshift" | "left_shift" | "shift_l" => Ok(InputKey::LeftShift),
+            "enter" | "return" => Ok(InputKey::Enter),
+            "tab" => Ok(InputKey::Tab),
+            "f1" => Ok(InputKey::F1),
+            "f2" => Ok(InputKey::F2),
+            "f3" => Ok(InputKey::F3),
+            "f4" => Ok(InputKey::F4),
+            "f5" => Ok(InputKey::F5),
+            "f6" => Ok(InputKey::F6),
+            "f7" => Ok(InputKey::F7),
+            "f8" => Ok(InputKey::F8),
+            "f9" => Ok(InputKey::F9),
+            "f10" => Ok(InputKey::F10),
+            "f11" => Ok(InputKey::F11),
+            "f12" => Ok(InputKey::F12),
+            _ => Err(InputError::UnknownKey(s.to_string())),
+        }
+    }
+}
+
+impl TryFrom<&str> for InputKey {
+    type Error = InputError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+pub fn resolve_hotkey(name: &str) -> Result<KeyCode, InputError> {
+    name.parse::<InputKey>().map(|k| k.to_keycode())
+}
+
 fn default_pacing_ms() -> u64 {
     15
 }
@@ -156,6 +297,7 @@ fn default_ui_config() -> UiConfig {
 pub struct Config {
     pub hotkey: String,
     pub pacing_delay_ms: u64,
+    pub input: InputConfig,
     pub audio: AudioConfig,
     pub inference: InferenceConfig,
     pub injector: InjectorConfig,
@@ -164,8 +306,10 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawConfig {
-    #[serde(default = "default_hotkey")]
-    hotkey: String,
+    #[serde(default)]
+    input: Option<InputConfig>,
+    #[serde(default)]
+    hotkey: Option<String>,
     #[serde(default)]
     pacing_delay_ms: Option<u64>,
     #[serde(default)]
@@ -231,9 +375,16 @@ impl From<RawConfig> for Config {
             ui.nickname = default_nickname();
         }
 
+        let mut input = raw.input.unwrap_or_default();
+        if let Some(h) = raw.hotkey {
+            input.hotkey = h;
+        }
+        let hotkey = input.hotkey.clone();
+
         Config {
-            hotkey: raw.hotkey,
+            hotkey,
             pacing_delay_ms: delay,
+            input,
             audio: raw.audio,
             inference,
             injector,
@@ -247,6 +398,7 @@ impl Default for Config {
         Self {
             hotkey: default_hotkey(),
             pacing_delay_ms: default_pacing_ms(),
+            input: InputConfig::default(),
             audio: AudioConfig::default(),
             inference: InferenceConfig::default(),
             injector: InjectorConfig::default(),
@@ -297,26 +449,7 @@ impl Config {
         provider: &str,
         model: &str,
     ) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create config directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
-
-        let mut table = if path.exists() {
-            let content = fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            match toml::from_str::<toml::Value>(&content) {
-                Ok(toml::Value::Table(t)) => t,
-                _ => toml::Table::new(),
-            }
-        } else {
-            toml::Table::new()
-        };
+        let mut table = read_toml_table(path)?;
 
         let inf_val = table
             .entry("inference")
@@ -335,36 +468,11 @@ impl Config {
         table.remove("provider");
         table.remove("sarvam_model");
 
-        let serialized = toml::to_string_pretty(&toml::Value::Table(table))
-            .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
-
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
-
-        Ok(())
+        write_secure_config(path, &table)
     }
 
     pub fn deactivate_model_in_file(path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create config directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
-
-        let mut table = if path.exists() {
-            let content = fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            match toml::from_str::<toml::Value>(&content) {
-                Ok(toml::Value::Table(t)) => t,
-                _ => toml::Table::new(),
-            }
-        } else {
-            toml::Table::new()
-        };
+        let mut table = read_toml_table(path)?;
 
         let inf_val = table
             .entry("inference")
@@ -380,36 +488,11 @@ impl Config {
 
         table.remove("sarvam_model");
 
-        let serialized = toml::to_string_pretty(&toml::Value::Table(table))
-            .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
-
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
-
-        Ok(())
+        write_secure_config(path, &table)
     }
 
     pub fn save_sarvam_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create config directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
-
-        let mut table = if path.exists() {
-            let content = fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            match toml::from_str::<toml::Value>(&content) {
-                Ok(toml::Value::Table(t)) => t,
-                _ => toml::Table::new(),
-            }
-        } else {
-            toml::Table::new()
-        };
+        let mut table = read_toml_table(path)?;
 
         let inf_val = table
             .entry("inference")
@@ -427,17 +510,13 @@ impl Config {
         table.remove("sarvam_api_key");
         table.remove("sarvam_model");
 
-        let serialized = toml::to_string_pretty(&toml::Value::Table(table))
-            .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
-
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
-
-        Ok(())
+        write_secure_config(path, &table)
     }
 
     pub fn to_target_chord(&self) -> TargetChord {
-        parse_hotkey(&self.hotkey).unwrap_or_else(TargetChord::right_alt)
+        parse_hotkey(&self.input.hotkey)
+            .or_else(|| parse_hotkey(&self.hotkey))
+            .unwrap_or_else(TargetChord::right_alt)
     }
 
     pub fn apply_cli_overrides(
@@ -463,17 +542,64 @@ impl Config {
     }
 }
 
-fn parse_trigger_key(name: &str) -> Option<KeyCode> {
-    match name.to_lowercase().as_str() {
-        "space" => Some(KeyCode::KEY_SPACE),
-        "rightalt" | "right_alt" | "alt_r" => Some(KeyCode::KEY_RIGHTALT),
-        "leftalt" | "left_alt" | "alt_l" => Some(KeyCode::KEY_LEFTALT),
-        "rightctrl" | "right_ctrl" | "ctrl_r" => Some(KeyCode::KEY_RIGHTCTRL),
-        "leftctrl" | "left_ctrl" | "ctrl_l" => Some(KeyCode::KEY_LEFTCTRL),
-        "enter" => Some(KeyCode::KEY_ENTER),
-        "tab" => Some(KeyCode::KEY_TAB),
-        _ => None,
+fn read_toml_table(path: &Path) -> Result<toml::Table, String> {
+    if path.exists() {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        match toml::from_str::<toml::Value>(&content) {
+            Ok(toml::Value::Table(t)) => Ok(t),
+            _ => Ok(toml::Table::new()),
+        }
+    } else {
+        Ok(toml::Table::new())
     }
+}
+
+fn write_secure_config(path: &Path, table: &toml::Table) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create config directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+
+    let serialized = toml::to_string_pretty(&toml::Value::Table(table.clone()))
+        .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+
+        file.write_all(serialized.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to set permissions on {}: {}", path.display(), e))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, serialized)
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    }
+
+    Ok(())
+}
+
+fn parse_trigger_key(name: &str) -> Option<KeyCode> {
+    resolve_hotkey(name).ok()
 }
 
 pub fn parse_hotkey(s: &str) -> Option<TargetChord> {
@@ -521,6 +647,52 @@ mod tests {
                 modifiers: vec![Modifier::Alt],
                 trigger_key: KeyCode::KEY_SPACE
             })
+        );
+        assert_eq!(
+            parse_hotkey("CapsLock"),
+            Some(TargetChord::SingleKey(KeyCode::KEY_CAPSLOCK))
+        );
+        assert_eq!(
+            parse_hotkey("F8"),
+            Some(TargetChord::SingleKey(KeyCode::KEY_F8))
+        );
+    }
+
+    #[test]
+    fn test_hotkey_resolver_mappings() {
+        use std::str::FromStr;
+        assert_eq!(InputKey::from_str("RightAlt").unwrap(), InputKey::RightAlt);
+        assert_eq!(InputKey::try_from("CapsLock").unwrap(), InputKey::CapsLock);
+        assert_eq!(InputKey::RightAlt.to_keycode(), KeyCode::KEY_RIGHTALT);
+
+        assert_eq!(resolve_hotkey("RightAlt").unwrap(), KeyCode::KEY_RIGHTALT);
+        assert_eq!(resolve_hotkey("LeftAlt").unwrap(), KeyCode::KEY_LEFTALT);
+        assert_eq!(resolve_hotkey("CapsLock").unwrap(), KeyCode::KEY_CAPSLOCK);
+        assert_eq!(resolve_hotkey("ScrollLock").unwrap(), KeyCode::KEY_SCROLLLOCK);
+        assert_eq!(resolve_hotkey("Pause").unwrap(), KeyCode::KEY_PAUSE);
+        assert_eq!(resolve_hotkey("Space").unwrap(), KeyCode::KEY_SPACE);
+        assert_eq!(resolve_hotkey("F8").unwrap(), KeyCode::KEY_F8);
+        assert_eq!(resolve_hotkey("F12").unwrap(), KeyCode::KEY_F12);
+        assert!(matches!(
+            resolve_hotkey("InvalidKey123"),
+            Err(InputError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn test_input_config_deserialization() {
+        let toml_data = r#"
+[input]
+hotkey = "CapsLock"
+grab_key = false
+"#;
+        let parsed: Config = toml::from_str(toml_data).unwrap();
+        assert_eq!(parsed.input.hotkey, "CapsLock");
+        assert!(!parsed.input.grab_key);
+        assert_eq!(parsed.hotkey, "CapsLock");
+        assert_eq!(
+            parsed.to_target_chord(),
+            TargetChord::SingleKey(KeyCode::KEY_CAPSLOCK)
         );
     }
 
@@ -709,6 +881,23 @@ model = "parakeet-tdt-v3"
         let reloaded = Config::load_from_path(&config_file);
         assert_eq!(reloaded.inference.provider, "local");
         assert_eq!(reloaded.inference.model, "");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_sarvam_credentials_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = std::env::temp_dir().join(format!("speechyyy_cfg_perm_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let config_file = temp_dir.join("speechyyy").join("config.toml");
+
+        Config::save_sarvam_credentials_in_file(&config_file, "secret_key_123")
+            .expect("save credentials");
+        let meta = fs::metadata(&config_file).expect("config file metadata");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "Config file permissions must be 0600");
 
         let _ = fs::remove_dir_all(temp_dir);
     }
