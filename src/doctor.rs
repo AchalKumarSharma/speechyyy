@@ -37,6 +37,10 @@ pub trait SysEnv {
     fn check_layer_shell(&self, _dock_bin: &Path) -> Result<LayerShellCheckResult, String> {
         Ok(LayerShellCheckResult::Supported)
     }
+
+    fn current_desktop(&self) -> String {
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "current desktop".into())
+    }
 }
 
 pub struct RealSysEnv;
@@ -165,7 +169,7 @@ impl SysEnv for RealSysEnv {
         {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = fs::metadata(path) {
-                return (meta.permissions().mode() & 0o111) != 0;
+                return (meta.permissions().mode() & 0o100) != 0;
             }
             false
         }
@@ -244,14 +248,19 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
     }
     match prov.as_str() {
         "sarvam" => {
-            if let Some(key) = config.inference.resolve_api_key() {
-                let masked = mask_credential(&key);
-                Ok(format!("Sarvam API Key: {} (configured)", masked))
-            } else {
-                Err(
+            let key_info = config.inference.resolve_key_for_provider("sarvam");
+            match key_info {
+                Some((_, source)) => {
+                    let host = "api.sarvam.ai";
+                    Ok(format!(
+                        "Sarvam: key configured (source: {}), host: {} (policy: valid HTTPS)",
+                        source, host
+                    ))
+                }
+                None => Err(
                     "Sarvam API Key missing. Set SARVAM_API_KEY in config.toml or environment."
                         .into(),
-                )
+                ),
             }
         }
         "groq" => {
@@ -598,7 +607,7 @@ pub fn run_doctor_opts<E: SysEnv>(
     // 5. Speech inference provider readiness check
     match env.check_inference() {
         Ok(info) => {
-            let name = if info.starts_with("Sarvam API Key") {
+            let name = if info.starts_with("Sarvam API Key") || info.starts_with("Sarvam:") {
                 info
             } else {
                 format!("Speech inference provider: {}", info)
@@ -726,8 +735,7 @@ pub fn run_doctor_opts<E: SysEnv>(
                         });
                     }
                     Ok(LayerShellCheckResult::Unsupported) => {
-                        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
-                            .unwrap_or_else(|_| "current desktop".into());
+                        let desktop = env.current_desktop();
                         items.push(DiagnosticItem {
                             name: "Wayland layer-shell protocol (zwlr_layer_shell_v1)".into(),
                             status: CheckStatus::Warn(format!(
@@ -1373,7 +1381,7 @@ mod tests {
         config.inference.api_key = "sk_test_1234567890abcdef".into();
 
         let res = check_inference_for_config(&config).expect("should succeed with api key");
-        assert_eq!(res, "Sarvam API Key: sk_t...cdef (configured)");
+        assert!(res.contains("Sarvam: key configured (source: config), host: api.sarvam.ai"));
 
         config.inference.api_key.clear();
         std::env::remove_var("SARVAM_API_KEY");

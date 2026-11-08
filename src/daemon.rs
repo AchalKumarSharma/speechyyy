@@ -449,6 +449,31 @@ pub fn spawn_dock_process(bin_path: &Path) -> Option<u32> {
     }
 }
 
+pub fn find_running_dock_pid(paths: &RuntimePaths, proc_root: &Path) -> Option<u32> {
+    let dock_pid_raw = PidFile::read_pid(&paths.dock_pid_path);
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0;
+
+    let dock_pid_valid = dock_pid_raw
+        .is_some_and(|p| crate::procs::pid_matches(proc_root, p, "speechyyy-dock"));
+    if let Some(p) = dock_pid_raw {
+        if PidFile::is_process_running(p) && !dock_pid_valid {
+            PidFile::remove(&paths.dock_pid_path);
+        }
+    }
+    if dock_pid_valid {
+        return dock_pid_raw;
+    }
+    let extra_docks = crate::procs::list_own_processes_named(proc_root, "speechyyy-dock", uid);
+    extra_docks.first().copied()
+}
+
+pub fn is_dock_currently_running(paths: &RuntimePaths, proc_root: &Path) -> bool {
+    find_running_dock_pid(paths, proc_root).is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn start_daemon(
     foreground: bool,
@@ -544,24 +569,8 @@ pub fn start_daemon(
         if ready {
             let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
             let dock_bin = resolve_dock_binary(Some(&current_exe));
-
-            let dock_pid_raw = PidFile::read_pid(&paths.dock_pid_path);
             let proc_root = Path::new("/proc");
-            #[cfg(unix)]
-            let uid = unsafe { libc::geteuid() };
-            #[cfg(not(unix))]
-            let uid = 0;
-
-            let dock_pid_valid = dock_pid_raw
-                .is_some_and(|p| crate::procs::pid_matches(proc_root, p, "speechyyy-dock"));
-            if let Some(p) = dock_pid_raw {
-                if PidFile::is_process_running(p) && !dock_pid_valid {
-                    PidFile::remove(&paths.dock_pid_path);
-                }
-            }
-            let extra_docks =
-                crate::procs::list_own_processes_named(proc_root, "speechyyy-dock", uid);
-            let dock_running = dock_pid_valid || !extra_docks.is_empty();
+            let dock_running = is_dock_currently_running(paths, proc_root);
 
             let decision = should_launch_dock(
                 no_dock,
@@ -583,7 +592,7 @@ pub fn start_daemon(
                 }
                 DockLaunchDecision::SkipAlreadyRunning => {
                     println!("✦ Companion dock is already running; skipping duplicate launch.");
-                    active_dock_pid = dock_pid_raw.or_else(|| extra_docks.first().copied());
+                    active_dock_pid = find_running_dock_pid(paths, proc_root);
                 }
                 DockLaunchDecision::SkipBinaryNotFound => {
                     println!("✦ Companion dock binary not found; speechyyy-dock skipped.");
@@ -620,24 +629,8 @@ pub fn start_daemon(
             let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
             let current_exe = std::env::current_exe().ok();
             let dock_bin = resolve_dock_binary(current_exe.as_deref());
-
-            let dock_pid_raw = PidFile::read_pid(&paths.dock_pid_path);
             let proc_root = Path::new("/proc");
-            #[cfg(unix)]
-            let uid = unsafe { libc::geteuid() };
-            #[cfg(not(unix))]
-            let uid = 0;
-
-            let dock_pid_valid = dock_pid_raw
-                .is_some_and(|p| crate::procs::pid_matches(proc_root, p, "speechyyy-dock"));
-            if let Some(p) = dock_pid_raw {
-                if PidFile::is_process_running(p) && !dock_pid_valid {
-                    PidFile::remove(&paths.dock_pid_path);
-                }
-            }
-            let extra_docks =
-                crate::procs::list_own_processes_named(proc_root, "speechyyy-dock", uid);
-            let dock_running = dock_pid_valid || !extra_docks.is_empty();
+            let dock_running = is_dock_currently_running(paths, proc_root);
 
             let decision = should_launch_dock(
                 no_dock,
@@ -786,6 +779,16 @@ pub fn stop_daemon(paths: &RuntimePaths) -> Result<(), String> {
 
 /// Stops both Speechyyy and speechyyy-dock cleanly, sweeping any orphaned docks.
 /// Used by `speechyyy stop`, `update`, and `uninstall`.
+/// Gracefully terminates daemon and companion dock processes, PID files, and sockets.
+///
+/// Order of operations:
+/// 1. Sends `IpcRequest::Stop` if control socket answers.
+/// 2. Waits up to 1,000 ms for daemon and dock PID files to clear / processes to exit.
+/// 3. Signals remaining tracked PIDs verified via `pid_matches` with SIGTERM (never SIGKILL).
+/// 4. Sweeps untracked own-user `speechyyy-dock` processes with SIGTERM.
+///    Note: This sweep also ends the user's dev-build docks (for example under `target/`), which is intended.
+/// 5. Reports any surviving PIDs.
+/// 6. Cleans PID and socket files only when processes are dead.
 pub fn stop_all(paths: &RuntimePaths) -> Result<(), String> {
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
@@ -846,7 +849,8 @@ pub fn stop_all_with_sink_and_proc_root(
         let dock_alive = dock_pid
             .map(|p| p != current_pid && sink.is_alive(p))
             .unwrap_or(false);
-        if !daemon_alive && !dock_alive {
+        let pid_files_cleared = !paths.pid_path.exists() && !paths.dock_pid_path.exists();
+        if (!daemon_alive && !dock_alive) || pid_files_cleared {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -854,10 +858,13 @@ pub fn stop_all_with_sink_and_proc_root(
 
     // 3. For any tracked PID still alive, verify with pid_matches and SIGTERM it.
     // If a tracked PID fails pid_matches, PID reuse occurred; remove the stale file, do NOT signal!
+    let mut survivors: Vec<(u32, &'static str)> = Vec::new();
+
     if let Some(p) = daemon_pid {
         if p != current_pid && sink.is_alive(p) {
             if crate::procs::pid_matches_uid(proc_root, p, "speechyyy", Some(uid)) {
-                let _ = crate::procs::terminate(&[p], Duration::from_millis(500), sink);
+                let d_surv = crate::procs::terminate(&[p], Duration::from_millis(500), sink);
+                survivors.extend(d_surv.into_iter().map(|pid| (pid, "Daemon")));
             } else {
                 PidFile::remove(&paths.pid_path);
             }
@@ -867,7 +874,8 @@ pub fn stop_all_with_sink_and_proc_root(
     if let Some(p) = dock_pid {
         if p != current_pid && sink.is_alive(p) {
             if crate::procs::pid_matches_uid(proc_root, p, "speechyyy-dock", Some(uid)) {
-                let _ = crate::procs::terminate(&[p], Duration::from_millis(500), sink);
+                let dk_surv = crate::procs::terminate(&[p], Duration::from_millis(500), sink);
+                survivors.extend(dk_surv.into_iter().map(|pid| (pid, "Dock")));
             } else {
                 PidFile::remove(&paths.dock_pid_path);
             }
@@ -882,51 +890,28 @@ pub fn stop_all_with_sink_and_proc_root(
             .filter(|p| dock_pid != Some(*p))
             .collect();
     if !remaining_docks.is_empty() {
-        let _ = crate::procs::terminate(&remaining_docks, Duration::from_millis(500), sink);
+        let sw_surv = crate::procs::terminate(&remaining_docks, Duration::from_millis(500), sink);
+        survivors.extend(sw_surv.into_iter().map(|pid| (pid, "Dock (sweep)")));
     }
 
     // 5. Report survivors by PID instead of escalating to SIGKILL (never send SIGKILL)
-    let final_surviving_daemon = daemon_pid.filter(|&p| {
-        p != current_pid
-            && sink.is_alive(p)
-            && crate::procs::pid_matches_uid(proc_root, p, "speechyyy", Some(uid))
-    });
-    let final_surviving_dock = dock_pid.filter(|&p| {
-        p != current_pid
-            && sink.is_alive(p)
-            && crate::procs::pid_matches_uid(proc_root, p, "speechyyy-dock", Some(uid))
-    });
-
-    if let Some(pid) = final_surviving_daemon {
+    for (pid, label) in &survivors {
         eprintln!(
-            "Warning: Daemon process (PID: {}) survived SIGTERM and is still running.",
-            pid
+            "Warning: {} process (PID: {}) survived SIGTERM and is still running.",
+            label, pid
         );
-    }
-    if let Some(pid) = final_surviving_dock {
-        eprintln!(
-            "Warning: Dock process (PID: {}) survived SIGTERM and is still running.",
-            pid
-        );
-    }
-
-    let extra_survivors = crate::procs::list_own_processes_named(proc_root, "speechyyy-dock", uid);
-    for pid in extra_survivors {
-        if Some(pid) != final_surviving_dock {
-            eprintln!(
-                "Warning: Dock process (PID: {}) survived SIGTERM and is still running.",
-                pid
-            );
-        }
     }
 
     // 6. Remove PID and socket files only after owner is confirmed dead. Never remove a live process's PID file.
-    if daemon_pid == Some(current_pid) || final_surviving_daemon.is_none() {
+    let daemon_dead = !survivors.iter().any(|(_, label)| *label == "Daemon");
+    let dock_dead = !survivors.iter().any(|(_, label)| *label == "Dock");
+
+    if daemon_dead {
         PidFile::remove(&paths.pid_path);
         let _ = fs::remove_file(&paths.socket_path);
         let _ = fs::remove_file(&paths.events_socket_path);
     }
-    if dock_pid == Some(current_pid) || final_surviving_dock.is_none() {
+    if dock_dead {
         PidFile::remove(&paths.dock_pid_path);
     }
 

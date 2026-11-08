@@ -264,7 +264,7 @@ pub fn install_from_extracted_dir(
         }
     }
 
-    // Swap binaries with rollback protection
+    // Swap binaries with rollback protection (prevents ETXTBSY by staging to temporary files and atomically renaming)
     let target_speechyyy = target_dir.join("speechyyy");
     let speechyyy_bak = target_dir.join("speechyyy.bak");
     let dock_bak = target_dir.join("speechyyy-dock.bak");
