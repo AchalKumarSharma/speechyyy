@@ -15,6 +15,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
 pub enum Command {
     /// Start Speechyyy (-f for foreground logs)
+    #[command(alias = "daemon")]
     Start {
         /// Run in foreground instead of detaching in background
         #[arg(short, long)]
@@ -183,6 +184,21 @@ mod tests {
             cli.command,
             Command::Start {
                 foreground: true,
+                provider: None,
+                mode: None,
+                injection: None,
+                typing_delay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_start_daemon_alias() {
+        let cli = Cli::try_parse_from(["speechyyy", "daemon"]).expect("parse daemon alias");
+        assert_eq!(
+            cli.command,
+            Command::Start {
+                foreground: false,
                 provider: None,
                 mode: None,
                 injection: None,
