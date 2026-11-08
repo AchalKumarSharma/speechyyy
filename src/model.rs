@@ -979,6 +979,100 @@ pub fn download_and_install_model<F: Fetcher>(
     Ok(verified_info)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedModelTarget {
+    CloudProvider {
+        provider: String,
+        default_model: String,
+    },
+    LocalModel {
+        model_type: LocalModelType,
+        canonical_name: &'static str,
+    },
+}
+
+pub fn resolve_model_target(name: &str) -> Result<ResolvedModelTarget, String> {
+    let raw_trimmed = name.trim();
+    if raw_trimmed.is_empty() {
+        return Err("Model name cannot be empty.".to_string());
+    }
+
+    let normalized = raw_trimmed.to_lowercase().replace('_', "-");
+
+    // (a) Provider names
+    match normalized.as_str() {
+        "sarvam" | "saaras:v4" | "sarvam:saaras-v4" | "saaras" => {
+            return Ok(ResolvedModelTarget::CloudProvider {
+                provider: "sarvam".to_string(),
+                default_model: "saaras:v4".to_string(),
+            });
+        }
+        "groq" => {
+            return Ok(ResolvedModelTarget::CloudProvider {
+                provider: "groq".to_string(),
+                default_model: crate::inference::DEFAULT_GROQ_MODEL.to_string(),
+            });
+        }
+        "openai" => {
+            return Ok(ResolvedModelTarget::CloudProvider {
+                provider: "openai".to_string(),
+                default_model: crate::inference::DEFAULT_OPENAI_MODEL.to_string(),
+            });
+        }
+        "openai-compatible" => {
+            return Ok(ResolvedModelTarget::CloudProvider {
+                provider: "openai-compatible".to_string(),
+                default_model: crate::inference::DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    // (b) Names not on the roster
+    if normalized.starts_with("phonon") || normalized.starts_with("voxtral") {
+        return Err(format!(
+            "Oh, darling! '{}' isn't on Speechyyy's roster. Run 'speechyyy models' to see what's ready to roll!",
+            raw_trimmed
+        ));
+    }
+
+    // (c) Alias normalization & (d) Manifest/model lookup
+    match normalized.as_str() {
+        "whisper-large-v3-turbo" | "whisper-turbo" | "turbo" => {
+            Ok(ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::WhisperLargeV3Turbo,
+                canonical_name: "whisper-large-v3-turbo",
+            })
+        }
+        "parakeet-tdt-v3" | "parakeet-v3" | "parakeet" => {
+            Ok(ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::ParakeetTdtV3,
+                canonical_name: "parakeet-tdt-v3",
+            })
+        }
+        "whisper-small" | "small" => {
+            Ok(ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::WhisperSmall,
+                canonical_name: "whisper-small",
+            })
+        }
+        "moonshine-base" | "moonshine" => {
+            Ok(ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::MoonshineBase,
+                canonical_name: "moonshine-base",
+            })
+        }
+        #[cfg(target_os = "macos")]
+        "apple-speech" | "apple" => {
+            Ok(ResolvedModelTarget::CloudProvider {
+                provider: "apple".to_string(),
+                default_model: "apple-speech".to_string(),
+            })
+        }
+        _ => Err(unsupported_model_error(raw_trimmed)),
+    }
+}
+
 /// Checks if a model identifier refers to the Sarvam AI cloud provider.
 pub fn is_sarvam_cloud_model(name: &str) -> bool {
     matches!(
@@ -1048,114 +1142,125 @@ where
     C: FnMut() -> Result<bool, String>,
     F: FnMut() -> Result<String, String>,
 {
-    let trimmed = model_name.trim();
+    let target = resolve_model_target(model_name)?;
     let cfg = crate::config::Config::load_from_path(config_path);
     let nickname = cfg.nickname();
-    if is_sarvam_cloud_model(trimmed) {
-        if let Some(key) = cfg.inference.resolve_api_key() {
-            if !key.trim().is_empty() {
-                let should_replace = if force {
-                    true
-                } else {
-                    confirm_replace_fn()?
-                };
 
-                if !should_replace {
-                    println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
-                    println!(
-                        "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
-                        nickname
-                    );
-                    return Ok(());
+    match target {
+        ResolvedModelTarget::CloudProvider { provider, .. } => {
+            if provider == "sarvam" {
+                if let Some(key) = cfg.inference.resolve_api_key() {
+                    if !key.trim().is_empty() {
+                        let should_replace = if force {
+                            true
+                        } else {
+                            confirm_replace_fn()?
+                        };
+
+                        if !should_replace {
+                            println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
+                            println!(
+                                "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
+                                nickname
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
-            }
-        }
 
-        let raw_key = prompt_key_fn()?;
-        let key = raw_key.trim().trim_matches('"');
-        if key.is_empty() {
-            return Err("Sarvam API key cannot be empty.".to_string());
-        }
+                let raw_key = prompt_key_fn()?;
+                let key = raw_key.trim().trim_matches('"');
+                if key.is_empty() {
+                    return Err("Sarvam API key cannot be empty.".to_string());
+                }
 
-        crate::config::Config::save_sarvam_credentials_in_file(config_path, key)?;
-        println!("[✓] Sarvam API key configured successfully. saaras:v4 is ready to use.");
-        println!(
-            "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
-            nickname
-        );
-        Ok(())
-    } else if is_cloud_provider(trimmed) {
-        let (prov_name, env_var) = if trimmed.eq_ignore_ascii_case("groq") {
-            ("Groq", "GROQ_API_KEY")
-        } else {
-            ("OpenAI", "OPENAI_API_KEY")
-        };
-        let key_opt = cfg.inference.resolve_key_for_provider(trimmed);
-        println!(
-            "[i] {} is a cloud provider — there are no weights to download onto your machine.",
-            prov_name
-        );
-        match key_opt {
-            Some((_, source)) => {
-                println!("[✓] {} API key is configured (source: {}).", prov_name, source);
+                crate::config::Config::save_sarvam_credentials_in_file(config_path, key)?;
+                println!("[✓] Sarvam API key configured successfully. saaras:v4 is ready to use.");
                 println!(
-                    "[✓] Run 'speechyyy use {}' whenever you want me to speak it, {}!",
-                    trimmed.to_lowercase(),
+                    "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
                     nickname
                 );
-            }
-            None => {
-                println!("[!] No {} API key is configured.", prov_name);
-                use std::io::{stdin, IsTerminal};
-                if stdin().is_terminal() {
-                    let raw_key = prompt_key_fn()?;
-                    let key = raw_key.trim().trim_matches('"');
-                    if !key.is_empty() {
-                        if trimmed.eq_ignore_ascii_case("groq") {
-                            crate::config::Config::save_groq_credentials_in_file(config_path, key)?;
-                        } else {
-                            crate::config::Config::save_openai_credentials_in_file(config_path, key)?;
-                        }
-                        println!("[✓] {} API key configured successfully.", prov_name);
+                Ok(())
+            } else if provider == "groq" || provider == "openai" {
+                let (prov_name, env_var) = if provider == "groq" {
+                    ("Groq", "GROQ_API_KEY")
+                } else {
+                    ("OpenAI", "OPENAI_API_KEY")
+                };
+                let key_opt = cfg.inference.resolve_key_for_provider(&provider);
+                println!(
+                    "[i] {} is a cloud provider — there are no weights to download onto your machine.",
+                    prov_name
+                );
+                match key_opt {
+                    Some((_, source)) => {
+                        println!("[✓] {} API key is configured (source: {}).", prov_name, source);
                         println!(
                             "[✓] Run 'speechyyy use {}' whenever you want me to speak it, {}!",
-                            trimmed.to_lowercase(),
+                            provider,
                             nickname
                         );
-                    } else {
-                        println!("[!] Blank key entered. Configuration unchanged.");
                     }
-                } else {
-                    println!(
-                        "[i] To configure, set {} in your environment or run 'speechyyy use {}' in an interactive terminal.",
-                        env_var,
-                        trimmed.to_lowercase()
-                    );
+                    None => {
+                        println!("[!] No {} API key is configured.", prov_name);
+                        use std::io::{stdin, IsTerminal};
+                        if stdin().is_terminal() {
+                            let raw_key = prompt_key_fn()?;
+                            let key = raw_key.trim().trim_matches('"');
+                            if !key.is_empty() {
+                                if provider == "groq" {
+                                    crate::config::Config::save_groq_credentials_in_file(config_path, key)?;
+                                } else {
+                                    crate::config::Config::save_openai_credentials_in_file(config_path, key)?;
+                                }
+                                println!("[✓] {} API key configured successfully.", prov_name);
+                                println!(
+                                    "[✓] Run 'speechyyy use {}' whenever you want me to speak it, {}!",
+                                    provider,
+                                    nickname
+                                );
+                            } else {
+                                println!("[!] Blank key entered. Configuration unchanged.");
+                            }
+                        } else {
+                            println!(
+                                "[i] To configure, set {} in your environment or run 'speechyyy use {}' in an interactive terminal.",
+                                env_var,
+                                provider
+                            );
+                        }
+                    }
                 }
+                Ok(())
+            } else {
+                println!(
+                    "[i] {} is an endpoint provider — there are no weights to download onto your machine.",
+                    provider
+                );
+                Ok(())
             }
         }
-        Ok(())
-    } else if let Some(local_type) = LocalModelType::from_str_name(trimmed) {
-        let target_dir = match models_dir {
-            Some(d) => d.join(local_type.folder_name()),
-            None => ModelManager::model_dir(local_type),
-        };
-        ModelManager::download_model(local_type, &target_dir)?;
-        println!(
-            "[✓] Model '{}' is all yours, {}! Run 'speechyyy use {}' whenever you want me to speak it.",
-            local_type.folder_name(),
-            nickname,
-            local_type.folder_name()
-        );
-        Ok(())
-    } else {
-        Err(unsupported_model_error(trimmed))
+        ResolvedModelTarget::LocalModel { model_type, canonical_name } => {
+            let target_dir = match models_dir {
+                Some(d) => d.join(canonical_name),
+                None => ModelManager::model_dir(model_type),
+            };
+            ModelManager::download_model(model_type, &target_dir)?;
+            println!(
+                "[✓] Model '{}' is all yours, {}! Run 'speechyyy use {}' whenever you want me to speak it.",
+                canonical_name,
+                nickname,
+                canonical_name
+            );
+            Ok(())
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupportedModel {
     pub id: &'static str,
+    pub alias: Option<&'static str>,
     pub provider_name: &'static str,
     pub provider_type: &'static str,
     pub is_local: bool,
@@ -1164,14 +1269,8 @@ pub struct SupportedModel {
 
 pub const SUPPORTED_MODELS: &[SupportedModel] = &[
     SupportedModel {
-        id: "saaras:v4",
-        provider_name: "Sarvam AI Cloud",
-        provider_type: "sarvam",
-        is_local: false,
-        local_type: None,
-    },
-    SupportedModel {
         id: "parakeet-tdt-v3",
+        alias: Some("parakeet-v3"),
         provider_name: "Local Transducer",
         provider_type: "local",
         is_local: true,
@@ -1179,6 +1278,7 @@ pub const SUPPORTED_MODELS: &[SupportedModel] = &[
     },
     SupportedModel {
         id: "whisper-small",
+        alias: None,
         provider_name: "Local Whisper",
         provider_type: "local",
         is_local: true,
@@ -1186,6 +1286,7 @@ pub const SUPPORTED_MODELS: &[SupportedModel] = &[
     },
     SupportedModel {
         id: "whisper-large-v3-turbo",
+        alias: Some("whisper-turbo"),
         provider_name: "Local Whisper",
         provider_type: "local",
         is_local: true,
@@ -1193,14 +1294,48 @@ pub const SUPPORTED_MODELS: &[SupportedModel] = &[
     },
     SupportedModel {
         id: "moonshine-base",
+        alias: None,
         provider_name: "Local Moonshine",
         provider_type: "local",
         is_local: true,
         local_type: Some(LocalModelType::MoonshineBase),
     },
+    SupportedModel {
+        id: "saaras:v4",
+        alias: Some("sarvam"),
+        provider_name: "Sarvam AI Cloud",
+        provider_type: "sarvam",
+        is_local: false,
+        local_type: None,
+    },
+    SupportedModel {
+        id: "groq",
+        alias: None,
+        provider_name: "Groq Cloud (Whisper)",
+        provider_type: "groq",
+        is_local: false,
+        local_type: None,
+    },
+    SupportedModel {
+        id: "openai",
+        alias: None,
+        provider_name: "OpenAI Cloud (Whisper)",
+        provider_type: "openai",
+        is_local: false,
+        local_type: None,
+    },
+    SupportedModel {
+        id: "openai-compatible",
+        alias: None,
+        provider_name: "OpenAI-compatible Endpoint",
+        provider_type: "openai-compatible",
+        is_local: false,
+        local_type: None,
+    },
     #[cfg(target_os = "macos")]
     SupportedModel {
         id: "apple-speech",
+        alias: Some("apple"),
         provider_name: "Apple Native",
         provider_type: "apple",
         is_local: false,
@@ -1221,19 +1356,21 @@ pub fn check_local_model_exists(model_type: LocalModelType, base_dir: Option<&Pa
 }
 
 pub fn is_model_active(cfg: &crate::config::Config, model_id: &str) -> bool {
-    if cfg.inference.model.trim().is_empty() {
-        return false;
-    }
+    let prov = cfg.inference.provider.to_lowercase();
     match model_id {
         "saaras:v4" => {
-            cfg.inference.provider.eq_ignore_ascii_case("sarvam")
+            prov == "sarvam"
                 && (cfg.inference.model.eq_ignore_ascii_case("saaras:v4")
-                    || cfg.inference.model.eq_ignore_ascii_case("sarvam:saaras-v4"))
+                    || cfg.inference.model.eq_ignore_ascii_case("sarvam:saaras-v4")
+                    || cfg.inference.model.is_empty())
         }
+        "groq" => prov == "groq",
+        "openai" => prov == "openai",
+        "openai-compatible" => prov == "openai-compatible",
         #[cfg(target_os = "macos")]
-        "apple-speech" => cfg.inference.provider.eq_ignore_ascii_case("apple"),
+        "apple-speech" => prov == "apple",
         preset => {
-            if !cfg.inference.provider.eq_ignore_ascii_case("local") {
+            if prov != "local" {
                 return false;
             }
             if let Some(target_type) = LocalModelType::from_str_name(preset) {
@@ -1252,8 +1389,8 @@ pub fn format_model_list_with_models_dir(
 ) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
-        "{:<24} {:<18} {:<16} {}",
-        "NAME", "PROVIDER", "STATUS", "ACTIVE"
+        "{:<24} {:<16} {:<8} {:<26} {:<16} {}",
+        "NAME", "ALIAS", "TYPE", "PROVIDER", "STATUS", "ACTIVE"
     ));
 
     for model in SUPPORTED_MODELS {
@@ -1262,6 +1399,9 @@ pub fn format_model_list_with_models_dir(
         } else {
             "no"
         };
+
+        let alias_str = model.alias.unwrap_or("-");
+        let type_str = if model.is_local { "local" } else { "cloud" };
 
         let status_str = if model.is_local {
             if let Some(lt) = model.local_type {
@@ -1273,26 +1413,60 @@ pub fn format_model_list_with_models_dir(
             } else {
                 "Unknown"
             }
-        } else if model.provider_type == "sarvam" {
-            let has_key = !cfg.inference.api_key.trim().is_empty()
-                || std::env::var("SARVAM_API_KEY").is_ok_and(|k| !k.trim().is_empty());
-            if has_key {
-                "Configured"
-            } else {
-                "API Key Required"
-            }
         } else {
-            "Available"
+            match model.provider_type {
+                "sarvam" => {
+                    let has_key = cfg
+                        .inference
+                        .resolve_api_key()
+                        .is_some_and(|k| !k.trim().is_empty());
+                    if has_key {
+                        "Configured"
+                    } else {
+                        "API Key Required"
+                    }
+                }
+                "groq" => {
+                    let has_key = cfg.inference.resolve_key_for_provider("groq").is_some();
+                    if has_key {
+                        "Configured"
+                    } else {
+                        "API Key Required"
+                    }
+                }
+                "openai" => {
+                    let has_key = cfg.inference.resolve_key_for_provider("openai").is_some();
+                    if has_key {
+                        "Configured"
+                    } else {
+                        "API Key Required"
+                    }
+                }
+                "openai-compatible" => {
+                    let has_endpoint = cfg
+                        .inference
+                        .openai_compatible_endpoint
+                        .as_ref()
+                        .is_some_and(|e| !e.trim().is_empty());
+                    if has_endpoint {
+                        "Configured"
+                    } else {
+                        "Endpoint Required"
+                    }
+                }
+                _ => "Available",
+            }
         };
 
         lines.push(format!(
-            "{:<24} {:<18} {:<16} {}",
-            model.id, model.provider_name, status_str, active_str
+            "{:<24} {:<16} {:<8} {:<26} {:<16} {}",
+            model.id, alias_str, type_str, model.provider_name, status_str, active_str
         ));
     }
 
     lines.push(String::new());
     lines.push("Tip: For custom ONNX models, set provider = 'custom' in ~/.config/speechyyy/config.toml".to_string());
+    lines.push("Tip: Run 'speechyyy use <model>' to activate, or 'speechyyy download <model>' to fetch weights.".to_string());
 
     lines.join("\n")
 }
@@ -1321,128 +1495,73 @@ pub fn resolve_model_use(
     models_dir: Option<&Path>,
     config_path: Option<&Path>,
 ) -> Result<(String, String, Option<String>), String> {
-    let lower = model_arg.trim().to_lowercase().replace('_', "-");
-    match lower.as_str() {
-        "groq" => {
+    let target = resolve_model_target(model_arg)?;
+    match target {
+        ResolvedModelTarget::CloudProvider { provider, default_model } => {
             let cfg = match config_path {
                 Some(p) => crate::config::Config::load_from_path(p),
                 None => crate::config::Config::load(),
             };
-            let has_key = cfg.inference.resolve_key_for_provider("groq").is_some();
-            let notice = if !has_key {
-                Some("[!] No Groq API key found. Set GROQ_API_KEY in config.toml or environment.".to_string())
+            let notice = match provider.as_str() {
+                "sarvam" => {
+                    let has_key = cfg
+                        .inference
+                        .resolve_api_key()
+                        .is_some_and(|k| !k.trim().is_empty());
+                    if !has_key {
+                        Some("[!] No API key found. Run 'speechyyy download saaras:v4' first to configure.".to_string())
+                    } else {
+                        None
+                    }
+                }
+                "groq" => {
+                    let has_key = cfg.inference.resolve_key_for_provider("groq").is_some();
+                    if !has_key {
+                        Some("[!] No Groq API key found. Set GROQ_API_KEY in config.toml or environment.".to_string())
+                    } else {
+                        None
+                    }
+                }
+                "openai" => {
+                    let has_key = cfg.inference.resolve_key_for_provider("openai").is_some();
+                    if !has_key {
+                        Some("[!] No OpenAI API key found. Set OPENAI_API_KEY in config.toml or environment.".to_string())
+                    } else {
+                        None
+                    }
+                }
+                "openai-compatible" => {
+                    let has_endpoint = cfg
+                        .inference
+                        .openai_compatible_endpoint
+                        .as_ref()
+                        .is_some_and(|e| !e.trim().is_empty());
+                    if !has_endpoint {
+                        Some("[!] No OpenAI-compatible endpoint configured. Set 'openai_compatible_endpoint' in config.toml.".to_string())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let model = if provider == "openai-compatible" {
+                cfg.inference
+                    .openai_compatible_model
+                    .unwrap_or(default_model)
             } else {
-                None
+                default_model
             };
-            Ok((
-                "groq".to_string(),
-                crate::inference::DEFAULT_GROQ_MODEL.to_string(),
-                notice,
-            ))
+            Ok((provider, model, notice))
         }
-        "openai" => {
-            let cfg = match config_path {
-                Some(p) => crate::config::Config::load_from_path(p),
-                None => crate::config::Config::load(),
-            };
-            let has_key = cfg.inference.resolve_key_for_provider("openai").is_some();
-            let notice = if !has_key {
-                Some("[!] No OpenAI API key found. Set OPENAI_API_KEY in config.toml or environment.".to_string())
-            } else {
-                None
-            };
-            Ok((
-                "openai".to_string(),
-                crate::inference::DEFAULT_OPENAI_MODEL.to_string(),
-                notice,
-            ))
-        }
-        "openai-compatible" => {
-            let cfg = match config_path {
-                Some(p) => crate::config::Config::load_from_path(p),
-                None => crate::config::Config::load(),
-            };
-            let has_endpoint = cfg
-                .inference
-                .openai_compatible_endpoint
-                .as_ref()
-                .is_some_and(|e| !e.trim().is_empty());
-            let notice = if !has_endpoint {
-                Some("[!] No OpenAI-compatible endpoint configured. Set 'openai_compatible_endpoint' in config.toml.".to_string())
-            } else {
-                None
-            };
-            let model = cfg
-                .inference
-                .openai_compatible_model
-                .unwrap_or_else(|| crate::inference::DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string());
-            Ok(("openai-compatible".to_string(), model, notice))
-        }
-        s if is_sarvam_cloud_model(s) => {
-            let cfg = match config_path {
-                Some(p) => crate::config::Config::load_from_path(p),
-                None => crate::config::Config::load(),
-            };
-            let has_key = cfg
-                .inference
-                .resolve_api_key()
-                .map(|k| !k.trim().is_empty())
-                .unwrap_or(false);
-
-            let notice = if !has_key {
-                Some("[!] No API key found. Run 'speechyyy download saaras:v4' first to configure.".to_string())
-            } else {
-                None
-            };
-            Ok(("sarvam".to_string(), "saaras:v4".to_string(), notice))
-        }
-        "parakeet-tdt-v3" | "parakeet-v3" => {
-            let lt = LocalModelType::ParakeetTdtV3;
-            let exists = check_local_model_exists(lt, models_dir);
+        ResolvedModelTarget::LocalModel { model_type, canonical_name } => {
+            let exists = check_local_model_exists(model_type, models_dir);
             let notice = if !exists {
-                Some("Weights not found. Run `speechyyy model download -m parakeet-tdt-v3`".to_string())
+                Some(format!("Weights not found. Run `speechyyy model download -m {}`", canonical_name))
             } else {
                 None
             };
-            Ok(("local".to_string(), "parakeet-tdt-v3".to_string(), notice))
+            Ok(("local".to_string(), canonical_name.to_string(), notice))
         }
-        "whisper-small" => {
-            let lt = LocalModelType::WhisperSmall;
-            let exists = check_local_model_exists(lt, models_dir);
-            let notice = if !exists {
-                Some("Weights not found. Run `speechyyy model download -m whisper-small`".to_string())
-            } else {
-                None
-            };
-            Ok(("local".to_string(), "whisper-small".to_string(), notice))
-        }
-        "whisper-large-v3-turbo" | "whisper-turbo" => {
-            let lt = LocalModelType::WhisperLargeV3Turbo;
-            let exists = check_local_model_exists(lt, models_dir);
-            let notice = if !exists {
-                Some("Weights not found. Run `speechyyy model download -m whisper-large-v3-turbo`".to_string())
-            } else {
-                None
-            };
-            Ok((
-                "local".to_string(),
-                "whisper-large-v3-turbo".to_string(),
-                notice,
-            ))
-        }
-        "moonshine-base" => {
-            let lt = LocalModelType::MoonshineBase;
-            let exists = check_local_model_exists(lt, models_dir);
-            let notice = if !exists {
-                Some("Weights not found. Run `speechyyy model download -m moonshine-base`".to_string())
-            } else {
-                None
-            };
-            Ok(("local".to_string(), "moonshine-base".to_string(), notice))
-        }
-        #[cfg(target_os = "macos")]
-        "apple-speech" => Ok(("apple".to_string(), "apple-speech".to_string(), None)),
-        _ => Err(unsupported_model_error(model_arg)),
     }
 }
 
@@ -1643,28 +1762,32 @@ pub fn handle_model_remove_full(
     config_path: Option<&Path>,
     paths_override: Option<&crate::ipc::RuntimePaths>,
 ) -> Result<(), String> {
-    let trimmed = model_name.trim();
-    if trimmed.is_empty() {
-        return Err("Model name cannot be empty".to_string());
-    }
+    let target = resolve_model_target(model_name)?;
+    let (lt, canonical_name) = match target {
+        ResolvedModelTarget::CloudProvider { provider, .. } => {
+            return Err(format!(
+                "Cannot remove cloud provider '{}': cloud providers do not store local model weights.",
+                provider
+            ));
+        }
+        ResolvedModelTarget::LocalModel { model_type, canonical_name } => (model_type, canonical_name),
+    };
 
     let base_dir = models_dir
         .map(PathBuf::from)
         .unwrap_or_else(ModelManager::default_models_dir);
 
-    let target_dir = if let Some(lt) = LocalModelType::from_str_name(trimmed) {
-        let preset_dir = base_dir.join(lt.folder_name());
+    let target_dir = {
+        let preset_dir = base_dir.join(canonical_name);
         if preset_dir.exists() {
             preset_dir
         } else {
-            base_dir.join(trimmed)
+            base_dir.join(lt.folder_name())
         }
-    } else {
-        base_dir.join(trimmed)
     };
 
     if !target_dir.exists() {
-        println!("[!] Model '{}' is not installed locally.", trimmed);
+        println!("[!] Model '{}' is not installed locally.", canonical_name);
         return Ok(());
     }
 
@@ -1677,7 +1800,7 @@ pub fn handle_model_remove_full(
     };
     let nickname = cfg.nickname();
 
-    if is_model_active(&cfg, trimmed) {
+    if is_model_active(&cfg, canonical_name) {
         let paths = paths_override.cloned().unwrap_or_else(crate::ipc::RuntimePaths::new);
         let is_running = crate::ipc::PidFile::read_pid(&paths.pid_path)
             .is_some_and(crate::ipc::PidFile::is_process_running)
@@ -1693,7 +1816,7 @@ pub fn handle_model_remove_full(
 
         println!(
             "[!] Notice: '{}' was your active model, {}. Speechyyy has been stopped and deactivated. Pick another model with 'speechyyy use <model>' whenever you're ready.",
-            trimmed, nickname
+            canonical_name, nickname
         );
     }
 
@@ -1703,7 +1826,7 @@ pub fn handle_model_remove_full(
     let size_str = format!("{:.1} MB", size_mb);
     println!(
         "[✓] Removed '{}', {}. Reclaimed {} for you.",
-        trimmed, nickname, size_str
+        canonical_name, nickname, size_str
     );
 
     Ok(())
@@ -2122,5 +2245,97 @@ mod tests {
         assert!(err_msg.contains("parakeet-tdt-v3"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_model_target_whisper_turbo_and_never_groq() {
+        let res_alias = resolve_model_target("whisper-turbo").unwrap();
+        assert_eq!(
+            res_alias,
+            ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::WhisperLargeV3Turbo,
+                canonical_name: "whisper-large-v3-turbo",
+            }
+        );
+
+        let res_canonical = resolve_model_target("whisper-large-v3-turbo").unwrap();
+        assert_eq!(
+            res_canonical,
+            ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::WhisperLargeV3Turbo,
+                canonical_name: "whisper-large-v3-turbo",
+            }
+        );
+
+        let res_groq = resolve_model_target("groq").unwrap();
+        assert!(matches!(
+            res_groq,
+            ResolvedModelTarget::CloudProvider { ref provider, .. } if provider == "groq"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_model_target_phonon_and_voxtral_roster_rejection() {
+        let rejected_inputs = ["phonon", "Phonon-2", "phonon-2.5", "voxtral", "Voxtral-Small"];
+        for input in rejected_inputs {
+            let err = resolve_model_target(input).unwrap_err();
+            assert!(
+                err.contains("isn't on Speechyyy's roster"),
+                "Expected roster rejection for '{}', got: {}",
+                input,
+                err
+            );
+            assert!(
+                err.contains("speechyyy models"),
+                "Expected advice to check 'speechyyy models' for '{}', got: {}",
+                input,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_whisper_turbo_alias_in_use_and_remove() {
+        let temp_dir = std::env::temp_dir().join(format!("test_turbo_alias_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let models_dir = temp_dir.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        // 1. resolve_model_use("whisper-turbo") must resolve to local whisper-large-v3-turbo
+        let (prov, model, _) = resolve_model_use("whisper-turbo", Some(&models_dir), None).unwrap();
+        assert_eq!(prov, "local");
+        assert_eq!(model, "whisper-large-v3-turbo");
+
+        // 2. handle_model_remove_full("whisper-turbo") targets whisper-large-v3-turbo directory
+        let turbo_dir = models_dir.join("whisper-large-v3-turbo");
+        fs::create_dir_all(&turbo_dir).unwrap();
+        fs::write(turbo_dir.join("dummy.bin"), b"dummy model data").unwrap();
+
+        let rem_res = handle_model_remove_full("whisper-turbo", Some(&models_dir), None, None);
+        assert!(rem_res.is_ok());
+        assert!(!turbo_dir.exists(), "whisper-large-v3-turbo dir should have been removed");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_speechyyy_models_list_output() {
+        let cfg = crate::config::Config::default();
+        let output = format_model_list(&cfg);
+
+        // Required models and providers
+        assert!(output.contains("parakeet-tdt-v3"));
+        assert!(output.contains("whisper-large-v3-turbo"));
+        assert!(output.contains("whisper-turbo"));
+        assert!(output.contains("moonshine-base"));
+        assert!(output.contains("saaras:v4"));
+        assert!(output.contains("groq"));
+        assert!(output.contains("openai"));
+        assert!(output.contains("openai-compatible"));
+
+        // Must not contain Phonon or Voxtral
+        let lower = output.to_lowercase();
+        assert!(!lower.contains("phonon"), "Output should not contain phonon");
+        assert!(!lower.contains("voxtral"), "Output should not contain voxtral");
     }
 }

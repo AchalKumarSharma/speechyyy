@@ -12,6 +12,7 @@ pub mod injector;
 pub mod input;
 pub mod ipc;
 pub mod model;
+pub mod procs;
 pub mod text;
 pub mod uninstall;
 pub mod update;

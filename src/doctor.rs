@@ -2,6 +2,15 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerShellCheckResult {
+    Supported,
+    Unsupported,
+    CannotConnect,
+    Timeout,
+    ExecutionFailed,
+}
+
 pub trait SysEnv {
     fn current_username(&self) -> String;
     fn user_groups(&self) -> Vec<String>;
@@ -15,6 +24,18 @@ pub trait SysEnv {
 
     fn has_command(&self, _cmd: &str) -> bool {
         false
+    }
+
+    fn find_dock_binary(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn is_executable(&self, _path: &Path) -> bool {
+        false
+    }
+
+    fn check_layer_shell(&self, _dock_bin: &Path) -> Result<LayerShellCheckResult, String> {
+        Ok(LayerShellCheckResult::Supported)
     }
 }
 
@@ -117,6 +138,83 @@ impl SysEnv for RealSysEnv {
             }
         }
         false
+    }
+
+    fn find_dock_binary(&self) -> Option<std::path::PathBuf> {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let candidate = parent.join("speechyyy-dock");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        if let Ok(path) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let candidate = dir.join("speechyyy-dock");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    fn is_executable(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(path) {
+                return (meta.permissions().mode() & 0o111) != 0;
+            }
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            path.is_file()
+        }
+    }
+
+    fn check_layer_shell(&self, dock_bin: &Path) -> Result<LayerShellCheckResult, String> {
+        let mut child = match std::process::Command::new(dock_bin)
+            .arg("--check")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Failed to spawn {}: {}", dock_bin.display(), e)),
+        };
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(2);
+        let poll_interval = std::time::Duration::from_millis(50);
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Ok(match status.code() {
+                        Some(0) => LayerShellCheckResult::Supported,
+                        Some(1) => LayerShellCheckResult::Unsupported,
+                        Some(2) => LayerShellCheckResult::CannotConnect,
+                        _ => LayerShellCheckResult::ExecutionFailed,
+                    });
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(LayerShellCheckResult::Timeout);
+                    }
+                    std::thread::sleep(poll_interval);
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("Error polling child process: {}", e));
+                }
+            }
+        }
     }
 }
 
@@ -572,6 +670,99 @@ pub fn run_doctor_opts<E: SysEnv>(
     };
     check_installed_models_integrity(&models_dir_path, deep, &mut items, &mut fix_instructions);
 
+    // 8. Companion dock binary check
+    let dock_bin_opt = env.find_dock_binary();
+    let dock_executable = match &dock_bin_opt {
+        Some(bin) => {
+            if env.is_executable(bin) {
+                items.push(DiagnosticItem {
+                    name: format!("Companion dock binary ({})", bin.display()),
+                    status: CheckStatus::Pass,
+                });
+                true
+            } else {
+                items.push(DiagnosticItem {
+                    name: format!("Companion dock binary ({})", bin.display()),
+                    status: CheckStatus::Warn("File exists but executable bit is not set".into()),
+                });
+                fix_instructions.push(format!("chmod +x {}", bin.display()));
+                false
+            }
+        }
+        None => {
+            items.push(DiagnosticItem {
+                name: "Companion dock binary (speechyyy-dock)".into(),
+                status: CheckStatus::Warn(
+                    "Not found in PATH or next to speechyyy; companion dock will not appear on 'start'"
+                        .into(),
+                ),
+            });
+            fix_instructions.push(
+                "Install 'speechyyy-dock' into ~/.local/bin or alongside speechyyy.".into(),
+            );
+            false
+        }
+    };
+
+    // 9. Wayland session & Layer-Shell protocol support
+    if !env.is_wayland() {
+        items.push(DiagnosticItem {
+            name: "Wayland session (WAYLAND_DISPLAY unset)".into(),
+            status: CheckStatus::Pass,
+        });
+    } else {
+        items.push(DiagnosticItem {
+            name: "Wayland session detected".into(),
+            status: CheckStatus::Pass,
+        });
+
+        if dock_executable {
+            if let Some(ref dock_bin) = dock_bin_opt {
+                match env.check_layer_shell(dock_bin) {
+                    Ok(LayerShellCheckResult::Supported) => {
+                        items.push(DiagnosticItem {
+                            name: "Wayland layer-shell protocol (zwlr_layer_shell_v1)".into(),
+                            status: CheckStatus::Pass,
+                        });
+                    }
+                    Ok(LayerShellCheckResult::Unsupported) => {
+                        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+                            .unwrap_or_else(|_| "current desktop".into());
+                        items.push(DiagnosticItem {
+                            name: "Wayland layer-shell protocol (zwlr_layer_shell_v1)".into(),
+                            status: CheckStatus::Warn(format!(
+                                "Compositor ({}) does not advertise zwlr_layer_shell_v1; companion dock will not appear, but dictation works normally.",
+                                desktop
+                            )),
+                        });
+                    }
+                    Ok(LayerShellCheckResult::CannotConnect) => {
+                        items.push(DiagnosticItem {
+                            name: "Wayland layer-shell protocol check".into(),
+                            status: CheckStatus::Warn(
+                                "Cannot connect to Wayland display to query layer-shell".into(),
+                            ),
+                        });
+                    }
+                    Ok(LayerShellCheckResult::Timeout) => {
+                        items.push(DiagnosticItem {
+                            name: "Wayland layer-shell protocol check".into(),
+                            status: CheckStatus::Warn("Check timed out after 2 seconds".into()),
+                        });
+                    }
+                    Ok(LayerShellCheckResult::ExecutionFailed) | Err(_) => {
+                        items.push(DiagnosticItem {
+                            name: "Wayland layer-shell protocol check".into(),
+                            status: CheckStatus::Warn(
+                                "Failed to execute speechyyy-dock --check".into(),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let udev_rule_content =
         r#"# Speechyyy uinput rule for unprivileged virtual keyboard caret injection
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
@@ -820,6 +1011,12 @@ mod tests {
         fn has_command(&self, cmd: &str) -> bool {
             cmd == "wl-copy"
         }
+        fn find_dock_binary(&self) -> Option<PathBuf> {
+            Some(PathBuf::from("/usr/local/bin/speechyyy-dock"))
+        }
+        fn is_executable(&self, _path: &Path) -> bool {
+            true
+        }
     }
 
     struct MockMissingWlCopyEnv {
@@ -848,6 +1045,12 @@ mod tests {
         }
         fn has_command(&self, _cmd: &str) -> bool {
             false
+        }
+        fn find_dock_binary(&self) -> Option<PathBuf> {
+            Some(PathBuf::from("/usr/local/bin/speechyyy-dock"))
+        }
+        fn is_executable(&self, _path: &Path) -> bool {
+            true
         }
     }
 
@@ -1283,5 +1486,124 @@ mod tests {
         config.inference.model = "".into();
         let err_empty = check_inference_for_config(&config).unwrap_err();
         assert!(err_empty.contains("speechyyy use <model>"));
+    }
+
+    #[derive(Clone)]
+    struct MockDoctorEnv {
+        user: String,
+        groups: Vec<String>,
+        writable_paths: Vec<PathBuf>,
+        audio_input: Result<String, String>,
+        inference_result: Result<String, String>,
+        is_wayland: bool,
+        commands: Vec<String>,
+        dock_binary: Option<PathBuf>,
+        dock_executable: bool,
+        layer_shell_result: Result<LayerShellCheckResult, String>,
+    }
+
+    impl SysEnv for MockDoctorEnv {
+        fn current_username(&self) -> String {
+            self.user.clone()
+        }
+        fn user_groups(&self) -> Vec<String> {
+            self.groups.clone()
+        }
+        fn can_write_path(&self, path: &Path) -> bool {
+            self.writable_paths.contains(&path.to_path_buf())
+        }
+        fn check_audio_input(&self) -> Result<String, String> {
+            self.audio_input.clone()
+        }
+        fn check_inference(&self) -> Result<String, String> {
+            self.inference_result.clone()
+        }
+        fn is_wayland(&self) -> bool {
+            self.is_wayland
+        }
+        fn has_command(&self, cmd: &str) -> bool {
+            self.commands.iter().any(|c| c == cmd)
+        }
+        fn find_dock_binary(&self) -> Option<PathBuf> {
+            self.dock_binary.clone()
+        }
+        fn is_executable(&self, _path: &Path) -> bool {
+            self.dock_executable
+        }
+        fn check_layer_shell(&self, _dock_bin: &Path) -> Result<LayerShellCheckResult, String> {
+            self.layer_shell_result.clone()
+        }
+    }
+
+    #[test]
+    fn test_doctor_dock_and_wayland_layer_shell_scenarios() {
+        let mut config = crate::config::Config::default();
+        config.inference.provider = "mock".into();
+
+        // Scenario 1: Dock present, executable, Wayland with LayerShell::Supported (exit 0)
+        let env_ok = MockDoctorEnv {
+            user: "testuser".into(),
+            groups: vec!["input".into()],
+            writable_paths: vec![PathBuf::from("/dev/uinput")],
+            audio_input: Ok("Mock Mic".into()),
+            inference_result: Ok("Mock Provider".into()),
+            is_wayland: true,
+            commands: vec!["wl-copy".into()],
+            dock_binary: Some(PathBuf::from("/usr/bin/speechyyy-dock")),
+            dock_executable: true,
+            layer_shell_result: Ok(LayerShellCheckResult::Supported),
+        };
+        let rep_ok = run_doctor_with_config(&env_ok, &config);
+        assert!(rep_ok.items.iter().any(|i| i.name.contains("Companion dock binary") && i.status == CheckStatus::Pass));
+        assert!(rep_ok.items.iter().any(|i| i.name.contains("zwlr_layer_shell_v1") && i.status == CheckStatus::Pass));
+
+        // Scenario 2: Dock missing
+        let env_no_dock = MockDoctorEnv {
+            dock_binary: None,
+            ..env_ok.clone()
+        };
+        let rep_no_dock = run_doctor_with_config(&env_no_dock, &config);
+        assert!(rep_no_dock.items.iter().any(|i| i.name.contains("Companion dock binary") && matches!(i.status, CheckStatus::Warn(_))));
+
+        // Scenario 3: Dock not executable
+        let env_not_exec = MockDoctorEnv {
+            dock_executable: false,
+            ..env_ok.clone()
+        };
+        let rep_not_exec = run_doctor_with_config(&env_not_exec, &config);
+        assert!(rep_not_exec.items.iter().any(|i| i.name.contains("Companion dock binary") && matches!(i.status, CheckStatus::Warn(ref w) if w.contains("executable bit"))));
+
+        // Scenario 4: Layer shell unsupported (exit 1)
+        let env_unsupported = MockDoctorEnv {
+            layer_shell_result: Ok(LayerShellCheckResult::Unsupported),
+            ..env_ok.clone()
+        };
+        let rep_unsupported = run_doctor_with_config(&env_unsupported, &config);
+        assert!(rep_unsupported.items.iter().any(|i| i.name.contains("zwlr_layer_shell_v1") && matches!(i.status, CheckStatus::Warn(ref w) if w.contains("does not advertise"))));
+
+        // Scenario 5: Cannot connect (exit 2)
+        let env_cannot_connect = MockDoctorEnv {
+            layer_shell_result: Ok(LayerShellCheckResult::CannotConnect),
+            ..env_ok.clone()
+        };
+        let rep_cannot_connect = run_doctor_with_config(&env_cannot_connect, &config);
+        assert!(rep_cannot_connect.items.iter().any(|i| i.name.contains("layer-shell protocol check") && matches!(i.status, CheckStatus::Warn(ref w) if w.contains("Cannot connect"))));
+
+        // Scenario 6: Timeout (exceeded 2s)
+        let env_timeout = MockDoctorEnv {
+            layer_shell_result: Ok(LayerShellCheckResult::Timeout),
+            ..env_ok.clone()
+        };
+        let rep_timeout = run_doctor_with_config(&env_timeout, &config);
+        assert!(rep_timeout.items.iter().any(|i| i.name.contains("layer-shell protocol check") && matches!(i.status, CheckStatus::Warn(ref w) if w.contains("timed out"))));
+
+        // Scenario 7: Non-Wayland session
+        let env_x11 = MockDoctorEnv {
+            is_wayland: false,
+            ..env_ok.clone()
+        };
+        let rep_x11 = run_doctor_with_config(&env_x11, &config);
+        assert!(rep_x11.items.iter().any(|i| i.name.contains("WAYLAND_DISPLAY unset") && i.status == CheckStatus::Pass));
+        assert!(!rep_x11.items.iter().any(|i| i.name.contains("zwlr_layer_shell_v1")));
     }
 }

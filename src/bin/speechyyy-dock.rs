@@ -209,7 +209,72 @@ impl ProvidesRegistryState for DockApp {
 
 delegate_dispatch2!(DockApp);
 
+use smithay_client_toolkit::reexports::client::globals::GlobalListContents;
+use smithay_client_toolkit::reexports::client::protocol::wl_registry;
+use smithay_client_toolkit::reexports::client::Dispatch;
+
+struct DockCheckApp;
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for DockCheckApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+pub fn parse_check_flag<I>(args: I) -> bool
+where
+    I: IntoIterator<Item = String>,
+{
+    args.into_iter().any(|arg| arg == "--check")
+}
+
+fn run_layer_shell_check() -> ! {
+    let conn = match Connection::connect_to_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("speechyyy-dock: failed to connect to Wayland display: {}", e);
+            std::process::exit(2);
+        }
+    };
+
+    let (globals, mut event_queue) = match registry_queue_init::<DockCheckApp>(&conn) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("speechyyy-dock: failed to initialize Wayland registry: {}", e);
+            std::process::exit(2);
+        }
+    };
+
+    let mut state = DockCheckApp;
+    if let Err(e) = event_queue.roundtrip(&mut state) {
+        eprintln!("speechyyy-dock: Wayland roundtrip failed: {}", e);
+        std::process::exit(2);
+    }
+
+    let has_layer_shell = globals
+        .contents()
+        .with_list(|list| list.iter().any(|g| g.interface == "zwlr_layer_shell_v1"));
+
+    if has_layer_shell {
+        println!("zwlr_layer_shell_v1 supported");
+        std::process::exit(0);
+    } else {
+        eprintln!("zwlr_layer_shell_v1 unsupported");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
+    if parse_check_flag(std::env::args()) {
+        run_layer_shell_check();
+    }
+
     let paths = RuntimePaths::default();
     if let Err(e) = PidFile::acquire_for_service(&paths.dock_pid_path, "speechyyy-dock") {
         println!("speechyyy-dock: {}", e);
@@ -459,4 +524,17 @@ fn main() {
 
     PidFile::remove(&paths.dock_pid_path);
     println!("speechyyy-dock: shutting down cleanly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_flag_parsing() {
+        assert!(parse_check_flag(vec!["speechyyy-dock".into(), "--check".into()]));
+        assert!(parse_check_flag(vec!["speechyyy-dock".into(), "-v".into(), "--check".into()]));
+        assert!(!parse_check_flag(vec!["speechyyy-dock".into()]));
+        assert!(!parse_check_flag(vec!["speechyyy-dock".into(), "--other".into()]));
+    }
 }

@@ -20,7 +20,7 @@ pub enum Command {
         /// Run in foreground instead of detaching in background
         #[arg(short, long)]
         foreground: bool,
-        /// Speech-to-text inference provider ('local' or 'sarvam')
+        /// Speech-to-text inference provider ('local', 'sarvam', 'groq', 'openai', or 'openai-compatible')
         #[arg(long)]
         provider: Option<String>,
         /// Sarvam operating mode ('translit', 'transcribe', 'translate', 'codemix')
