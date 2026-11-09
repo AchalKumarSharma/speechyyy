@@ -372,59 +372,75 @@ fi
 echo "✦ Checking autostart configuration..."
 HYPR_STATUS="not_detected"
 if [ -f "$HYPR_CONF" ]; then
-    HYPR_LINES=(
-        "exec-once = speechyyy daemon"
-        "exec-once = speechyyy-dock"
-        "bind = , code:108, exec, speechyyy toggle"
-    )
-
-    MISSING_LINES=()
-    for line in "${HYPR_LINES[@]}"; do
-        if ! grep -qxF "$line" "$HYPR_CONF" 2>/dev/null; then
-            MISSING_LINES+=("$line")
-        fi
-    done
-
-    if [ "${#MISSING_LINES[@]}" -eq 0 ]; then
-        echo "[✓] Hyprland configuration (${HYPR_CONF}) already contains Speechyyy autostart & hotkey."
-        HYPR_STATUS="already_present"
+    EXISTING_BINDS=$(grep -E 'exec.*speechyyy (toggle|push-down|push-up)' "$HYPR_CONF" 2>/dev/null || true)
+    if [ -n "$EXISTING_BINDS" ]; then
+        echo "[!] Existing Speechyyy keybinding(s) detected in ${HYPR_CONF}:"
+        echo "$EXISTING_BINDS" | sed 's/^/      /'
+        echo "    To prevent conflicting bindings, new keybindings were not appended automatically."
+        echo "    Suggested push-to-talk configuration for ~/.config/hypr/hyprland.conf:"
+        echo "      exec-once = speechyyy daemon"
+        echo "      exec-once = speechyyy-dock"
+        echo "      bind = , code:108, exec, speechyyy push-down"
+        echo "      bindr = , code:108, exec, speechyyy push-up"
+        echo "      # bind = , Scroll_Lock, exec, speechyyy toggle"
+        HYPR_STATUS="existing_binds_detected"
     else
-        PROCEED_HYPR=1
-        if [ "$DRY_RUN" = "0" ]; then
-            if [ -t 0 ]; then
-                read -rp "✦ Add Speechyyy autostart & hotkey (RightAlt) to ~/.config/hypr/hyprland.conf? [Y/n] " HYPR_REPLY || HYPR_REPLY=""
-                case "$HYPR_REPLY" in
-                    [nN]*) PROCEED_HYPR=0 ;;
-                    *) PROCEED_HYPR=1 ;;
-                esac
-            elif [ ! "/dev/null" -ef /dev/stdin ] && [ -r /dev/tty ] && (exec < /dev/tty 2>/dev/null); then
-                read -rp "✦ Add Speechyyy autostart & hotkey (RightAlt) to ~/.config/hypr/hyprland.conf? [Y/n] " HYPR_REPLY < /dev/tty || HYPR_REPLY=""
-                case "$HYPR_REPLY" in
-                    [nN]*) PROCEED_HYPR=0 ;;
-                    *) PROCEED_HYPR=1 ;;
-                esac
-            fi
-        fi
+        HYPR_LINES=(
+            "exec-once = speechyyy daemon"
+            "exec-once = speechyyy-dock"
+            "bind = , code:108, exec, speechyyy push-down"
+            "bindr = , code:108, exec, speechyyy push-up"
+            "# bind = , Scroll_Lock, exec, speechyyy toggle"
+        )
 
-        if [ "$PROCEED_HYPR" = "1" ]; then
-            if [ "$DRY_RUN" = "1" ]; then
-                echo "[dry-run] Would backup ${HYPR_CONF} to ${HYPR_CONF}.bak.<timestamp>"
-                for line in "${MISSING_LINES[@]}"; do
-                    echo "[dry-run] Would append to ${HYPR_CONF}: ${line}"
-                done
-                HYPR_STATUS="would_update"
-            else
-                BACKUP_PATH="${HYPR_CONF}.bak.$(date +%s)"
-                cp "$HYPR_CONF" "$BACKUP_PATH"
-                for line in "${MISSING_LINES[@]}"; do
-                    echo "$line" >> "$HYPR_CONF"
-                done
-                echo "[✓] Hyprland configuration updated (backup created at ${BACKUP_PATH})."
-                HYPR_STATUS="updated"
+        MISSING_LINES=()
+        for line in "${HYPR_LINES[@]}"; do
+            if ! grep -qxF "$line" "$HYPR_CONF" 2>/dev/null; then
+                MISSING_LINES+=("$line")
             fi
+        done
+
+        if [ "${#MISSING_LINES[@]}" -eq 0 ]; then
+            echo "[✓] Hyprland configuration (${HYPR_CONF}) already contains Speechyyy autostart & push-to-talk hotkeys."
+            HYPR_STATUS="already_present"
         else
-            echo "[!] Skipped Hyprland configuration update."
-            HYPR_STATUS="skipped"
+            PROCEED_HYPR=1
+            if [ "$DRY_RUN" = "0" ]; then
+                if [ -t 0 ]; then
+                    read -rp "✦ Add Speechyyy autostart & push-to-talk hotkeys (RightAlt) to ~/.config/hypr/hyprland.conf? [Y/n] " HYPR_REPLY || HYPR_REPLY=""
+                    case "$HYPR_REPLY" in
+                        [nN]*) PROCEED_HYPR=0 ;;
+                        *) PROCEED_HYPR=1 ;;
+                    esac
+                elif [ ! "/dev/null" -ef /dev/stdin ] && [ -r /dev/tty ] && (exec < /dev/tty 2>/dev/null); then
+                    read -rp "✦ Add Speechyyy autostart & push-to-talk hotkeys (RightAlt) to ~/.config/hypr/hyprland.conf? [Y/n] " HYPR_REPLY < /dev/tty || HYPR_REPLY=""
+                    case "$HYPR_REPLY" in
+                        [nN]*) PROCEED_HYPR=0 ;;
+                        *) PROCEED_HYPR=1 ;;
+                    esac
+                fi
+            fi
+
+            if [ "$PROCEED_HYPR" = "1" ]; then
+                if [ "$DRY_RUN" = "1" ]; then
+                    echo "[dry-run] Would backup ${HYPR_CONF} to ${HYPR_CONF}.bak.<timestamp>"
+                    for line in "${MISSING_LINES[@]}"; do
+                        echo "[dry-run] Would append to ${HYPR_CONF}: ${line}"
+                    done
+                    HYPR_STATUS="would_update"
+                else
+                    BACKUP_PATH="${HYPR_CONF}.bak.$(date +%s)"
+                    cp "$HYPR_CONF" "$BACKUP_PATH"
+                    for line in "${MISSING_LINES[@]}"; do
+                        echo "$line" >> "$HYPR_CONF"
+                    done
+                    echo "[✓] Hyprland configuration updated (backup created at ${BACKUP_PATH})."
+                    HYPR_STATUS="updated"
+                fi
+            else
+                echo "[!] Skipped Hyprland configuration update."
+                HYPR_STATUS="skipped"
+            fi
         fi
     fi
 fi
@@ -510,6 +526,9 @@ case "$HYPR_STATUS" in
         ;;
     would_update)
         echo "• Autostart:      Hyprland config planned for update (dry-run)"
+        ;;
+    existing_binds_detected)
+        echo "• Autostart:      Existing Hyprland bindings detected (manual review recommended)"
         ;;
     skipped)
         echo "• Autostart:      Hyprland update skipped by user"
