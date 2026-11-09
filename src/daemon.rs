@@ -203,6 +203,12 @@ where
                         is_restart = false;
                     }
                     Ok(Some(_)) | Ok(None) => {}
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::BrokenPipe
+                            || e.raw_os_error() == Some(libc::EPIPE) =>
+                    {
+                        // Client disconnected before response could be flushed (e.g. timed out during inference); ignore silently
+                    }
                     Err(e) => {
                         eprintln!("IPC connection error: {}", e);
                     }
@@ -1584,6 +1590,55 @@ mod tests {
             ]
         );
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_run_session_loop_broken_pipe_ignored_silently() {
+        use std::io::Write;
+
+        let temp_dir = std::env::temp_dir().join(format!("test_broken_pipe_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        let server = IpcServer::new(paths.clone());
+        let listener = server.start_listener().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let running = server.running_flag();
+        let running_clone = Arc::clone(&running);
+
+        let socket_path = paths.socket_path.clone();
+        let client = std::thread::spawn(move || {
+            // Connect and send a request, but immediately close/shutdown the stream
+            // so writing the response can encounter BrokenPipe
+            if let Ok(mut stream) = UnixStream::connect(&socket_path) {
+                let _ = stream.write_all(b"{\"cmd\":\"status\"}\n");
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                drop(stream);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            running_clone.store(false, Ordering::SeqCst);
+        });
+
+        let mut input = NoopInputSource;
+        let mut injector = RecordingInjector::new(Duration::ZERO);
+        let mut controller = StateMachineController::new(
+            TargetChord::right_alt(),
+            MockDictationEngine::with_payload("test"),
+        );
+
+        let res = run_session_loop(
+            &listener,
+            &mut input,
+            &mut injector,
+            &mut controller,
+            &running,
+            "RightAlt",
+            0,
+        );
+
+        client.join().unwrap();
+        assert!(res.is_ok());
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

@@ -20,6 +20,19 @@ pub enum IpcRequest {
     Cancel,
 }
 
+impl IpcRequest {
+    /// Recommended client timeout for this request.
+    /// Commands that trigger or wait on speech transcription (PushUp, Toggle)
+    /// receive a longer timeout (15s) to allow CPU decoders to process multi-second audio chunks.
+    /// Fast status/control commands retain a short timeout (2s) so stale clients fail fast.
+    pub fn timeout(&self) -> Duration {
+        match self {
+            IpcRequest::PushUp | IpcRequest::Toggle => Duration::from_secs(15),
+            _ => Duration::from_secs(2),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcResponse {
@@ -186,6 +199,14 @@ pub struct IpcClient;
 
 impl IpcClient {
     pub fn send_request(socket_path: &Path, req: &IpcRequest) -> Result<IpcResponse, String> {
+        Self::send_request_with_timeout(socket_path, req, req.timeout())
+    }
+
+    pub fn send_request_with_timeout(
+        socket_path: &Path,
+        req: &IpcRequest,
+        timeout: Duration,
+    ) -> Result<IpcResponse, String> {
         let mut stream = UnixStream::connect(socket_path).map_err(|e| {
             format!(
                 "Failed to connect to Speechyyy socket at {}: {}",
@@ -195,7 +216,7 @@ impl IpcClient {
         })?;
 
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(timeout))
             .map_err(|e| e.to_string())?;
 
         let mut payload = serde_json::to_string(req).map_err(|e| e.to_string())?;
@@ -457,6 +478,18 @@ pub fn read_bounded_request<R: BufRead>(reader: &mut R) -> std::io::Result<Reque
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ipc_request_timeouts() {
+        assert_eq!(IpcRequest::PushUp.timeout(), Duration::from_secs(15));
+        assert_eq!(IpcRequest::Toggle.timeout(), Duration::from_secs(15));
+        assert_eq!(IpcRequest::Status.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::Ping.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::Stop.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::Restart.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::PushDown.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::Cancel.timeout(), Duration::from_secs(2));
+    }
 
     #[test]
     fn test_ipc_roundtrip_ping_and_status() {
