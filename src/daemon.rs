@@ -450,24 +450,19 @@ pub fn spawn_dock_process(bin_path: &Path) -> Option<u32> {
 }
 
 pub fn find_running_dock_pid(paths: &RuntimePaths, proc_root: &Path) -> Option<u32> {
-    let dock_pid_raw = PidFile::read_pid(&paths.dock_pid_path);
+    let dock_pid_raw = PidFile::read_pid(&paths.dock_pid_path)?;
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
     let uid = 0;
 
-    let dock_pid_valid = dock_pid_raw
-        .is_some_and(|p| crate::procs::pid_matches(proc_root, p, "speechyyy-dock"));
-    if let Some(p) = dock_pid_raw {
-        if PidFile::is_process_running(p) && !dock_pid_valid {
-            PidFile::remove(&paths.dock_pid_path);
-        }
+    if crate::procs::pid_matches_uid(proc_root, dock_pid_raw, "speechyyy-dock", Some(uid)) {
+        Some(dock_pid_raw)
+    } else {
+        // If the PID file is stale or was reused by another process, remove it and do not signal
+        PidFile::remove(&paths.dock_pid_path);
+        None
     }
-    if dock_pid_valid {
-        return dock_pid_raw;
-    }
-    let extra_docks = crate::procs::list_own_processes_named(proc_root, "speechyyy-dock", uid);
-    extra_docks.first().copied()
 }
 
 pub fn is_dock_currently_running(paths: &RuntimePaths, proc_root: &Path) -> bool {
@@ -821,15 +816,11 @@ pub fn stop_all_with_sink_and_proc_root(
     let dock_live = dock_pid.map(|p| sink.is_alive(p)).unwrap_or(false);
     let socket_exists = paths.socket_path.exists();
 
-    // Check for any legacy/untracked dock processes owned by this user
-    let extra_docks = crate::procs::list_own_processes_named(proc_root, "speechyyy-dock", uid);
-
     if !daemon_live
         && !dock_live
         && !socket_exists
         && !paths.pid_path.exists()
         && !paths.dock_pid_path.exists()
-        && extra_docks.is_empty()
     {
         println!("[✓] Resting now, {}. Nothing to stop.", nickname);
         return Ok(());
@@ -882,19 +873,7 @@ pub fn stop_all_with_sink_and_proc_root(
         }
     }
 
-    // 4. Sweep any remaining own-user speechyyy-dock processes (legacy docks or autostart)
-    // Note: This sweep also ends the user's dev-build docks (for example under target/), which is intended.
-    let remaining_docks: Vec<u32> =
-        crate::procs::list_own_processes_named(proc_root, "speechyyy-dock", uid)
-            .into_iter()
-            .filter(|p| dock_pid != Some(*p))
-            .collect();
-    if !remaining_docks.is_empty() {
-        let sw_surv = crate::procs::terminate(&remaining_docks, Duration::from_millis(500), sink);
-        survivors.extend(sw_surv.into_iter().map(|pid| (pid, "Dock (sweep)")));
-    }
-
-    // 5. Report survivors by PID instead of escalating to SIGKILL (never send SIGKILL)
+    // 4. Report survivors by PID instead of escalating to SIGKILL (never send SIGKILL)
     for (pid, label) in &survivors {
         eprintln!(
             "Warning: {} process (PID: {}) survived SIGTERM and is still running.",
@@ -902,7 +881,7 @@ pub fn stop_all_with_sink_and_proc_root(
         );
     }
 
-    // 6. Remove PID and socket files only after owner is confirmed dead. Never remove a live process's PID file.
+    // 5. Remove PID and socket files only after owner is confirmed dead. Never remove a live process's PID file.
     let daemon_dead = !survivors.iter().any(|(_, label)| *label == "Daemon");
     let dock_dead = !survivors.iter().any(|(_, label)| *label == "Dock");
 
@@ -1940,6 +1919,128 @@ mod tests {
             assert!(sink.terms.lock().unwrap().is_empty());
             // Must remove stale PID file
             assert!(!paths.pid_path.exists());
+        }
+
+        // Case 6: Dock PID file signaled, but unlinked second dock is NOT signaled
+        {
+            let tdir = base_temp.join("case6");
+            let pdir = tdir.join("proc");
+            let rdir = tdir.join("runtime");
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::create_dir_all(&rdir).unwrap();
+            let paths = RuntimePaths::with_dir(rdir);
+
+            make_proc(&pdir, 706, "speechyyy-dock");
+            make_proc(&pdir, 799, "speechyyy-dock");
+            std::fs::write(&paths.dock_pid_path, "706").unwrap();
+
+            let sink = TestSink {
+                terms: Arc::new(Mutex::new(Vec::new())),
+                alive: Arc::new(Mutex::new(vec![706, 799])),
+            };
+            let res = stop_all_with_sink_and_proc_root(&paths, &sink, &pdir, my_uid);
+            assert!(res.is_ok());
+            let terms = sink.terms.lock().unwrap().clone();
+            assert_eq!(terms, vec![706], "Only the PID-file dock must be signaled");
+            assert!(!terms.contains(&799), "Untracked second dock must NOT be signaled");
+            assert!(!paths.dock_pid_path.exists());
+        }
+
+        // Case 7: Stale dock PID file is removed without signaling
+        {
+            let tdir = base_temp.join("case7");
+            let pdir = tdir.join("proc");
+            let rdir = tdir.join("runtime");
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::create_dir_all(&rdir).unwrap();
+            let paths = RuntimePaths::with_dir(rdir);
+
+            std::fs::write(&paths.dock_pid_path, "707").unwrap();
+
+            let sink = TestSink {
+                terms: Arc::new(Mutex::new(Vec::new())),
+                alive: Arc::new(Mutex::new(vec![])), // 707 is dead
+            };
+            let res = stop_all_with_sink_and_proc_root(&paths, &sink, &pdir, my_uid);
+            assert!(res.is_ok());
+            assert!(sink.terms.lock().unwrap().is_empty(), "Dead dock must not be signaled");
+            assert!(!paths.dock_pid_path.exists(), "Stale dock PID file must be removed");
+        }
+
+        // Case 8: Dock PID reuse (alive, different comm) is not signaled
+        {
+            let tdir = base_temp.join("case8");
+            let pdir = tdir.join("proc");
+            let rdir = tdir.join("runtime");
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::create_dir_all(&rdir).unwrap();
+            let paths = RuntimePaths::with_dir(rdir);
+
+            make_proc(&pdir, 708, "firefox");
+            std::fs::write(&paths.dock_pid_path, "708").unwrap();
+
+            let sink = TestSink {
+                terms: Arc::new(Mutex::new(Vec::new())),
+                alive: Arc::new(Mutex::new(vec![708])),
+            };
+            let res = stop_all_with_sink_and_proc_root(&paths, &sink, &pdir, my_uid);
+            assert!(res.is_ok());
+            assert!(sink.terms.lock().unwrap().is_empty(), "Reused PID must not be signaled");
+            assert!(!paths.dock_pid_path.exists(), "Mismatched dock PID file must be removed");
+        }
+
+        // Case 9: Dock owned by another UID is not signaled
+        {
+            let tdir = base_temp.join("case9");
+            let pdir = tdir.join("proc");
+            let rdir = tdir.join("runtime");
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::create_dir_all(&rdir).unwrap();
+            let paths = RuntimePaths::with_dir(rdir);
+
+            make_proc(&pdir, 709, "speechyyy-dock");
+            std::fs::write(&paths.dock_pid_path, "709").unwrap();
+
+            let sink = TestSink {
+                terms: Arc::new(Mutex::new(Vec::new())),
+                alive: Arc::new(Mutex::new(vec![709])),
+            };
+            // Call with other UID (my_uid + 9999)
+            let res = stop_all_with_sink_and_proc_root(&paths, &sink, &pdir, my_uid + 9999);
+            assert!(res.is_ok());
+            assert!(sink.terms.lock().unwrap().is_empty(), "Dock of another UID must not be signaled");
+            assert!(!paths.dock_pid_path.exists());
+        }
+
+        // Case 10: should_launch_dock ignores a dock not recorded in this instance's PID file
+        {
+            let tdir = base_temp.join("case10");
+            let pdir = tdir.join("proc");
+            let rdir = tdir.join("runtime");
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::create_dir_all(&rdir).unwrap();
+            let paths = RuntimePaths::with_dir(rdir);
+
+            // A foreign dock is running in the OS
+            make_proc(&pdir, 710, "speechyyy-dock");
+            // But this instance has no dock PID file
+            assert_eq!(find_running_dock_pid(&paths, &pdir), None);
+            assert!(!is_dock_currently_running(&paths, &pdir));
+
+            let dummy_bin = tdir.join("speechyyy-dock");
+            std::fs::write(&dummy_bin, b"#!/bin/sh\nexit 0").unwrap();
+
+            let decision = should_launch_dock(
+                false,
+                Some("wayland-0"),
+                is_dock_currently_running(&paths, &pdir),
+                Some(dummy_bin.clone()),
+            );
+            assert_eq!(
+                decision,
+                DockLaunchDecision::Launch(dummy_bin),
+                "Should launch dock despite unrecorded foreign dock process"
+            );
         }
 
         let _ = std::fs::remove_dir_all(base_temp);

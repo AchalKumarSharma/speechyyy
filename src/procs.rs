@@ -117,46 +117,6 @@ pub fn pid_matches(proc_root: &Path, pid: u32, comm: &str) -> bool {
     pid_matches_uid(proc_root, pid, comm, Some(euid))
 }
 
-/// Scans numeric entries under `proc_root` (default `/proc`), matching when:
-/// - The entry name parses as an integer PID
-/// - The PID is not the current running process
-/// - The process directory owner UID equals `uid`
-/// - `/proc/<pid>/comm` (trimmed) equals `comm` EXACTLY (no substring or cmdline matching)
-/// - The process is not a zombie (`state != 'Z'`)
-pub fn list_own_processes_named(proc_root: &Path, comm: &str, uid: u32) -> Vec<u32> {
-    let current_pid = std::process::id();
-    let mut matching_pids = Vec::new();
-
-    let entries = match fs::read_dir(proc_root) {
-        Ok(e) => e,
-        Err(_) => return matching_pids,
-    };
-
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let name_str = match file_name.to_str() {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let pid: u32 = match name_str.parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        if pid == current_pid {
-            continue;
-        }
-
-        if pid_matches_uid(proc_root, pid, comm, Some(uid)) {
-            matching_pids.push(pid);
-        }
-    }
-
-    matching_pids.sort_unstable();
-    matching_pids
-}
-
 /// Sends `SIGTERM` to the given PIDs, polls up to `grace` duration for exit,
 /// and returns any surviving PIDs. **Never sends SIGKILL.**
 pub fn terminate(pids: &[u32], grace: Duration, sink: &dyn SignalSink) -> Vec<u32> {
@@ -243,66 +203,6 @@ mod tests {
         let zombie_stat = "5678 (python3 (worker)) Z 1 1 0 0 0 0";
         assert_eq!(parse_stat_state(zombie_stat), Some('Z'));
         assert!(is_stat_zombie(zombie_stat));
-    }
-
-    #[test]
-    fn test_list_own_processes_named_and_filters() {
-        let temp_dir = std::env::temp_dir().join(format!("test_proc_scan_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        #[cfg(unix)]
-        let my_uid = unsafe { libc::geteuid() };
-        #[cfg(not(unix))]
-        let my_uid = 1000;
-
-        // 1. Exact match on speechyyy-dock (alive)
-        create_fake_proc_entry(&temp_dir, 101, "speechyyy-dock", 'S');
-
-        // 2. Substrings and similar names that MUST NOT MATCH:
-        // - speechyyy-dock.rs
-        // - speechyyy-dock-helper
-        // - vim
-        // - cargo
-        create_fake_proc_entry(&temp_dir, 102, "speechyyy-dock.rs", 'S');
-        create_fake_proc_entry(&temp_dir, 103, "speechyyy-dock-helper", 'S');
-        create_fake_proc_entry(&temp_dir, 104, "vim", 'S');
-        create_fake_proc_entry(&temp_dir, 105, "cargo", 'S');
-
-        // 3. Zombie process with exact comm (must be excluded)
-        create_fake_proc_entry(&temp_dir, 106, "speechyyy-dock", 'Z');
-
-        // 4. Non-numeric folder
-        fs::create_dir_all(temp_dir.join("sys")).unwrap();
-
-        let found = list_own_processes_named(&temp_dir, "speechyyy-dock", my_uid);
-        assert_eq!(found, vec![101]);
-
-        // 5. Another UID's process excluded (pass different UID)
-        let other_uid_found = list_own_processes_named(&temp_dir, "speechyyy-dock", my_uid + 9999);
-        assert!(other_uid_found.is_empty());
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn test_current_process_pid_excluded() {
-        let temp_dir = std::env::temp_dir().join(format!("test_proc_self_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-
-        #[cfg(unix)]
-        let my_uid = unsafe { libc::geteuid() };
-        #[cfg(not(unix))]
-        let my_uid = 1000;
-
-        let self_pid = std::process::id();
-        create_fake_proc_entry(&temp_dir, self_pid, "speechyyy", 'R');
-
-        let found = list_own_processes_named(&temp_dir, "speechyyy", my_uid);
-        assert!(found.is_empty(), "Current process PID must be excluded");
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]

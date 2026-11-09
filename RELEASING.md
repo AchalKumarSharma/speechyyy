@@ -128,6 +128,7 @@ Once the release candidate is approved:
    ```
 2. Allow CI to finish building and publishing the draft release.
 3. Review release notes in GitHub Releases.
+   - *Migration note:* Docks started by versions before the PID file existed are not stopped by `speechyyy stop` and must be closed manually once.
 4. Promote from Draft to Public:
    ```bash
    gh release edit v0.2.0 --draft=false
