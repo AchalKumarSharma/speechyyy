@@ -511,13 +511,14 @@ impl UreqFetcher {
             let mut attempts = 0;
             let mut last_err = String::new();
             let mut response = None;
+            let mut is_redirect = false;
 
             while attempts < 3 {
                 attempts += 1;
                 match agent.get(&current_url).call() {
                     Ok(resp) => {
                         let status = resp.status();
-                        if status == 200 {
+                        if (200..=299).contains(&status) && status != 206 {
                             response = Some(resp);
                             break;
                         } else if matches!(status, 301 | 302 | 303 | 307 | 308) {
@@ -532,6 +533,7 @@ impl UreqFetcher {
                             visited_urls.insert(next.clone());
                             current_url = next;
                             hops += 1;
+                            is_redirect = true;
                             response = None;
                             break;
                         } else {
@@ -571,6 +573,10 @@ impl UreqFetcher {
                 }
             }
 
+            if is_redirect {
+                continue;
+            }
+
             if response.is_none() {
                 if attempts >= 3 && !last_err.is_empty() {
                     return Err(format!("Download failed after 3 attempts: {}", last_err));
@@ -597,9 +603,14 @@ impl UreqFetcher {
             let mut total_bytes = 0u64;
 
             loop {
-                let n = reader
-                    .read(&mut buf)
-                    .map_err(|e| format!("Failed reading stream from {}: {}", current_url, e))?;
+                let n = match reader.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        drop(dest_file);
+                        let _ = fs::remove_file(dest);
+                        return Err(format!("Failed reading stream from {}: {}", current_url, e));
+                    }
+                };
                 if n == 0 {
                     break;
                 }
