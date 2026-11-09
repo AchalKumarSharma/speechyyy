@@ -65,7 +65,12 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libbz2-dev pkg-config cmake
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libasound2-dev \
+            libbz2-dev \
+            cmake
 
       - name: Run test suite
         run: cargo test --all-targets --locked
@@ -99,7 +104,12 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libbz2-dev pkg-config cmake
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libasound2-dev \
+            libbz2-dev \
+            cmake
 
       - name: Compile release binaries
         run: cargo build --release --locked --bin speechyyy --bin speechyyy-dock
@@ -110,6 +120,8 @@ jobs:
         run: |
           ./target/release/speechyyy --version
           ./target/release/speechyyy --help
+          ./target/release/speechyyy-dock --version
+          ./target/release/speechyyy-dock --help
           echo "=== speechyyy dynamic linking ==="
           ldd ./target/release/speechyyy
           echo "=== speechyyy-dock dynamic linking ==="
