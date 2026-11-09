@@ -1,4 +1,7 @@
-# Kernel evdev Push-to-Talk
+# Kernel evdev Push-to-Talk (Superseded by ADR-0014)
+
+> **Status: Superseded & Removed in v0.2.0**
+> Direct `/dev/input/event*` hardware monitoring and device grabbing were replaced by compositor-level IPC keybindings (`speechyyy push-down`, `speechyyy push-up`, `speechyyy toggle`) under ADR-0014. The legacy `EvdevListener` and `EvdevGrabGuard` subsystem has been completely removed from `src/input.rs`.
 
 Global push-to-talk hotkey detection on Wayland cannot rely on traditional X11 hotkey hooks or standard windowing protocols due to compositor security isolation. We decided to read Linux input events directly from `/dev/input/event*` devices using passive monitoring (without `EVIOCGRAB`), combined with an `inotify` watcher on `/dev/input` for device reconnection and sleep/resume recovery. This provides compositor-agnostic global keypress and keyrelease detection without blocking regular modifier events or locking out the keyboard.
 

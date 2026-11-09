@@ -99,9 +99,12 @@ where
             }
         }
 
+        let mut had_activity = false;
+
         // 1. Process IPC socket connections
         match listener.accept() {
             Ok((mut stream, _)) => {
+                had_activity = true;
                 let state_str = controller.state.as_str();
                 match IpcServer::handle_connection(
                     &mut stream,
@@ -211,8 +214,9 @@ where
             }
         }
 
-        // 2. Poll input events (10ms tick) without hardware EVIOCGRAB
-        if let Some((keycode, is_down)) = input_source.poll_event(Duration::from_millis(10)) {
+        // 2. Poll input events without hardware EVIOCGRAB (Duration::ZERO)
+        if let Some((keycode, is_down)) = input_source.poll_event(Duration::ZERO) {
+            had_activity = true;
             let prev = controller.state;
             match controller.handle_key_event(keycode, is_down) {
                 Ok(Some(text)) => {
@@ -259,6 +263,18 @@ where
                 }
             }
         }
+
+        // 3. Sleep on the IPC listener socket until activity, a signal, or the next audio RMS tick
+        if !had_activity && running.load(Ordering::SeqCst) {
+            let wait_timeout = if controller.state == DictationState::Recording {
+                Duration::from_millis(25).saturating_sub(last_rms_tick.elapsed())
+            } else {
+                Duration::from_millis(25)
+            };
+            if wait_timeout > Duration::ZERO {
+                wait_for_listener_activity(listener, wait_timeout);
+            }
+        }
     }
 
     if let Some(b) = broadcaster {
@@ -267,6 +283,25 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_listener_activity(listener: &UnixListener, timeout: Duration) {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    unsafe {
+        libc::poll(&mut pfd, 1, timeout_ms);
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_listener_activity(_listener: &UnixListener, timeout: Duration) {
+    std::thread::sleep(timeout);
 }
 
 /// Handles a `Command::Toggle` / `IpcRequest::Toggle` with debouncing against rapid double-toggles.
