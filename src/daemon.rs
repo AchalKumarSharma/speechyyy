@@ -399,6 +399,14 @@ impl DockLaunchDecision {
     }
 }
 
+/// Determines whether the companion dock should be launched based on CLI flags.
+/// By default, the dock is launched in both background and foreground modes.
+/// `--no-dock` suppresses dock launch and takes precedence if both `--no-dock` and `--with-dock` are supplied.
+pub fn should_launch_dock_from_flags(no_dock: bool, with_dock: bool) -> bool {
+    let _ = with_dock; // Accepted for backward compatibility
+    !no_dock
+}
+
 pub fn should_launch_dock(
     no_dock: bool,
     wayland_display: Option<&str>,
@@ -602,8 +610,9 @@ pub fn start_daemon(
             let proc_root = Path::new("/proc");
             let dock_running = is_dock_currently_running(paths, proc_root);
 
+            let effective_no_dock = !should_launch_dock_from_flags(no_dock, with_dock);
             let decision = should_launch_dock(
-                no_dock,
+                effective_no_dock,
                 wayland_display.as_deref(),
                 dock_running,
                 dock_bin,
@@ -655,38 +664,37 @@ pub fn start_daemon(
             }
         }
     } else {
-        if with_dock {
-            let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
-            let current_exe = std::env::current_exe().ok();
-            let dock_bin = resolve_dock_binary(current_exe.as_deref());
-            let proc_root = Path::new("/proc");
-            let dock_running = is_dock_currently_running(paths, proc_root);
+        let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+        let current_exe = std::env::current_exe().ok();
+        let dock_bin = resolve_dock_binary(current_exe.as_deref());
+        let proc_root = Path::new("/proc");
+        let dock_running = is_dock_currently_running(paths, proc_root);
 
-            let decision = should_launch_dock(
-                no_dock,
-                wayland_display.as_deref(),
-                dock_running,
-                dock_bin,
-            );
+        let effective_no_dock = !should_launch_dock_from_flags(no_dock, with_dock);
+        let decision = should_launch_dock(
+            effective_no_dock,
+            wayland_display.as_deref(),
+            dock_running,
+            dock_bin,
+        );
 
-            match decision {
-                DockLaunchDecision::Launch(bin_path) => {
-                    if let Some(d_pid) = spawn_dock_process(&bin_path) {
-                        println!("✦ Companion dock launched (PID: {}).", d_pid);
-                    }
+        match decision {
+            DockLaunchDecision::Launch(bin_path) => {
+                if let Some(d_pid) = spawn_dock_process(&bin_path) {
+                    println!("✦ Companion dock launched (PID: {}).", d_pid);
                 }
-                DockLaunchDecision::SkipNoDock => {
-                    println!("✦ Companion dock disabled via --no-dock.");
-                }
-                DockLaunchDecision::SkipNoWayland => {
-                    println!("✦ Wayland session not detected; companion dock skipped.");
-                }
-                DockLaunchDecision::SkipAlreadyRunning => {
-                    println!("✦ Companion dock is already running; skipping duplicate launch.");
-                }
-                DockLaunchDecision::SkipBinaryNotFound => {
-                    println!("✦ Companion dock binary not found; speechyyy-dock skipped.");
-                }
+            }
+            DockLaunchDecision::SkipNoDock => {
+                println!("✦ Companion dock disabled via --no-dock.");
+            }
+            DockLaunchDecision::SkipNoWayland => {
+                println!("✦ Wayland session not detected; companion dock skipped.");
+            }
+            DockLaunchDecision::SkipAlreadyRunning => {
+                println!("✦ Companion dock is already running; skipping duplicate launch.");
+            }
+            DockLaunchDecision::SkipBinaryNotFound => {
+                println!("✦ Companion dock binary not found; speechyyy-dock skipped.");
             }
         }
 
@@ -798,6 +806,15 @@ pub fn start_daemon(
         signal_handle.close();
 
         println!("Shutting down Speechyyy...");
+        let proc_root = Path::new("/proc");
+        if let Some(dock_pid) = find_running_dock_pid(paths, proc_root) {
+            #[cfg(unix)]
+            {
+                let sink = crate::procs::RealSignalSink;
+                let _ = crate::procs::terminate(&[dock_pid], Duration::from_millis(500), &sink);
+            }
+            PidFile::remove(&paths.dock_pid_path);
+        }
         paths.cleanup();
         Ok(())
     }
@@ -1568,6 +1585,18 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_should_launch_dock_from_flags_all_combinations() {
+        // 1. Defaults: neither flag passed -> dock is launched by default
+        assert!(should_launch_dock_from_flags(false, false));
+        // 2. Explicit with_dock -> dock is launched
+        assert!(should_launch_dock_from_flags(false, true));
+        // 3. Explicit no_dock -> dock is suppressed
+        assert!(!should_launch_dock_from_flags(true, false));
+        // 4. Both flags passed -> --no-dock wins
+        assert!(!should_launch_dock_from_flags(true, true));
     }
 
     #[test]

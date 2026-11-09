@@ -32,10 +32,10 @@ pub enum Command {
         /// Keystroke typing delay in milliseconds for typewriter mode
         #[arg(long)]
         typing_delay: Option<u64>,
-        /// Disable companion dock launch on start
+        /// Disable companion dock launch on start (takes precedence over --with-dock)
         #[arg(long)]
         no_dock: bool,
-        /// Launch companion dock even when running in foreground mode
+        /// Launch companion dock on start (dock is launched by default; overridden by --no-dock)
         #[arg(long)]
         with_dock: bool,
     },
@@ -635,5 +635,20 @@ mod tests {
         assert!(help.contains("remove"));
         assert!(help.contains("uninstall"));
         assert!(help.contains("unlearn"));
+    }
+
+    #[test]
+    fn test_start_subcommand_dock_flags_help_guidance() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let start_sub = cmd.find_subcommand("start").expect("start subcommand");
+        let mut buf = Vec::new();
+        start_sub.clone().write_help(&mut buf).unwrap();
+        let help = String::from_utf8(buf).unwrap();
+
+        assert!(help.contains("--no-dock"));
+        assert!(help.contains("--with-dock"));
+        assert!(help.contains("takes precedence over --with-dock"));
+        assert!(help.contains("overridden by --no-dock"));
     }
 }
