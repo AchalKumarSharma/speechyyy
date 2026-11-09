@@ -32,10 +32,21 @@ This installs `speechyyy` and `speechyyy-dock` into `~/.local/bin/` and creates 
    ```bash
    speechyyy doctor
    ```
-2. Choose a speech provider (see below):
+2. Pick how you want to transcribe (more options below):
+
+   **Offline, on your device:** Parakeet. It's a big download, so give it a minute.
+
    ```bash
-   speechyyy use groq
+   speechyyy download parakeet-tdt-v3
+   speechyyy use parakeet-tdt-v3
    ```
+
+   **Cloud, bring your own key:** Sarvam. This is the one to pick for Indian languages. Your audio is sent to Sarvam to be transcribed.
+
+   ```bash
+   speechyyy use sarvam
+   ```
+
 3. Start the engine:
    ```bash
    speechyyy start
@@ -77,12 +88,12 @@ Speechyyy pastes via clipboard by default (`wl-copy` followed by a synthetic `Ct
 
 Audio is sent over HTTPS to your chosen provider for transcription. Sarvam is the pick for Indian languages.
 
-| Provider | Setup command | Environment key fallback |
-|---|---|---|
-| Sarvam AI | `speechyyy use sarvam` | `SARVAM_API_KEY` |
-| Groq | `speechyyy use groq` | `GROQ_API_KEY` |
-| OpenAI | `speechyyy use openai` | `OPENAI_API_KEY` |
-| Custom | `speechyyy use openai-compatible` | `OPENAI_COMPATIBLE_API_KEY` |
+| Provider  | Setup command                     | Environment key fallback    |
+| --------- | --------------------------------- | --------------------------- |
+| Sarvam AI | `speechyyy use sarvam`            | `SARVAM_API_KEY`            |
+| Groq      | `speechyyy use groq`              | `GROQ_API_KEY`              |
+| OpenAI    | `speechyyy use openai`            | `OPENAI_API_KEY`            |
+| Custom    | `speechyyy use openai-compatible` | `OPENAI_COMPATIBLE_API_KEY` |
 
 Enter your API key when prompted; it is saved with `0600` permissions to `config.toml`. You can also provide `SPEECHYYY_API_KEY="<key>"` during installation.
 
@@ -90,11 +101,11 @@ Enter your API key when prompted; it is saved with `0600` permissions to `config
 
 Runs completely on your machine with no network connection during dictation.
 
-| Model | Size | Setup command |
-|---|---|---|
-| `parakeet-tdt-v3` | Large download (~487 MB) | `speechyyy download parakeet-tdt-v3 && speechyyy use parakeet-tdt-v3` |
-| `whisper-large-v3-turbo` (alias `whisper-turbo`) | Large download | `speechyyy download whisper-turbo && speechyyy use whisper-turbo` |
-| `moonshine-base` | Medium download | `speechyyy download moonshine-base && speechyyy use moonshine-base` |
+| Model                                            | Size                     | Setup command                                                         |
+| ------------------------------------------------ | ------------------------ | --------------------------------------------------------------------- |
+| `parakeet-tdt-v3`                                | Large download (~487 MB) | `speechyyy download parakeet-tdt-v3 && speechyyy use parakeet-tdt-v3` |
+| `whisper-large-v3-turbo` (alias `whisper-turbo`) | Large download           | `speechyyy download whisper-turbo && speechyyy use whisper-turbo`     |
+| `moonshine-base`                                 | Medium download          | `speechyyy download moonshine-base && speechyyy use moonshine-base`   |
 
 View installed models with `speechyyy models`, and delete local model files with `speechyyy remove <model>`.
 
@@ -102,24 +113,24 @@ View installed models with `speechyyy models`, and delete local model files with
 
 ## Commands cheat-sheet
 
-| Command | What it does |
-|---|---|
-| `speechyyy start` | Starts daemon and dock. Use `-f` for foreground logs, `--no-dock` to skip dock. |
-| `speechyyy stop` | Stops the running daemon and dock cleanly via SIGTERM. |
-| `speechyyy status` | Shows daemon PID, current state, and active model. |
-| `speechyyy doctor` | Audits microphone, `/dev/uinput`, dock, and models. Add `--deep` to verify checksums. |
-| `speechyyy push-down` | Starts recording (press shortcut). |
-| `speechyyy push-up` | Stops recording and transcribes (release shortcut). |
-| `speechyyy toggle` | Toggles recording state on or off. |
-| `speechyyy cancel` | Discards current audio without emitting text. |
-| `speechyyy events` | Streams live daemon state and audio RMS levels as NDJSON. |
-| `speechyyy history` | Shows recent dictation transcripts (default: last 10). |
-| `speechyyy models` | Lists available and installed speech models. |
-| `speechyyy download <model>` | Downloads and verifies model weights. |
-| `speechyyy use <model>` | Switches active model and reloads the daemon. |
-| `speechyyy remove <model>` | Deletes local model files to free disk space. |
-| `speechyyy update` | Updates binaries in-place to the newest release. |
-| `speechyyy uninstall` | Stops services and removes binaries, models, and config. |
+| Command                      | What it does                                                                          |
+| ---------------------------- | ------------------------------------------------------------------------------------- |
+| `speechyyy start`            | Starts daemon and dock. Use `-f` for foreground logs, `--no-dock` to skip dock.       |
+| `speechyyy stop`             | Stops the running daemon and dock cleanly via SIGTERM.                                |
+| `speechyyy status`           | Shows daemon PID, current state, and active model.                                    |
+| `speechyyy doctor`           | Audits microphone, `/dev/uinput`, dock, and models. Add `--deep` to verify checksums. |
+| `speechyyy push-down`        | Starts recording (press shortcut).                                                    |
+| `speechyyy push-up`          | Stops recording and transcribes (release shortcut).                                   |
+| `speechyyy toggle`           | Toggles recording state on or off.                                                    |
+| `speechyyy cancel`           | Discards current audio without emitting text.                                         |
+| `speechyyy events`           | Streams live daemon state and audio RMS levels as NDJSON.                             |
+| `speechyyy history`          | Shows recent dictation transcripts (default: last 10).                                |
+| `speechyyy models`           | Lists available and installed speech models.                                          |
+| `speechyyy download <model>` | Downloads and verifies model weights.                                                 |
+| `speechyyy use <model>`      | Switches active model and reloads the daemon.                                         |
+| `speechyyy remove <model>`   | Deletes local model files to free disk space.                                         |
+| `speechyyy update`           | Updates binaries in-place to the newest release.                                      |
+| `speechyyy uninstall`        | Stops services and removes binaries, models, and config.                              |
 
 Run `speechyyy --help` for flag details on any command.
 
@@ -139,13 +150,14 @@ speechyyy uninstall
 ```
 
 **Pre-releases:** GitHub's standard release feed skips pre-releases. To install or update to a release candidate (such as `v0.2.0-rc1`), pass the tag explicitly:
+
 ```bash
 SPEECHYYY_VERSION=v0.2.0-rc1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/AchalKumarSharma/speechyyy/main/install.sh)"
 # Or update an existing install:
 speechyyy update --tag v0.2.0-rc1
 ```
 
-*Upgrade note:* If you started a dock under a pre-v0.2.0 version before PID tracking existed, close it manually once (`killall speechyyy-dock`).
+_Upgrade note:_ If you started a dock under a pre-v0.2.0 version before PID tracking existed, close it manually once (`killall speechyyy-dock`).
 
 ---
 
