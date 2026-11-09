@@ -36,6 +36,9 @@ The GitHub Actions release pipeline is defined in [`.github/workflows/release.ym
   - `actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2`
   - `actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0`
   - `actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8`
+- **Credential Hygiene:** Git credentials are never persisted on runner disks (`persist-credentials: false` on every checkout). `GITHUB_TOKEN` is passed exclusively through environment variables in the `publish` job (never inline in script text or echoed).
+- **Script-Injection Safety:** Context expressions (`inputs.*`, `github.*`, `matrix.*`, `needs.*`) are strictly mapped to step-level environment variables (`env:`) and referenced as quoted shell variables; zero expression interpolations appear inside `run:` script bodies.
+- **Tag Validation:** The release tag is validated in the initial `sanity` job against `^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$` and confirmed against `Cargo.toml`. Downstream jobs consume the validated tag from job outputs (`needs.sanity.outputs.tag`).
 - **Native Matrix Compilation:**
   - `x86_64`: Hosted on `ubuntu-22.04` (provides broad glibc backward-compatibility, baseline glibc 2.35).
   - `aarch64`: Hosted on `ubuntu-24.04-arm` (GitHub-hosted native Arm64 runner, eliminating slow QEMU cross-emulation).
@@ -161,8 +164,26 @@ Do **NOT** re-tag or mutate existing tags; users and package managers rely on im
 
 ## 6. Action SHA Pinning & Upgrades
 
-For supply-chain security, GitHub Actions should not rely on floating tags (`@v4`). To audit or bump pinned actions:
+For supply-chain security, GitHub Actions should not rely on floating tags (`@v4`). All actions are pinned to immutable 40-character commit SHAs.
 
+### Audit & Verification Commands
+To verify the pinned commit SHAs directly against their upstream repositories:
+
+```bash
+# 1. Verify actions/checkout @ v4.2.2 (11bd71901bbe5b1630ceea73d27597364c9af683)
+git ls-remote https://github.com/actions/checkout.git refs/tags/v4.2.2
+gh api repos/actions/checkout/git/commits/11bd71901bbe5b1630ceea73d27597364c9af683 --jq '.sha, .message'
+
+# 2. Verify actions/upload-artifact @ v4.5.0 (6f51ac03b9356f520e9adb1b1b7802705f340c2b)
+git ls-remote https://github.com/actions/upload-artifact.git refs/tags/v4.5.0
+gh api repos/actions/upload-artifact/git/commits/6f51ac03b9356f520e9adb1b1b7802705f340c2b --jq '.sha, .message'
+
+# 3. Verify actions/download-artifact @ v4.1.8 (fa0a91b85d4f404e444e00e005971372dc801d16)
+git ls-remote https://github.com/actions/download-artifact.git refs/tags/v4.1.8
+gh api repos/actions/download-artifact/git/commits/fa0a91b85d4f404e444e00e005971372dc801d16 --jq '.sha, .message'
+```
+
+### Bumping Action Pins
 1. Resolve the latest commit hash for the target action tag using GitHub CLI:
    ```bash
    gh api repos/actions/checkout/commits/v4.2.2 --jq '.sha'
