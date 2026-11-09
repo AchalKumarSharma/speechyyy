@@ -642,3 +642,28 @@ fn test_clipboard_write_failure_emits_no_keys_and_does_not_panic() {
         "No keys should be recorded in order"
     );
 }
+
+#[test]
+fn test_clipboard_injector_paste_hold_delay_timing() {
+    use std::time::Instant;
+
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let writer = MockClipboardWriter::with_order(Arc::clone(&order));
+    let sink = MockKeySink::with_order(Arc::clone(&order));
+
+    let mut injector = WaylandClipboardInjector::with_parts(
+        Box::new(writer),
+        Box::new(sink),
+        Duration::ZERO,
+    );
+
+    let start = Instant::now();
+    assert!(injector.inject("Test hold duration").is_ok());
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= WaylandClipboardInjector::PASTE_HOLD_DELAY,
+        "inject() must hold the Ctrl+V chord for at least PASTE_HOLD_DELAY (20ms), took {:?}",
+        elapsed
+    );
+}

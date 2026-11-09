@@ -820,6 +820,8 @@ impl TextInjector for WaylandClipboardInjector {
             return Err(e);
         }
 
+        thread::sleep(Self::PASTE_HOLD_DELAY);
+
         if let Err(e) = self.key_sink.emit_key(KeyCode::KEY_V, false) {
             eprintln!("Clipboard paste warning: failed to emit KEY_V release: {}", e);
             let _ = self.key_sink.emit_key(KeyCode::KEY_LEFTCTRL, false);
