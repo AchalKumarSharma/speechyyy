@@ -317,6 +317,11 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
                     )
                 }
             };
+            if config.inference.model.trim().is_empty() {
+                return Err(
+                    "OpenAI-compatible model is not set. Set 'model' in config.toml or run 'speechyyy use openai-compatible' to specify your model.".into(),
+                );
+            }
             let policy_result = match crate::inference::validate_endpoint(endpoint) {
                 Ok(_) => {
                     let host = crate::inference::extract_endpoint_host(endpoint)
@@ -361,7 +366,8 @@ pub fn check_inference_for_config(config: &crate::config::Config) -> Result<Stri
                     info.file_count
                 )),
                 Err(err) => Err(format!(
-                    "Local model missing at {}: {}. Run 'speechyyy model download -m {}' to fetch weights.",
+                    "Local model '{}' not downloaded (missing at {}): {}. Run 'speechyyy download {}' to download weights.",
+                    model_type.folder_name(),
                     model_dir.display(),
                     err,
                     model_type.folder_name()
@@ -621,15 +627,50 @@ pub fn run_doctor_opts<E: SysEnv>(
             let (name, status_err) = if err.starts_with("Sarvam API Key") {
                 (err.clone(), String::new())
             } else {
-                ("Speech inference provider".to_string(), err)
+                ("Speech inference provider".to_string(), err.clone())
             };
             items.push(DiagnosticItem {
                 name,
                 status: CheckStatus::Fail(status_err),
             });
-            fix_instructions.push(
-                "Export SARVAM_API_KEY (e.g. 'export SARVAM_API_KEY=your_key') or run 'speechyyy model download' for offline local inference.".into(),
-            );
+            if err.contains("SARVAM_API_KEY")
+                || err.starts_with("Sarvam")
+                || config.inference.provider.eq_ignore_ascii_case("sarvam")
+            {
+                fix_instructions.push(
+                    "Export SARVAM_API_KEY (e.g. 'export SARVAM_API_KEY=your_key') or set api_key in config.toml.".into(),
+                );
+            } else if err.contains("GROQ_API_KEY")
+                || config.inference.provider.eq_ignore_ascii_case("groq")
+            {
+                fix_instructions.push(
+                    "Export GROQ_API_KEY or set groq_api_key in config.toml.".into(),
+                );
+            } else if err.contains("OPENAI_API_KEY")
+                || config.inference.provider.eq_ignore_ascii_case("openai")
+            {
+                fix_instructions.push(
+                    "Export OPENAI_API_KEY or set openai_api_key in config.toml.".into(),
+                );
+            } else if config.inference.provider.eq_ignore_ascii_case("openai-compatible") {
+                fix_instructions.push(
+                    "Set openai_compatible_endpoint and model in config.toml or run 'speechyyy use openai-compatible'.".into(),
+                );
+            } else if config.inference.provider.eq_ignore_ascii_case("local") {
+                let model_name = if config.inference.model.trim().is_empty() {
+                    "parakeet-tdt-v3"
+                } else {
+                    config.inference.model.trim()
+                };
+                fix_instructions.push(format!(
+                    "Download the default local model: 'speechyyy download {}'.",
+                    model_name
+                ));
+            } else {
+                fix_instructions.push(
+                    "Check your inference provider configuration in config.toml or run 'speechyyy doctor'.".into(),
+                );
+            }
         }
     }
 

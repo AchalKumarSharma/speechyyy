@@ -6,6 +6,131 @@ use std::time::Duration;
 pub const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/achalkumarsharma/speechyyy/releases/latest";
 
+pub const MAX_SHA256SUMS_BYTES: u64 = 256 * 1024;
+pub const MAX_UPDATE_ARCHIVE_BYTES: u64 = 150 * 1024 * 1024;
+
+/// Parses a SHA256SUMS file content for the expected target filename.
+/// Enforces strict validation: 64-hex chars, matches target filename, rejects duplicates/malformed.
+pub fn parse_sha256sums(content: &str, target_filename: &str) -> Result<String, String> {
+    let mut matched_hash: Option<String> = None;
+    let target_clean = target_filename.trim_start_matches("./");
+
+    for (line_no, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let hash = parts.next().ok_or_else(|| {
+            format!("Line {}: missing hash in SHA256SUMS", line_no + 1)
+        })?;
+        let filename = parts.next().ok_or_else(|| {
+            format!("Line {}: missing filename in SHA256SUMS", line_no + 1)
+        })?;
+
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "Line {}: invalid SHA-256 hash '{}' (expected 64 hexadecimal characters)",
+                line_no + 1,
+                hash
+            ));
+        }
+
+        let clean_fname = filename.trim_start_matches('*').trim_start_matches("./");
+        if clean_fname == target_clean {
+            if matched_hash.is_some() {
+                return Err(format!(
+                    "Duplicate entry for '{}' found in SHA256SUMS on line {}",
+                    target_filename,
+                    line_no + 1
+                ));
+            }
+            matched_hash = Some(hash.to_ascii_lowercase());
+        }
+    }
+
+    matched_hash.ok_or_else(|| {
+        format!(
+            "Target file '{}' not found in SHA256SUMS",
+            target_filename
+        )
+    })
+}
+
+pub fn download_and_verify_release<P>(
+    archive_url: &str,
+    sha256sums_url: &str,
+    archive_filename: &str,
+    staged_archive_path: &Path,
+    staged_sha_path: &Path,
+    policy: P,
+) -> Result<String, String>
+where
+    P: Fn(&str) -> Result<(), String>,
+{
+    let fetcher = crate::model::UreqFetcher;
+
+    // 1. Fetch SHA256SUMS
+    let fetch_sha_res = fetcher.fetch_with_policy(
+        sha256sums_url,
+        staged_sha_path,
+        MAX_SHA256SUMS_BYTES,
+        None,
+        &policy,
+    );
+    if let Err(e) = fetch_sha_res {
+        let _ = fs::remove_file(staged_sha_path);
+        return Err(format!("Failed to download SHA256SUMS: {}", e));
+    }
+
+    // 2. Parse SHA256SUMS for the target archive
+    let sha_content = match fs::read_to_string(staged_sha_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = fs::remove_file(staged_sha_path);
+            return Err(format!("Failed to read staged SHA256SUMS file: {}", e));
+        }
+    };
+    let expected_hash = match parse_sha256sums(&sha_content, archive_filename) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_file(staged_sha_path);
+            return Err(format!("Failed to parse SHA256SUMS: {}", e));
+        }
+    };
+
+    // 3. Fetch archive tarball (fetch_with_policy hashes and enforces MAX_UPDATE_ARCHIVE_BYTES)
+    let fetch_archive_res = fetcher.fetch_with_policy(
+        archive_url,
+        staged_archive_path,
+        MAX_UPDATE_ARCHIVE_BYTES,
+        None,
+        &policy,
+    );
+    let actual_hash = match fetch_archive_res {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_file(staged_archive_path);
+            let _ = fs::remove_file(staged_sha_path);
+            return Err(format!("Failed to download release archive: {}", e));
+        }
+    };
+
+    // 4. Verify checksum
+    if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
+        let _ = fs::remove_file(staged_archive_path);
+        let _ = fs::remove_file(staged_sha_path);
+        return Err(format!(
+            "SHA-256 verification failed for '{}': expected {}, computed {}",
+            archive_filename, expected_hash, actual_hash
+        ));
+    }
+
+    let _ = fs::remove_file(staged_sha_path);
+    Ok(actual_hash)
+}
+
 /// Fetches latest release metadata from GitHub
 pub fn fetch_latest_release(url: &str) -> Result<serde_json::Value, String> {
     let agent = ureq::AgentBuilder::new()
@@ -368,22 +493,42 @@ pub fn handle_update_command(force: bool) -> Result<(), String> {
         ));
     }
 
-    // Determine download URL
-    let asset_url = release_info["assets"].as_array().and_then(|assets| {
-        assets.iter().find_map(|a| {
-            let name = a["name"].as_str()?;
-            if name.contains("x86_64-unknown-linux-gnu.tar.gz") {
-                a["browser_download_url"].as_str().map(|s| s.to_string())
-            } else {
-                None
+    // Determine download URL and SHA256SUMS URL
+    let (archive_url, sha_url, archive_filename) = if let Some(assets) = release_info["assets"].as_array() {
+        let mut arch_url = None;
+        let mut arch_name = None;
+        let mut s_url = None;
+
+        for a in assets {
+            if let Some(name) = a["name"].as_str() {
+                if name == "SHA256SUMS" {
+                    s_url = a["browser_download_url"].as_str().map(String::from);
+                } else if name.ends_with("x86_64-unknown-linux-gnu.tar.gz") {
+                    arch_name = Some(name.to_string());
+                    arch_url = a["browser_download_url"].as_str().map(String::from);
+                }
             }
-        })
+        }
+        (arch_url, s_url, arch_name)
+    } else {
+        (None, None, None)
+    };
+
+    let filename = archive_filename.unwrap_or_else(|| {
+        format!("speechyyy-{}-x86_64-unknown-linux-gnu.tar.gz", tag_name)
     });
 
-    let download_url = asset_url.unwrap_or_else(|| {
+    let download_url = archive_url.unwrap_or_else(|| {
         format!(
-            "https://github.com/achalkumarsharma/speechyyy/releases/download/{}/speechyyy-{}-x86_64-unknown-linux-gnu.tar.gz",
-            tag_name, tag_name
+            "https://github.com/achalkumarsharma/speechyyy/releases/download/{}/{}",
+            tag_name, filename
+        )
+    });
+
+    let sha256sums_url = sha_url.unwrap_or_else(|| {
+        format!(
+            "https://github.com/achalkumarsharma/speechyyy/releases/download/{}/SHA256SUMS",
+            tag_name
         )
     });
 
@@ -392,27 +537,23 @@ pub fn handle_update_command(force: bool) -> Result<(), String> {
     fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("Failed to create temporary directory: {}", e))?;
 
-    let tarball_path = temp_dir.join("speechyyy.tar.gz");
-    println!("==> Downloading pre-built release {}...", tag_name);
+    let tarball_path = temp_dir.join(&filename);
+    let sha_path = temp_dir.join("SHA256SUMS");
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(60))
-        .build();
+    println!("==> Downloading pre-built release {} and SHA256SUMS...", tag_name);
+    if let Err(e) = download_and_verify_release(
+        &download_url,
+        &sha256sums_url,
+        &filename,
+        &tarball_path,
+        &sha_path,
+        crate::model::validate_download_url,
+    ) {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(e);
+    }
 
-    let user_agent = format!("speechyyy-updater/{}", current_version);
-    let mut reader = agent
-        .get(&download_url)
-        .set("User-Agent", &user_agent)
-        .call()
-        .map_err(|e| format!("Failed to download release from {}: {}", download_url, e))?
-        .into_reader();
-
-    let mut out_file = fs::File::create(&tarball_path)
-        .map_err(|e| format!("Failed to create download file: {}", e))?;
-    std::io::copy(&mut reader, &mut out_file)
-        .map_err(|e| format!("Failed to save release download: {}", e))?;
-
-    println!("==> Extracting release archive...");
+    println!("==> Extracting verified release archive...");
     unpack_tarball(&tarball_path, &temp_dir)?;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -424,7 +565,7 @@ pub fn handle_update_command(force: bool) -> Result<(), String> {
 
     let _ = fs::remove_dir_all(&temp_dir);
     install_result?;
-    std::process::exit(0);
+    Ok(())
 }
 
 #[cfg(test)]

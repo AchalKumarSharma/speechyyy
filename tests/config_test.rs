@@ -22,7 +22,7 @@ fn test_config_defaults() {
         "Default Sarvam mode must be 'translit'"
     );
 
-    assert_eq!(cfg.inference.model, "saaras:v4");
+    assert_eq!(cfg.inference.model, "parakeet-tdt-v3");
 
     // Default text injection mode must be "clipboard"
     assert_eq!(

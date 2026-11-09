@@ -594,6 +594,18 @@ impl UreqFetcher {
                     .map_err(|e| format!("Failed to create staging dir {}: {}", p.display(), e))?;
             }
 
+            #[cfg(unix)]
+            let mut dest_file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(dest)
+                    .map_err(|e| format!("Failed to create staging file {}: {}", dest.display(), e))?
+            };
+            #[cfg(not(unix))]
             let mut dest_file = File::create(dest)
                 .map_err(|e| format!("Failed to create staging file {}: {}", dest.display(), e))?;
 

@@ -170,11 +170,6 @@ fn test_sarvam_http_401_maps_to_explicit_authentication_error() {
     match err {
         InferenceError::Authentication(msg) => {
             assert!(
-                msg.contains("Unauthorized") || msg.contains("invalid"),
-                "Expected auth error message, got: {}",
-                msg
-            );
-            assert!(
                 msg.contains("Invalid or expired Sarvam API key. Check 'speechyyy doctor' or replenish credentials at https://dashboard.sarvam.ai"),
                 "Missing structured 401 error message in: {}",
                 msg
@@ -224,6 +219,14 @@ fn test_sarvam_http_429_maps_to_explicit_rate_limited_error() {
 }
 
 #[test]
+fn test_sarvam_resolve_request_timeout() {
+    use speechyyy::inference::sarvam::resolve_request_timeout;
+    assert_eq!(resolve_request_timeout(None), Duration::from_secs(30));
+    assert_eq!(resolve_request_timeout(Some(0)), Duration::from_secs(30));
+    assert_eq!(resolve_request_timeout(Some(15)), Duration::from_secs(15));
+}
+
+#[test]
 fn test_sarvam_network_timeout_maps_to_explicit_timeout_error() {
     // Mock server connects but sleeps longer than client timeout
     let (endpoint, _) = spawn_mock_server(200, "{}", Some(Duration::from_millis(500)));
@@ -244,8 +247,13 @@ fn test_sarvam_network_timeout_maps_to_explicit_timeout_error() {
         InferenceError::Timeout(msg) => {
             assert!(!msg.is_empty());
             assert!(
-                msg.contains("Sarvam AI connection timed out. Check network connectivity"),
+                msg.contains("Sarvam AI connection timed out after"),
                 "Missing structured timeout error message in: {}",
+                msg
+            );
+            assert!(
+                msg.contains("raise 'request_timeout_secs' in config.toml"),
+                "Missing actionable config guidance in: {}",
                 msg
             );
         }
@@ -253,5 +261,31 @@ fn test_sarvam_network_timeout_maps_to_explicit_timeout_error() {
             "Expected InferenceError::Timeout for network timeout, got: {:?}",
             other
         ),
+    }
+}
+
+#[test]
+fn test_sarvam_timeout_with_server_not_responding() {
+    let (endpoint, _) = spawn_mock_server(200, "{}", Some(Duration::from_secs(10)));
+    let mut sarvam = SarvamSpeechInference::new(
+        "timeout_key".into(),
+        "saaras:v4".into(),
+        "unknown".into(),
+        "translit".into(),
+    )
+    .with_endpoint(&endpoint)
+    .with_timeout(Duration::from_secs(1));
+
+    let start = std::time::Instant::now();
+    let chunk = AudioChunk::new(vec![0.1f32; 1600]);
+    let err = sarvam.transcribe(&chunk).unwrap_err();
+    let elapsed = start.elapsed();
+
+    assert!(elapsed < Duration::from_secs(5), "Request took too long: {:?}", elapsed);
+    match err {
+        InferenceError::Timeout(msg) => {
+            assert!(msg.contains("Sarvam AI connection timed out"));
+        }
+        other => panic!("Expected InferenceError::Timeout, got {:?}", other),
     }
 }

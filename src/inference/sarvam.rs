@@ -10,6 +10,14 @@ pub const DEFAULT_SARVAM_MODEL: &str = "saaras:v4";
 pub const DEFAULT_SARVAM_MODE: &str = "translit";
 pub const DEFAULT_SARVAM_LANGUAGE: &str = "unknown";
 
+/// Resolves the Sarvam request timeout, defaulting 0 or None to 30 seconds.
+pub fn resolve_request_timeout(timeout_secs: Option<u64>) -> std::time::Duration {
+    match timeout_secs {
+        Some(s) if s > 0 => std::time::Duration::from_secs(s),
+        _ => std::time::Duration::from_secs(30),
+    }
+}
+
 #[derive(Debug)]
 pub struct SarvamSpeechInference {
     pub api_key: Secret,
@@ -17,7 +25,7 @@ pub struct SarvamSpeechInference {
     pub language_code: String,
     pub mode: String,
     pub endpoint: String,
-    pub timeout: Option<std::time::Duration>,
+    pub timeout: std::time::Duration,
 }
 
 impl SarvamSpeechInference {
@@ -29,7 +37,7 @@ impl SarvamSpeechInference {
             language_code,
             mode,
             endpoint: DEFAULT_SARVAM_ENDPOINT.to_string(),
-            timeout: None,
+            timeout: resolve_request_timeout(None),
         }
     }
 
@@ -37,12 +45,14 @@ impl SarvamSpeechInference {
         let api_key = config.resolve_api_key().ok_or_else(|| {
             InferenceError::MissingApiKey("SARVAM_API_KEY is not configured".to_string())
         })?;
+        let timeout = resolve_request_timeout(config.request_timeout_secs);
         Ok(Self::new(
             Secret::new(api_key),
             config.model.clone(),
             config.language_code.clone(),
             config.mode.clone(),
-        ))
+        )
+        .with_timeout(timeout))
     }
 
     pub fn with_endpoint(mut self, endpoint: &str) -> Self {
@@ -51,7 +61,7 @@ impl SarvamSpeechInference {
     }
 
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.timeout = Some(timeout);
+        self.timeout = timeout;
         self
     }
 }
@@ -85,11 +95,10 @@ impl SpeechInference for SarvamSpeechInference {
             &self.language_code,
         );
 
-        let mut agent_builder = ureq::builder();
-        if let Some(timeout) = self.timeout {
-            agent_builder = agent_builder.timeout(timeout);
-        }
-        let agent = agent_builder.build();
+        let agent = ureq::builder()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout(self.timeout)
+            .build();
 
         let response = agent
             .post(&self.endpoint)
@@ -106,15 +115,9 @@ impl SpeechInference for SarvamSpeechInference {
                         .unwrap_or_else(|_| "Unknown HTTP error".into());
                     match status {
                         401 => {
-                            let details = if msg.is_empty() {
-                                String::new()
-                            } else {
-                                format!(": {}", msg)
-                            };
-                            InferenceError::Authentication(format!(
-                                "Invalid or expired Sarvam API key. Check 'speechyyy doctor' or replenish credentials at https://dashboard.sarvam.ai{}",
-                                details
-                            ))
+                            InferenceError::Authentication(
+                                "Invalid or expired Sarvam API key. Check 'speechyyy doctor' or replenish credentials at https://dashboard.sarvam.ai".into(),
+                            )
                         }
                         429 => {
                             let details = if msg.is_empty() {
@@ -145,14 +148,9 @@ impl SpeechInference for SarvamSpeechInference {
                             .unwrap_or(false);
 
                     if is_timeout {
-                        let details = if msg.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {}", msg)
-                        };
                         InferenceError::Timeout(format!(
-                            "Sarvam AI connection timed out. Check network connectivity{}",
-                            details
+                            "Sarvam AI connection timed out after {:?}. Check your network connection or raise 'request_timeout_secs' in config.toml",
+                            self.timeout
                         ))
                     } else {
                         InferenceError::Network(msg)

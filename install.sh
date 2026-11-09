@@ -254,7 +254,8 @@ else
         mkdir -p "$CONFIG_DIR"
         (
             umask 077
-            cat > "$CONFIG_FILE" <<EOF
+            if [ -n "$API_KEY" ]; then
+                cat > "$CONFIG_FILE" <<EOF
 hotkey = "RightAlt"
 pacing_delay_ms = 15
 # Injection mode:
@@ -285,11 +286,45 @@ pacing_delay_ms = 15
 [ui]
 nickname = "babe"
 EOF
+            else
+                cat > "$CONFIG_FILE" <<EOF
+hotkey = "RightAlt"
+pacing_delay_ms = 15
+# Injection mode:
+# - "clipboard" (default): fast paste via Ctrl+V; leaves transcription in clipboard and immune to browser hotkey hijacking. (Requires wl-clipboard on Wayland; does not paste in standard terminals).
+# - "typewriter": character-by-character typing via /dev/uinput. Works in terminals, but triggers page shortcuts if no text field is focused.
+injection_mode = "clipboard"
+
+[input]
+hotkey = "RightAlt"
+grab_key = true
+
+[audio]
+sample_rate = 16000
+vad_threshold = 0.005
+min_duration_ms = 200
+
+[inference]
+# Defaults to provider = "local" with model = "parakeet-tdt-v3"
+# Run 'speechyyy download parakeet-tdt-v3' to download offline weights.
+# Or configure a cloud provider: 'speechyyy use sarvam', 'speechyyy use groq', or 'speechyyy use openai'.
+provider = "local"
+model = "parakeet-tdt-v3"
+
+[injector]
+method = "clipboard"
+pacing_delay_ms = 15
+
+[ui]
+nickname = "babe"
+EOF
+            fi
         )
         chmod 600 "$CONFIG_FILE"
 
         if [ -z "$API_KEY" ]; then
-            echo "✦ No API key provided. Add one later in ${CONFIG_FILE}"
+            echo "✦ No API key provided. Defaulting to local offline provider ('parakeet-tdt-v3')."
+            echo "  Run 'speechyyy download parakeet-tdt-v3' to fetch weights, or configure a provider with 'speechyyy use <provider>'."
             API_KEY_STATUS="skipped"
         else
             echo "[✓] Configuration written securely with mode 0600."

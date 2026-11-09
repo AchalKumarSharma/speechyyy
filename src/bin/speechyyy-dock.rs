@@ -227,11 +227,72 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for DockCheckApp {
     }
 }
 
+const DOCK_HELP: &str = "\
+speechyyy-dock
+Companion Wayland layer-shell HUD dock for Speechyyy
+
+USAGE:
+    speechyyy-dock [OPTIONS]
+
+OPTIONS:
+    -h, --help       Print help information
+    -V, --version    Print version information
+        --check      Check zwlr_layer_shell_v1 compositor support and exit
+";
+
+const DOCK_VERSION: &str = concat!("speechyyy-dock ", env!("CARGO_PKG_VERSION"));
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DockCliAction {
+    Run,
+    Help,
+    Version,
+    Check,
+    Invalid(String),
+}
+
+pub fn parse_dock_args<I>(args: I) -> DockCliAction
+where
+    I: IntoIterator<Item = String>,
+{
+    let items: Vec<String> = args.into_iter().skip(1).collect();
+    if items.is_empty() {
+        return DockCliAction::Run;
+    }
+
+    if items.iter().any(|a| a == "--help" || a == "-h") {
+        return DockCliAction::Help;
+    }
+
+    if items.iter().any(|a| a == "--version" || a == "-V") {
+        return DockCliAction::Version;
+    }
+
+    let mut has_check = false;
+    for item in &items {
+        match item.as_str() {
+            "--check" => has_check = true,
+            other => {
+                return DockCliAction::Invalid(format!(
+                    "error: unexpected argument '{}' found\n\nUsage: speechyyy-dock [OPTIONS]\n\nFor more information, try '--help'.",
+                    other
+                ));
+            }
+        }
+    }
+
+    if has_check {
+        DockCliAction::Check
+    } else {
+        DockCliAction::Run
+    }
+}
+
 pub fn parse_check_flag<I>(args: I) -> bool
 where
     I: IntoIterator<Item = String>,
 {
-    args.into_iter().any(|arg| arg == "--check")
+    matches!(parse_dock_args(args), DockCliAction::Check)
 }
 
 fn run_layer_shell_check() -> ! {
@@ -271,8 +332,23 @@ fn run_layer_shell_check() -> ! {
 }
 
 fn main() {
-    if parse_check_flag(std::env::args()) {
-        run_layer_shell_check();
+    match parse_dock_args(std::env::args()) {
+        DockCliAction::Help => {
+            print!("{}", DOCK_HELP);
+            std::process::exit(0);
+        }
+        DockCliAction::Version => {
+            println!("{}", DOCK_VERSION);
+            std::process::exit(0);
+        }
+        DockCliAction::Check => {
+            run_layer_shell_check();
+        }
+        DockCliAction::Invalid(err) => {
+            eprintln!("{}", err);
+            std::process::exit(2);
+        }
+        DockCliAction::Run => {}
     }
 
     let paths = RuntimePaths::default();
@@ -531,9 +607,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_dock_args() {
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into()]),
+            DockCliAction::Run
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "--help".into()]),
+            DockCliAction::Help
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "-h".into()]),
+            DockCliAction::Help
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "--version".into()]),
+            DockCliAction::Version
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "-V".into()]),
+            DockCliAction::Version
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "--check".into()]),
+            DockCliAction::Check
+        );
+        match parse_dock_args(vec!["speechyyy-dock".into(), "--unknown".into()]) {
+            DockCliAction::Invalid(msg) => {
+                assert!(msg.contains("unexpected argument '--unknown'"));
+            }
+            other => panic!("Expected DockCliAction::Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_check_flag_parsing() {
         assert!(parse_check_flag(vec!["speechyyy-dock".into(), "--check".into()]));
-        assert!(parse_check_flag(vec!["speechyyy-dock".into(), "-v".into(), "--check".into()]));
         assert!(!parse_check_flag(vec!["speechyyy-dock".into()]));
         assert!(!parse_check_flag(vec!["speechyyy-dock".into(), "--other".into()]));
     }

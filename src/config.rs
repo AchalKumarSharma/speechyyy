@@ -232,8 +232,16 @@ fn default_provider() -> String {
     "local".to_string()
 }
 
-fn default_model() -> String {
-    "saaras:v4".to_string()
+/// Single source of truth for default models across inference providers.
+pub fn default_model_for(provider: &str) -> &'static str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "local" => "parakeet-tdt-v3",
+        "sarvam" => "saaras:v4",
+        "groq" => crate::inference::DEFAULT_GROQ_MODEL,
+        "openai" => crate::inference::DEFAULT_OPENAI_MODEL,
+        "openai-compatible" | "custom" => "",
+        _ => "",
+    }
 }
 
 fn default_language_code() -> String {
@@ -274,7 +282,7 @@ pub struct InferenceConfig {
     pub provider: String,
     #[serde(default, alias = "sarvam_api_key")]
     pub api_key: Secret,
-    #[serde(default = "default_model", alias = "sarvam_model")]
+    #[serde(default, alias = "sarvam_model")]
     pub model: String,
     #[serde(default = "default_language_code")]
     pub language_code: String,
@@ -300,10 +308,12 @@ pub struct InferenceConfig {
 
 impl Default for InferenceConfig {
     fn default() -> Self {
+        let provider = default_provider();
+        let model = default_model_for(&provider).to_string();
         Self {
-            provider: default_provider(),
+            provider,
             api_key: Secret::default(),
-            model: default_model(),
+            model,
             language_code: default_language_code(),
             mode: default_mode(),
             groq_api_key: None,
@@ -434,6 +444,36 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawInferenceConfig {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default, alias = "sarvam_api_key")]
+    pub api_key: Option<Secret>,
+    #[serde(default, alias = "sarvam_model")]
+    pub model: Option<String>,
+    #[serde(default = "default_language_code")]
+    pub language_code: String,
+    #[serde(default = "default_mode", alias = "sarvam_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub groq_api_key: Option<Secret>,
+    #[serde(default)]
+    pub openai_api_key: Option<Secret>,
+    #[serde(default)]
+    pub openai_compatible_endpoint: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_model: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_api_key: Option<Secret>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub custom: Option<CustomModelConfig>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawConfig {
     #[serde(default)]
@@ -447,7 +487,7 @@ struct RawConfig {
     #[serde(default)]
     audio: AudioConfig,
     #[serde(default)]
-    inference: InferenceConfig,
+    inference: RawInferenceConfig,
     #[serde(default)]
     injector: InjectorConfig,
     #[serde(default = "default_ui_config")]
@@ -467,19 +507,41 @@ struct RawConfig {
 
 impl From<RawConfig> for Config {
     fn from(raw: RawConfig) -> Self {
-        let mut inference = raw.inference;
-        if let Some(p) = raw.provider {
-            inference.provider = p;
-        }
-        if let Some(k) = raw.sarvam_api_key {
-            inference.api_key = Secret::new(k);
-        }
-        if let Some(m) = raw.sarvam_mode {
-            inference.mode = m;
-        }
-        if let Some(mdl) = raw.sarvam_model {
-            inference.model = mdl;
-        }
+        let provider = raw
+            .provider
+            .or(raw.inference.provider)
+            .unwrap_or_else(default_provider);
+
+        let api_key = raw
+            .sarvam_api_key
+            .map(Secret::new)
+            .or(raw.inference.api_key)
+            .unwrap_or_default();
+
+        let mode = raw
+            .sarvam_mode
+            .unwrap_or(raw.inference.mode);
+
+        let model = raw
+            .sarvam_model
+            .or(raw.inference.model)
+            .unwrap_or_else(|| default_model_for(&provider).to_string());
+
+        let inference = InferenceConfig {
+            provider,
+            api_key,
+            model,
+            language_code: raw.inference.language_code,
+            mode,
+            groq_api_key: raw.inference.groq_api_key,
+            openai_api_key: raw.inference.openai_api_key,
+            openai_compatible_endpoint: raw.inference.openai_compatible_endpoint,
+            openai_compatible_model: raw.inference.openai_compatible_model,
+            openai_compatible_api_key: raw.inference.openai_compatible_api_key,
+            language: raw.inference.language,
+            request_timeout_secs: raw.inference.request_timeout_secs,
+            custom: raw.inference.custom,
+        };
 
         let injection_mode = raw
             .injection_mode
@@ -964,7 +1026,7 @@ mode = "codemix"
     fn test_inference_config_api_key_env_var_fallback() {
         let mut cfg = InferenceConfig::default();
         assert_eq!(cfg.provider, "local");
-        assert_eq!(cfg.model, "saaras:v4");
+        assert_eq!(cfg.model, "parakeet-tdt-v3");
         assert_eq!(cfg.language_code, "unknown");
 
         std::env::remove_var("SARVAM_API_KEY");
@@ -1059,7 +1121,7 @@ model = "saaras:v4"
         let loaded = Config::load_from_path(&config_file);
         assert_eq!(loaded.inference.provider, "local");
         assert_eq!(loaded.inference.api_key, "sarvam_test_token_abc");
-        assert_eq!(loaded.inference.model, "saaras:v4");
+        assert_eq!(loaded.inference.model, "parakeet-tdt-v3");
 
         // 2. Existing file -> updates api_key, preserves existing provider, model and other configs
         let custom_toml = r#"
@@ -1154,5 +1216,55 @@ model = "parakeet-tdt-v3"
         assert_eq!("clipboard".parse::<InjectionMode>(), Ok(InjectionMode::Clipboard));
         assert_eq!("typewriter".parse::<InjectionMode>(), Ok(InjectionMode::Typewriter));
         assert!("invalid".parse::<InjectionMode>().is_err());
+    }
+
+    #[test]
+    fn test_default_model_for_providers() {
+        assert_eq!(default_model_for("local"), "parakeet-tdt-v3");
+        assert_eq!(default_model_for("sarvam"), "saaras:v4");
+        assert_eq!(default_model_for("groq"), "whisper-large-v3-turbo");
+        assert_eq!(default_model_for("openai"), "whisper-1");
+        assert_eq!(default_model_for("openai-compatible"), "");
+        assert_eq!(default_model_for("custom"), "");
+        assert_eq!(default_model_for("unknown"), "");
+    }
+
+    #[test]
+    fn test_omitted_model_resolves_to_provider_default() {
+        // 1. Fresh config (empty TOML) defaults to local + parakeet-tdt-v3
+        let cfg_empty: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg_empty.inference.provider, "local");
+        assert_eq!(cfg_empty.inference.model, "parakeet-tdt-v3");
+
+        // 2. Existing config specifying provider = "sarvam" without model resolves to saaras:v4
+        let cfg_sarvam: Config = toml::from_str("[inference]\nprovider = \"sarvam\"").unwrap();
+        assert_eq!(cfg_sarvam.inference.provider, "sarvam");
+        assert_eq!(cfg_sarvam.inference.model, "saaras:v4");
+
+        // 3. Provider = "groq" without model resolves to whisper-large-v3-turbo
+        let cfg_groq: Config = toml::from_str("[inference]\nprovider = \"groq\"").unwrap();
+        assert_eq!(cfg_groq.inference.provider, "groq");
+        assert_eq!(cfg_groq.inference.model, "whisper-large-v3-turbo");
+
+        // 4. Provider = "openai" without model resolves to whisper-1
+        let cfg_openai: Config = toml::from_str("[inference]\nprovider = \"openai\"").unwrap();
+        assert_eq!(cfg_openai.inference.provider, "openai");
+        assert_eq!(cfg_openai.inference.model, "whisper-1");
+
+        // 5. Provider = "openai-compatible" without model resolves to empty string
+        let cfg_compat: Config = toml::from_str("[inference]\nprovider = \"openai-compatible\"").unwrap();
+        assert_eq!(cfg_compat.inference.provider, "openai-compatible");
+        assert_eq!(cfg_compat.inference.model, "");
+    }
+
+    #[test]
+    fn test_explicit_model_preserved_across_providers() {
+        let cfg_local: Config = toml::from_str("[inference]\nprovider = \"local\"\nmodel = \"whisper-small\"").unwrap();
+        assert_eq!(cfg_local.inference.provider, "local");
+        assert_eq!(cfg_local.inference.model, "whisper-small");
+
+        let cfg_sarvam: Config = toml::from_str("[inference]\nprovider = \"sarvam\"\nmodel = \"custom-sarvam-model\"").unwrap();
+        assert_eq!(cfg_sarvam.inference.provider, "sarvam");
+        assert_eq!(cfg_sarvam.inference.model, "custom-sarvam-model");
     }
 }

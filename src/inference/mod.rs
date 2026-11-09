@@ -80,12 +80,16 @@ pub fn create_inference_provider(
             let (api_key, _) = config.resolve_key_for_provider("sarvam").ok_or_else(|| {
                 "SARVAM_API_KEY is not configured in config.toml or environment variable. Check 'speechyyy doctor'.".to_string()
             })?;
-            Ok(Box::new(sarvam::SarvamSpeechInference::new(
-                api_key,
-                config.model.clone(),
-                config.language_code.clone(),
-                config.mode.clone(),
-            )))
+            let timeout = sarvam::resolve_request_timeout(config.request_timeout_secs);
+            Ok(Box::new(
+                sarvam::SarvamSpeechInference::new(
+                    api_key,
+                    config.model.clone(),
+                    config.language_code.clone(),
+                    config.mode.clone(),
+                )
+                .with_timeout(timeout),
+            ))
         }
         "groq" => {
             let (api_key, _) = config.resolve_key_for_provider("groq").ok_or_else(|| {
