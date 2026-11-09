@@ -341,6 +341,88 @@ pub fn validate_download_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Pure function resolving the next hop of an HTTP redirect.
+///
+/// Rules:
+/// - Valid only for HTTP statuses 301, 302, 303, 307, 308.
+/// - Missing or empty `location` is an error.
+/// - Hops count check: if `hops_so_far >= 5`, returns an error (exceeded 5 redirects).
+/// - Resolves relative `Location` headers against `current_url`:
+///   - Handles absolute URLs (`http://`, `https://`)
+///   - Handles scheme-relative URLs (`//host/path`)
+///   - Handles root-relative URLs (`/path`)
+///   - Handles document-relative URLs (`rel/path`, `?query`, `#hash`)
+/// - Validates the resolved URL against `policy` before returning.
+pub fn next_hop(
+    current_url: &str,
+    status: u16,
+    location: Option<&str>,
+    hops_so_far: u32,
+    policy: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return Err(format!(
+            "HTTP status {} is not a supported redirect status",
+            status
+        ));
+    }
+
+    if hops_so_far >= 5 {
+        return Err(format!(
+            "Too many redirects (exceeded 5) while fetching {}",
+            current_url
+        ));
+    }
+
+    let raw_loc = match location {
+        Some(l) if !l.trim().is_empty() => l.trim(),
+        _ => {
+            return Err(format!(
+                "Redirect status {} missing Location header while fetching {}",
+                status, current_url
+            ))
+        }
+    };
+
+    let scheme_end = current_url
+        .find("://")
+        .ok_or_else(|| format!("Invalid current URL '{}': missing scheme", current_url))?;
+    let scheme = &current_url[..scheme_end];
+
+    let resolved = if raw_loc.starts_with("http://") || raw_loc.starts_with("https://") {
+        raw_loc.to_string()
+    } else if raw_loc.starts_with("//") {
+        format!("{}:{}", scheme, raw_loc)
+    } else if raw_loc.starts_with('/') {
+        let after_scheme = &current_url[scheme_end + 3..];
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .map(|idx| scheme_end + 3 + idx)
+            .unwrap_or(current_url.len());
+        format!("{}{}", &current_url[..authority_end], raw_loc)
+    } else if raw_loc.starts_with('?') || raw_loc.starts_with('#') {
+        let base = current_url
+            .find(['?', '#'])
+            .map(|idx| &current_url[..idx])
+            .unwrap_or(current_url);
+        format!("{}{}", base, raw_loc)
+    } else {
+        let base_no_query = current_url
+            .find(['?', '#'])
+            .map(|idx| &current_url[..idx])
+            .unwrap_or(current_url);
+        let last_slash = base_no_query.rfind('/').unwrap_or(base_no_query.len());
+        if last_slash < scheme_end + 3 {
+            format!("{}/{}", base_no_query, raw_loc)
+        } else {
+            format!("{}{}", &base_no_query[..=last_slash], raw_loc)
+        }
+    };
+
+    policy(&resolved)?;
+    Ok(resolved)
+}
+
 pub fn compute_available_disk_space(bavail: u64, frsize: u64) -> u64 {
     bavail.saturating_mul(frsize)
 }
@@ -403,26 +485,29 @@ pub trait Fetcher {
 
 pub struct UreqFetcher;
 
-impl Fetcher for UreqFetcher {
-    fn fetch(
+impl UreqFetcher {
+    pub fn fetch_with_policy(
         &self,
         initial_url: &str,
         dest: &Path,
         max_bytes: u64,
         mut progress_cb: Option<&mut dyn FnMut(u64)>,
+        policy: &dyn Fn(&str) -> Result<(), String>,
     ) -> Result<String, String> {
+        policy(initial_url)?;
+
         let mut current_url = initial_url.to_string();
-        let mut redirect_count = 0;
+        let mut hops = 0;
+        let mut visited_urls = std::collections::HashSet::new();
+        visited_urls.insert(current_url.clone());
 
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
             .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(30))
+            .timeout_read(Duration::from_secs(60))
             .build();
 
         loop {
-            validate_download_url(&current_url)?;
-
             let mut attempts = 0;
             let mut last_err = String::new();
             let mut response = None;
@@ -431,39 +516,50 @@ impl Fetcher for UreqFetcher {
                 attempts += 1;
                 match agent.get(&current_url).call() {
                     Ok(resp) => {
-                        response = Some(resp);
-                        break;
+                        let status = resp.status();
+                        if status == 200 {
+                            response = Some(resp);
+                            break;
+                        } else if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                            let loc = resp.header("location");
+                            let next = next_hop(&current_url, status, loc, hops, policy)?;
+                            if visited_urls.contains(&next) {
+                                return Err(format!(
+                                    "Redirect loop detected: '{}' was already visited while fetching '{}'",
+                                    next, initial_url
+                                ));
+                            }
+                            visited_urls.insert(next.clone());
+                            current_url = next;
+                            hops += 1;
+                            response = None;
+                            break;
+                        } else {
+                            return Err(format!(
+                                "Unexpected HTTP status {} fetching {}",
+                                status, current_url
+                            ));
+                        }
                     }
                     Err(ureq::Error::Status(code, resp)) => {
-                        if (301..=308).contains(&code) {
-                            if let Some(loc) = resp.header("location") {
-                                redirect_count += 1;
-                                if redirect_count > 5 {
-                                    return Err(format!(
-                                        "Too many redirects (exceeded 5) while fetching {}",
-                                        initial_url
-                                    ));
-                                }
-                                let next_url = if loc.starts_with("http://") || loc.starts_with("https://") {
-                                    loc.to_string()
-                                } else if loc.starts_with('/') {
-                                    let authority_end = current_url["https://".len()..]
-                                        .find('/')
-                                        .map(|idx| idx + "https://".len())
-                                        .unwrap_or(current_url.len());
-                                    format!("{}{}", &current_url[..authority_end], loc)
-                                } else {
-                                    format!("{}/{}", current_url.trim_end_matches('/'), loc)
-                                };
-                                current_url = next_url;
-                                response = None;
-                                break;
+                        if (400..=499).contains(&code) {
+                            if code == 404 {
+                                return Err(format!(
+                                    "HTTP 404 fetching {}: the pinned URL no longer exists and the model manifest needs updating",
+                                    current_url
+                                ));
+                            } else {
+                                return Err(format!(
+                                    "HTTP error {} fetching {}: {}",
+                                    code, current_url, resp.status_text()
+                                ));
                             }
                         }
-                        return Err(format!(
-                            "HTTP error {} fetching {}: {}",
-                            code, current_url, resp.status_text()
-                        ));
+                        last_err = format!("HTTP error {} fetching {}: {}", code, current_url, resp.status_text());
+                        if attempts < 3 {
+                            let backoff = Duration::from_millis(500 * (1 << (attempts - 1)));
+                            std::thread::sleep(backoff);
+                        }
                     }
                     Err(ureq::Error::Transport(e)) => {
                         last_err = format!("Network failure on {}: {}", current_url, e);
@@ -475,60 +571,89 @@ impl Fetcher for UreqFetcher {
                 }
             }
 
-            if let Some(resp) = response {
-                if dest.exists() {
+            if response.is_none() {
+                if attempts >= 3 && !last_err.is_empty() {
+                    return Err(format!("Download failed after 3 attempts: {}", last_err));
+                }
+                continue;
+            }
+
+            let resp = response.unwrap();
+
+            if dest.exists() {
+                let _ = fs::remove_file(dest);
+            }
+            if let Some(p) = dest.parent() {
+                fs::create_dir_all(p)
+                    .map_err(|e| format!("Failed to create staging dir {}: {}", p.display(), e))?;
+            }
+
+            let mut dest_file = File::create(dest)
+                .map_err(|e| format!("Failed to create staging file {}: {}", dest.display(), e))?;
+
+            let mut reader = resp.into_reader();
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 65536];
+            let mut total_bytes = 0u64;
+
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| format!("Failed reading stream from {}: {}", current_url, e))?;
+                if n == 0 {
+                    break;
+                }
+                total_bytes += n as u64;
+                if total_bytes > max_bytes {
+                    drop(dest_file);
                     let _ = fs::remove_file(dest);
+                    return Err(format!(
+                        "Download aborted: received {} bytes, exceeding allowed maximum of {} bytes",
+                        total_bytes, max_bytes
+                    ));
                 }
-                if let Some(p) = dest.parent() {
-                    fs::create_dir_all(p)
-                        .map_err(|e| format!("Failed to create staging dir {}: {}", p.display(), e))?;
-                }
-
-                let mut dest_file = File::create(dest)
-                    .map_err(|e| format!("Failed to create staging file {}: {}", dest.display(), e))?;
-
-                let mut reader = resp.into_reader();
-                let mut hasher = Sha256::new();
-                let mut buf = [0u8; 65536];
-                let mut total_bytes = 0u64;
-
-                loop {
-                    let n = reader
-                        .read(&mut buf)
-                        .map_err(|e| format!("Failed reading stream from {}: {}", current_url, e))?;
-                    if n == 0 {
-                        break;
-                    }
-                    total_bytes += n as u64;
-                    if total_bytes > max_bytes {
-                        drop(dest_file);
-                        let _ = fs::remove_file(dest);
-                        return Err(format!(
-                            "Download aborted: received {} bytes, exceeding allowed maximum of {} bytes",
-                            total_bytes, max_bytes
-                        ));
-                    }
-                    hasher.update(&buf[..n]);
-                    dest_file
-                        .write_all(&buf[..n])
-                        .map_err(|e| format!("Failed to write to {}: {}", dest.display(), e))?;
-
-                    if let Some(ref mut cb) = progress_cb {
-                        cb(total_bytes);
-                    }
+                hasher.update(&buf[..n]);
+                if let Err(e) = dest_file.write_all(&buf[..n]) {
+                    drop(dest_file);
+                    let _ = fs::remove_file(dest);
+                    return Err(format!("Failed to write to {}: {}", dest.display(), e));
                 }
 
-                dest_file
-                    .flush()
-                    .map_err(|e| format!("Failed to flush {}: {}", dest.display(), e))?;
-                let computed_hash = to_hex(&hasher.finalize());
-                return Ok(computed_hash);
+                if let Some(ref mut cb) = progress_cb {
+                    cb(total_bytes);
+                }
             }
 
-            if attempts >= 3 && !last_err.is_empty() {
-                return Err(format!("Download failed after 3 attempts: {}", last_err));
+            if total_bytes == 0 {
+                drop(dest_file);
+                let _ = fs::remove_file(dest);
+                return Err(format!(
+                    "Download failed: server sent an empty body from {}",
+                    current_url
+                ));
             }
+
+            if let Err(e) = dest_file.flush() {
+                drop(dest_file);
+                let _ = fs::remove_file(dest);
+                return Err(format!("Failed to flush {}: {}", dest.display(), e));
+            }
+
+            let computed_hash = to_hex(&hasher.finalize());
+            return Ok(computed_hash);
         }
+    }
+}
+
+impl Fetcher for UreqFetcher {
+    fn fetch(
+        &self,
+        initial_url: &str,
+        dest: &Path,
+        max_bytes: u64,
+        progress_cb: Option<&mut dyn FnMut(u64)>,
+    ) -> Result<String, String> {
+        self.fetch_with_policy(initial_url, dest, max_bytes, progress_cb, &validate_download_url)
     }
 }
 
@@ -894,14 +1019,6 @@ pub fn download_and_install_model<F: Fetcher>(
     };
     pb.finish_with_message("Download complete. Verifying SHA-256 integrity...");
 
-    if !actual_sha256.eq_ignore_ascii_case(&entry.sha256) {
-        let _ = fs::remove_dir_all(&attempt_staging);
-        return Err(format!(
-            "SHA-256 checksum mismatch for '{}': expected {}, got {}. Nothing was extracted.",
-            entry.id, entry.sha256, actual_sha256
-        ));
-    }
-
     let archive_size = match fs::metadata(&archive_path) {
         Ok(m) => m.len(),
         Err(e) => {
@@ -914,6 +1031,23 @@ pub fn download_and_install_model<F: Fetcher>(
         return Err(format!(
             "Archive size mismatch for '{}': expected {} bytes, got {}. Nothing was extracted.",
             entry.id, entry.size_bytes, archive_size
+        ));
+    }
+
+    const EMPTY_INPUT_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    if !actual_sha256.eq_ignore_ascii_case(&entry.sha256) {
+        let _ = fs::remove_dir_all(&attempt_staging);
+        if actual_sha256.eq_ignore_ascii_case(EMPTY_INPUT_SHA256) {
+            return Err(format!(
+                "SHA-256 checksum mismatch for '{}': empty download (actual: {}). Expected {}. Nothing was extracted.",
+                entry.id, actual_sha256, entry.sha256
+            ));
+        }
+        return Err(format!(
+            "SHA-256 checksum mismatch for '{}': expected {}, got {}. Nothing was extracted.",
+            entry.id, entry.sha256, actual_sha256
         ));
     }
 

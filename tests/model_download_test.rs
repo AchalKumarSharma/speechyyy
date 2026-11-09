@@ -2,14 +2,16 @@ use speechyyy::config::Config;
 use speechyyy::doctor::{run_doctor_opts, CheckStatus, RealSysEnv};
 use speechyyy::model::{
     compute_available_disk_space, compute_required_disk_space, download_and_install_model,
-    recover_interrupted_install, safe_extract_tar_bz2, validate_download_url, Fetcher,
-    InstalledModelInfo, LocalModelType, ModelManifestEntry, ModelsManifest,
+    next_hop, recover_interrupted_install, safe_extract_tar_bz2, validate_download_url, Fetcher,
+    InstalledModelInfo, LocalModelType, ModelManifestEntry, ModelsManifest, UreqFetcher,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 struct TempTestDir {
     path: PathBuf,
@@ -995,4 +997,616 @@ fn test_doctor_integrity_checks() {
         }
         other => panic!("Expected Warn for unverified legacy install, got: {:?}", other),
     }
+}
+
+// 16. Table tests for next_hop: relative and absolute forms, schemes, disallowed hosts, hop limits
+#[test]
+fn test_next_hop_table() {
+    let base = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1/model.tar.bz2";
+    let policy = |url: &str| validate_download_url(url);
+
+    // Valid statuses
+    for status in [301, 302, 303, 307, 308] {
+        let hop = next_hop(base, status, Some("https://objects.githubusercontent.com/asset.tar.bz2"), 0, &policy);
+        assert!(hop.is_ok(), "Status {} should be allowed, got {:?}", status, hop);
+        assert_eq!(hop.unwrap(), "https://objects.githubusercontent.com/asset.tar.bz2");
+    }
+
+    // Invalid statuses
+    for status in [200, 300, 304, 305, 400, 404, 500] {
+        let hop = next_hop(base, status, Some("https://objects.githubusercontent.com/asset.tar.bz2"), 0, &policy);
+        assert!(hop.is_err(), "Status {} should not be allowed as redirect", status);
+    }
+
+    // Missing or empty location
+    assert!(next_hop(base, 302, None, 0, &policy).is_err());
+    assert!(next_hop(base, 302, Some(""), 0, &policy).is_err());
+    assert!(next_hop(base, 302, Some("   "), 0, &policy).is_err());
+
+    // Hop limit boundary: 0..=4 allowed, >= 5 rejected
+    assert!(next_hop(base, 302, Some("https://objects.githubusercontent.com/asset.tar.bz2"), 4, &policy).is_ok());
+    assert!(next_hop(base, 302, Some("https://objects.githubusercontent.com/asset.tar.bz2"), 5, &policy).is_err());
+    assert!(next_hop(base, 302, Some("https://objects.githubusercontent.com/asset.tar.bz2"), 6, &policy).is_err());
+
+    // Absolute URLs
+    let abs_ok = next_hop(base, 302, Some("https://objects.githubusercontent.com/asset.tar.bz2"), 0, &policy);
+    assert_eq!(abs_ok.unwrap(), "https://objects.githubusercontent.com/asset.tar.bz2");
+
+    // Absolute HTTP downgrade rejected
+    let abs_http = next_hop(base, 302, Some("http://objects.githubusercontent.com/asset.tar.bz2"), 0, &policy);
+    assert!(abs_http.is_err(), "HTTP downgrade should be rejected");
+
+    // Disallowed host rejected
+    let abs_evil = next_hop(base, 302, Some("https://github.com.evil.com/asset.tar.bz2"), 0, &policy);
+    assert!(abs_evil.is_err(), "Disallowed host should be rejected");
+
+    // Scheme-relative //host/path
+    let scheme_rel_ok = next_hop(base, 302, Some("//objects.githubusercontent.com/asset.tar.bz2"), 0, &policy);
+    assert_eq!(scheme_rel_ok.unwrap(), "https://objects.githubusercontent.com/asset.tar.bz2");
+
+    let scheme_rel_evil = next_hop(base, 302, Some("//evil.com/asset.tar.bz2"), 0, &policy);
+    assert!(scheme_rel_evil.is_err(), "Disallowed scheme-relative host should be rejected");
+
+    // Relative path with leading slash
+    let rel_slash = next_hop(base, 302, Some("/k2-fsa/sherpa-onnx/releases/download/v2/model.tar.bz2"), 0, &policy);
+    assert_eq!(rel_slash.unwrap(), "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2/model.tar.bz2");
+
+    // Relative path without leading slash
+    let rel_no_slash = next_hop(base, 302, Some("other-model.tar.bz2"), 0, &policy);
+    assert_eq!(rel_no_slash.unwrap(), "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1/other-model.tar.bz2");
+
+    // Relative path with query
+    let rel_query = next_hop(base, 302, Some("?download=true"), 0, &policy);
+    assert_eq!(rel_query.unwrap(), "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1/model.tar.bz2?download=true");
+}
+
+struct MockServer {
+    url: String,
+    count: Arc<AtomicUsize>,
+    shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MockServer {
+    fn new<F>(handler: F) -> Self
+    where
+        F: Fn(usize, &str) -> String + Send + 'static,
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+        let url = format!("http://{}", addr);
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = count.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        listener.set_nonblocking(true).unwrap();
+
+        let handle = thread::spawn(move || {
+            let mut req_idx = 0;
+            loop {
+                if rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count_clone.fetch_add(1, Ordering::SeqCst);
+                        let mut buf = [0u8; 2048];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req_str = String::from_utf8_lossy(&buf[..n]);
+                        let resp = handler(req_idx, &req_str);
+                        req_idx += 1;
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        MockServer {
+            url,
+            count,
+            shutdown_tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn requests_received(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn test_loopback_policy(url: &str) -> Result<(), String> {
+    if url.starts_with("http://127.0.0.1:") || url.starts_with("https://127.0.0.1:") {
+        Ok(())
+    } else {
+        validate_download_url(url)
+    }
+}
+
+// 17. 302 then 200: first server redirects to second, which serves body. Bytes & SHA-256 match.
+#[test]
+fn test_redirect_302_then_200() {
+    let payload = b"hello-model-data-stream";
+    let expected_hash = compute_sha256_hex(payload);
+
+    let server2 = MockServer::new(move |_idx, _req| {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            std::str::from_utf8(payload).unwrap()
+        )
+    });
+
+    let s2_url = server2.url().to_string();
+    let server1 = MockServer::new(move |_idx, _req| {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {}/model.tar.bz2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            s2_url
+        )
+    });
+
+    let temp = TempTestDir::new("redirect-302-200");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        &format!("{}/download", server1.url()),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+
+    assert!(res.is_ok(), "Expected fetch success, got: {:?}", res);
+    assert_eq!(res.unwrap(), expected_hash);
+    assert_eq!(fs::read(&dest).unwrap(), payload);
+    assert_eq!(server1.requests_received(), 1);
+    assert_eq!(server2.requests_received(), 1);
+}
+
+// 18. Redirect chain: three hops succeed; six hops fail with too-many-redirects
+#[test]
+fn test_redirect_chain_and_too_many_redirects() {
+    let payload = b"chain-data-ok";
+    let expected_hash = compute_sha256_hex(payload);
+
+    // 3 hops: /hop0 -> /hop1 -> /hop2 -> /target (200 OK)
+    let server = MockServer::new(move |_idx, req| {
+        if req.starts_with("GET /hop0") {
+            "HTTP/1.1 302 Found\r\nLocation: /hop1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        } else if req.starts_with("GET /hop1") {
+            "HTTP/1.1 302 Found\r\nLocation: /hop2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        } else if req.starts_with("GET /hop2") {
+            "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                std::str::from_utf8(payload).unwrap()
+            )
+        }
+    });
+
+    let temp = TempTestDir::new("redirect-chain");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        &format!("{}/hop0", server.url()),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res.is_ok(), "3-hop redirect chain should succeed, got: {:?}", res);
+    assert_eq!(res.unwrap(), expected_hash);
+
+    // 6 hops: /h0 -> /h1 -> /h2 -> /h3 -> /h4 -> /h5 -> /h6
+    let server_excess = MockServer::new(move |_idx, req| {
+        for i in 0..6 {
+            if req.starts_with(&format!("GET /h{}", i)) {
+                return format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /h{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    i + 1
+                );
+            }
+        }
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone".into()
+    });
+
+    let res_excess = UreqFetcher.fetch_with_policy(
+        &format!("{}/h0", server_excess.url()),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res_excess.is_err(), "6 hops must fail");
+    let err = res_excess.unwrap_err();
+    assert!(
+        err.contains("Too many redirects (exceeded 5)"),
+        "Expected exceeded 5 redirects, got: {}",
+        err
+    );
+}
+
+// 19. Redirect loop: detected and rejected
+#[test]
+fn test_redirect_loop_detected() {
+    let server = MockServer::new(move |_idx, req| {
+        if req.starts_with("GET /loop-a") {
+            "HTTP/1.1 302 Found\r\nLocation: /loop-b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        } else {
+            "HTTP/1.1 302 Found\r\nLocation: /loop-a\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        }
+    });
+
+    let temp = TempTestDir::new("redirect-loop");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        &format!("{}/loop-a", server.url()),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("Redirect loop detected"),
+        "Expected redirect loop error, got: {}",
+        err
+    );
+}
+
+// 20. Redirect to a disallowed host: policy rejects it and second server receives no connection
+#[test]
+fn test_redirect_disallowed_host_policy() {
+    let second_server = MockServer::new(move |_idx, _req| {
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nevil".into()
+    });
+
+    let server = MockServer::new(move |_idx, _req| {
+        "HTTP/1.1 302 Found\r\nLocation: https://evil.com/asset.tar.bz2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+
+    let temp = TempTestDir::new("redirect-disallowed");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        server.url(),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res.is_err());
+    assert_eq!(second_server.requests_received(), 0, "Disallowed host must not receive connection");
+}
+
+// 21. Relative Location: resolved correctly
+#[test]
+fn test_redirect_relative_location() {
+    let payload = b"relative-location-payload";
+    let expected_hash = compute_sha256_hex(payload);
+
+    let server = MockServer::new(move |_idx, req| {
+        if req.starts_with("GET /start-root-rel") {
+            "HTTP/1.1 302 Found\r\nLocation: /final/target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        } else if req.starts_with("GET /final/target") {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                std::str::from_utf8(payload).unwrap()
+            )
+        } else {
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        }
+    });
+
+    let temp = TempTestDir::new("rel-location");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        &format!("{}/start-root-rel", server.url()),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res.is_ok(), "Root-relative redirect should succeed, got: {:?}", res);
+    assert_eq!(res.unwrap(), expected_hash);
+    assert_eq!(fs::read(&dest).unwrap(), payload);
+}
+
+// 22. Missing Location header on 302: error
+#[test]
+fn test_redirect_missing_location() {
+    let server = MockServer::new(move |_idx, _req| {
+        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+
+    let temp = TempTestDir::new("missing-location");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        server.url(),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("missing Location header"),
+        "Expected missing Location error, got: {}",
+        err
+    );
+}
+
+// 23. 200 with an empty body: "empty body" error, staging cleaned
+#[test]
+fn test_fetch_empty_body_rejected() {
+    let server = MockServer::new(move |_idx, _req| {
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+
+    let temp = TempTestDir::new("empty-body");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        server.url(),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("server sent an empty body"),
+        "Expected empty body error, got: {}",
+        err
+    );
+    assert!(!dest.exists(), "Staging destination must be cleaned on empty body");
+}
+
+// 24. Body shorter than size_bytes: size-mismatch error, staging cleaned
+#[test]
+fn test_body_shorter_than_size_bytes_rejected() {
+    let short_payload = b"short-content";
+    let server = MockServer::new(move |_idx, _req| {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            short_payload.len(),
+            std::str::from_utf8(short_payload).unwrap()
+        )
+    });
+
+    struct CustomFetcher<P>(P);
+    impl<P: Fn(&str) -> Result<(), String>> Fetcher for CustomFetcher<P> {
+        fn fetch(
+            &self,
+            url: &str,
+            dest: &Path,
+            max_bytes: u64,
+            cb: Option<&mut dyn FnMut(u64)>,
+        ) -> Result<String, String> {
+            UreqFetcher.fetch_with_policy(url, dest, max_bytes, cb, &self.0)
+        }
+    }
+
+    let temp = TempTestDir::new("short-body");
+    let target_dir = temp.path().join("parakeet-tdt-v3");
+
+    let manifest = make_manifest(
+        "parakeet-tdt-v3",
+        &compute_sha256_hex(short_payload),
+        1000,
+        10,
+        100_000,
+        vec!["encoder.int8.onnx".into()],
+    );
+    let mut manifest_updated = manifest;
+    manifest_updated
+        .models
+        .get_mut("parakeet-tdt-v3")
+        .unwrap()
+        .url = format!("{}/model.tar.bz2", server.url());
+
+    let fetcher = CustomFetcher(test_loopback_policy);
+
+    let res = download_and_install_model(
+        LocalModelType::ParakeetTdtV3,
+        &target_dir,
+        &fetcher,
+        Some(&manifest_updated),
+    );
+
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("Archive size mismatch for 'parakeet-tdt-v3': expected 1000 bytes, got 13"),
+        "Expected archive size mismatch, got: {}",
+        err
+    );
+    assert!(!target_dir.exists(), "Target directory must not be created");
+}
+
+// 25. 404: no retry (seen once) and manifest hint. 503 then 200: retried and succeeds.
+#[test]
+fn test_fetch_404_no_retry_and_503_retry_succeeds() {
+    let server_404 = MockServer::new(move |_idx, _req| {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+
+    let temp = TempTestDir::new("404-test");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res_404 = UreqFetcher.fetch_with_policy(
+        server_404.url(),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res_404.is_err());
+    let err_404 = res_404.unwrap_err();
+    assert!(
+        err_404.contains("the pinned URL no longer exists and the model manifest needs updating"),
+        "Got: {}",
+        err_404
+    );
+    assert_eq!(server_404.requests_received(), 1, "404 must not be retried");
+
+    let payload = b"retry-success-payload";
+    let expected_hash = compute_sha256_hex(payload);
+    let server_503 = MockServer::new(move |idx, _req| {
+        if idx == 0 {
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                std::str::from_utf8(payload).unwrap()
+            )
+        }
+    });
+
+    let res_503 = UreqFetcher.fetch_with_policy(
+        server_503.url(),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res_503.is_ok(), "503 followed by 200 should succeed on retry");
+    assert_eq!(res_503.unwrap(), expected_hash);
+    assert_eq!(server_503.requests_received(), 2);
+}
+
+// 26. Unexpected HTTP status (e.g. 206)
+#[test]
+fn test_fetch_unexpected_http_status() {
+    let server = MockServer::new(move |_idx, _req| {
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+    });
+
+    let temp = TempTestDir::new("unexpected-status");
+    let dest = temp.path().join("model.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        server.url(),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("Unexpected HTTP status 206 fetching"),
+        "Expected unexpected status message, got: {}",
+        err
+    );
+}
+
+// 27. Regression test for this bug: 302 with Content-Length 0 must not produce empty-hash error
+#[test]
+fn test_regression_302_zero_content_length_does_not_produce_empty_hash() {
+    let payload = b"real-model-tar-bz2-bytes";
+    let real_hash = compute_sha256_hex(payload);
+    let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    let target_server = MockServer::new(move |_idx, _req| {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            std::str::from_utf8(payload).unwrap()
+        )
+    });
+
+    let target_url = target_server.url().to_string();
+    let release_server = MockServer::new(move |_idx, _req| {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {}/asset.tar.bz2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            target_url
+        )
+    });
+
+    let temp = TempTestDir::new("regression-302");
+    let dest = temp.path().join("archive.tar.bz2");
+
+    let res = UreqFetcher.fetch_with_policy(
+        &format!("{}/releases/download/v1.0/archive.tar.bz2", release_server.url()),
+        &dest,
+        100_000,
+        None,
+        &test_loopback_policy,
+    );
+
+    assert!(res.is_ok(), "Expected redirect following to succeed, got: {:?}", res);
+    let hash = res.unwrap();
+    assert_ne!(hash, empty_hash, "Must not return empty hash on 302 with content-length 0");
+    assert_eq!(hash, real_hash);
+    assert_eq!(fs::read(&dest).unwrap(), payload);
+}
+
+// 28. Hash mismatch on empty download mentions 'empty download'
+#[test]
+fn test_empty_download_hash_mismatch_message() {
+    let temp = TempTestDir::new("empty-hash-mismatch");
+    let target_dir = temp.path().join("parakeet-tdt-v3");
+
+    let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let manifest = make_manifest(
+        "parakeet-tdt-v3",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        100,
+        10,
+        100_000,
+        vec!["encoder.int8.onnx".into()],
+    );
+
+    let fetcher = MockFetcher {
+        bytes: vec![0u8; 100],
+        custom_hash: Some(empty_hash.to_string()),
+    };
+
+    let result = download_and_install_model(
+        LocalModelType::ParakeetTdtV3,
+        &target_dir,
+        &fetcher,
+        Some(&manifest),
+    );
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("empty download"),
+        "Expected error to say 'empty download', got: {}",
+        err
+    );
 }
