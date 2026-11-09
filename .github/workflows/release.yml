@@ -70,7 +70,8 @@ jobs:
             libxkbcommon-dev \
             libasound2-dev \
             libbz2-dev \
-            cmake
+            cmake \
+            wl-clipboard
 
       - name: Run test suite
         run: cargo test --all-targets --locked
