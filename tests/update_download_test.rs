@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 use speechyyy::update::{
-    download_and_verify_release, parse_sha256sums, MAX_SHA256SUMS_BYTES,
+    download_and_verify_release, is_valid_tag, parse_sha256sums, release_archive_dir,
+    release_archive_name, release_download_url, release_sha256sums_url, MAX_SHA256SUMS_BYTES,
     MAX_UPDATE_ARCHIVE_BYTES,
 };
 use std::io::{Read, Write};
@@ -365,4 +366,64 @@ fn test_size_caps_constants_and_enforcement() {
     let err = res.unwrap_err();
     assert!(err.contains("exceeding allowed maximum"), "got: {}", err);
     assert!(!dest.exists(), "Oversized download must be removed");
+}
+
+#[test]
+fn test_is_valid_tag_matrix() {
+    // Valid tags
+    assert!(is_valid_tag("v0.2.0"));
+    assert!(is_valid_tag("v0.2.0-rc1"));
+    assert!(is_valid_tag("v1.10.3-beta.2"));
+    assert!(is_valid_tag("v0.0.1"));
+    assert!(is_valid_tag("v10.200.3000-alpha.1.2"));
+
+    // Invalid tags
+    assert!(!is_valid_tag("0.2.0"), "Missing leading 'v'");
+    assert!(!is_valid_tag("latest"), "Word 'latest' is not semver tag");
+    assert!(!is_valid_tag("v0.2"), "Missing patch version");
+    assert!(!is_valid_tag("v0.2.0/../x"), "Path traversal prohibited");
+    assert!(!is_valid_tag("v0.2.0?x=1"), "Query string prohibited");
+    assert!(!is_valid_tag("v0.2.0 rc1"), "Whitespace prohibited");
+    assert!(!is_valid_tag(" v0.2.0"), "Leading whitespace prohibited");
+    assert!(!is_valid_tag("v0.2.0 "), "Trailing whitespace prohibited");
+    assert!(!is_valid_tag(""), "Empty string prohibited");
+    assert!(!is_valid_tag("v0.2.0-"), "Empty pre-release suffix prohibited");
+    assert!(!is_valid_tag("v0.2.0-rc1/2"), "Slash in pre-release prohibited");
+}
+
+#[test]
+fn test_release_asset_naming_scheme() {
+    assert_eq!(
+        release_archive_name("v0.2.0", "x86_64"),
+        "speechyyy-v0.2.0-x86_64-linux.tar.gz"
+    );
+    assert_eq!(
+        release_archive_name("v0.2.0-rc1", "aarch64"),
+        "speechyyy-v0.2.0-rc1-aarch64-linux.tar.gz"
+    );
+    assert_eq!(
+        release_archive_dir("v0.2.0", "x86_64"),
+        "speechyyy-v0.2.0-x86_64-linux"
+    );
+    assert_eq!(
+        release_download_url("v0.2.0", "x86_64"),
+        "https://github.com/AchalKumarSharma/speechyyy/releases/download/v0.2.0/speechyyy-v0.2.0-x86_64-linux.tar.gz"
+    );
+    assert_eq!(
+        release_sha256sums_url("v0.2.0"),
+        "https://github.com/AchalKumarSharma/speechyyy/releases/download/v0.2.0/SHA256SUMS"
+    );
+}
+
+#[test]
+fn test_handle_update_command_rejects_invalid_tag() {
+    let res = speechyyy::update::handle_update_command(false, Some("0.2.0"));
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(err.contains("Invalid release tag"), "Got: {}", err);
+
+    let res_traversal = speechyyy::update::handle_update_command(false, Some("v0.2.0/../hack"));
+    assert!(res_traversal.is_err());
+    let err_traversal = res_traversal.unwrap_err();
+    assert!(err_traversal.contains("Invalid release tag"), "Got: {}", err_traversal);
 }

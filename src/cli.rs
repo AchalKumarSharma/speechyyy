@@ -124,6 +124,9 @@ pub enum Command {
         /// Force re-installation even if already on the latest version
         #[arg(long)]
         force: bool,
+        /// Explicit release tag to install (e.g. v0.2.0, v0.2.0-rc1)
+        #[arg(long)]
+        tag: Option<String>,
     },
 }
 
@@ -599,11 +602,21 @@ mod tests {
     #[test]
     fn test_parse_update() {
         let cli = Cli::try_parse_from(["speechyyy", "update"]).expect("parse update");
-        assert_eq!(cli.command, Command::Update { force: false });
+        assert_eq!(cli.command, Command::Update { force: false, tag: None });
 
         let cli_force =
             Cli::try_parse_from(["speechyyy", "update", "--force"]).expect("parse update force");
-        assert_eq!(cli_force.command, Command::Update { force: true });
+        assert_eq!(cli_force.command, Command::Update { force: true, tag: None });
+
+        let cli_tag =
+            Cli::try_parse_from(["speechyyy", "update", "--tag", "v0.2.0-rc1"]).expect("parse update tag");
+        assert_eq!(
+            cli_tag.command,
+            Command::Update {
+                force: false,
+                tag: Some("v0.2.0-rc1".to_string())
+            }
+        );
     }
 
     #[test]

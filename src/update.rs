@@ -3,11 +3,83 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub const GITHUB_REPO: &str = "AchalKumarSharma/speechyyy";
 pub const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/achalkumarsharma/speechyyy/releases/latest";
+    "https://api.github.com/repos/AchalKumarSharma/speechyyy/releases/latest";
 
 pub const MAX_SHA256SUMS_BYTES: u64 = 256 * 1024;
 pub const MAX_UPDATE_ARCHIVE_BYTES: u64 = 150 * 1024 * 1024;
+
+/// Pure function validating a release tag according to ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$
+pub fn is_valid_tag(tag: &str) -> bool {
+    if tag.is_empty()
+        || tag.starts_with(char::is_whitespace)
+        || tag.ends_with(char::is_whitespace)
+    {
+        return false;
+    }
+    if !tag.starts_with('v') {
+        return false;
+    }
+    let after_v = &tag[1..];
+    if after_v.is_empty() {
+        return false;
+    }
+
+    let (version_part, prerelease) = match after_v.find('-') {
+        Some(idx) => (&after_v[..idx], Some(&after_v[idx + 1..])),
+        None => (after_v, None),
+    };
+
+    let segments: Vec<&str> = version_part.split('.').collect();
+    if segments.len() != 3 {
+        return false;
+    }
+    for seg in segments {
+        if seg.is_empty() || !seg.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+    }
+
+    if let Some(pre) = prerelease {
+        if pre.is_empty() {
+            return false;
+        }
+        if !pre.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Archive file name: speechyyy-<tag>-<arch>-linux.tar.gz
+pub fn release_archive_name(tag: &str, arch: &str) -> String {
+    format!("speechyyy-{}-{}-linux.tar.gz", tag, arch)
+}
+
+/// Archive top-level directory: speechyyy-<tag>-<arch>-linux
+pub fn release_archive_dir(tag: &str, arch: &str) -> String {
+    format!("speechyyy-{}-{}-linux", tag, arch)
+}
+
+/// Full download URL for release archive
+pub fn release_download_url(tag: &str, arch: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        GITHUB_REPO,
+        tag,
+        release_archive_name(tag, arch)
+    )
+}
+
+/// Full download URL for SHA256SUMS
+pub fn release_sha256sums_url(tag: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/download/{}/SHA256SUMS",
+        GITHUB_REPO, tag
+    )
+}
 
 /// Parses a SHA256SUMS file content for the expected target filename.
 /// Enforces strict validation: 64-hex chars, matches target filename, rejects duplicates/malformed.
@@ -465,72 +537,56 @@ pub fn install_from_extracted_dir(
     Ok(())
 }
 
-pub fn handle_update_command(force: bool) -> Result<(), String> {
-    let current_version = env!("CARGO_PKG_VERSION");
-    let release_info = fetch_latest_release(GITHUB_RELEASES_URL)?;
-
-    let tag_name = release_info["tag_name"]
-        .as_str()
-        .ok_or_else(|| "Missing tag_name in release metadata".to_string())?;
-
-    let latest_version = tag_name.trim_start_matches('v');
-
-    if latest_version == current_version && !force {
-        let config = crate::config::Config::load();
-        let nickname = config.nickname();
-        let version_str = current_version.trim_start_matches('v');
-        println!(
-            "[✓] We're on the latest and greatest already, {} (v{}).",
-            nickname, version_str
-        );
-        return Ok(());
-    }
-
-    if std::env::consts::ARCH != "x86_64" {
-        return Err(format!(
-            "Auto-update is currently only supported on x86_64 Linux (detected: {}).",
-            std::env::consts::ARCH
-        ));
-    }
-
-    // Determine download URL and SHA256SUMS URL
-    let (archive_url, sha_url, archive_filename) = if let Some(assets) = release_info["assets"].as_array() {
-        let mut arch_url = None;
-        let mut arch_name = None;
-        let mut s_url = None;
-
-        for a in assets {
-            if let Some(name) = a["name"].as_str() {
-                if name == "SHA256SUMS" {
-                    s_url = a["browser_download_url"].as_str().map(String::from);
-                } else if name.ends_with("x86_64-unknown-linux-gnu.tar.gz") {
-                    arch_name = Some(name.to_string());
-                    arch_url = a["browser_download_url"].as_str().map(String::from);
-                }
-            }
+pub fn handle_update_command(force: bool, tag_override: Option<&str>) -> Result<(), String> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => {
+            return Err(format!(
+                "Auto-update is currently only supported on x86_64 and aarch64 Linux (detected: {}).",
+                other
+            ));
         }
-        (arch_url, s_url, arch_name)
-    } else {
-        (None, None, None)
     };
 
-    let filename = archive_filename.unwrap_or_else(|| {
-        format!("speechyyy-{}-x86_64-unknown-linux-gnu.tar.gz", tag_name)
-    });
+    let target_tag = match tag_override {
+        Some(t) => {
+            let t = t.trim();
+            if !is_valid_tag(t) {
+                return Err(format!(
+                    "Invalid release tag '{}'. Expected format: vMAJOR.MINOR.PATCH(-PRERELEASE), e.g. v0.2.0 or v0.2.0-rc1",
+                    t
+                ));
+            }
+            t.to_string()
+        }
+        None => {
+            let current_version = env!("CARGO_PKG_VERSION");
+            let release_info = fetch_latest_release(GITHUB_RELEASES_URL)?;
 
-    let download_url = archive_url.unwrap_or_else(|| {
-        format!(
-            "https://github.com/achalkumarsharma/speechyyy/releases/download/{}/{}",
-            tag_name, filename
-        )
-    });
+            let tag_name = release_info["tag_name"]
+                .as_str()
+                .ok_or_else(|| "Missing tag_name in release metadata".to_string())?;
 
-    let sha256sums_url = sha_url.unwrap_or_else(|| {
-        format!(
-            "https://github.com/achalkumarsharma/speechyyy/releases/download/{}/SHA256SUMS",
-            tag_name
-        )
-    });
+            let latest_version = tag_name.trim_start_matches('v');
+
+            if latest_version == current_version && !force {
+                let config = crate::config::Config::load();
+                let nickname = config.nickname();
+                let version_str = current_version.trim_start_matches('v');
+                println!(
+                    "[✓] We're on the latest and greatest already, {} (v{}).",
+                    nickname, version_str
+                );
+                return Ok(());
+            }
+            tag_name.to_string()
+        }
+    };
+
+    let filename = release_archive_name(&target_tag, arch);
+    let download_url = release_download_url(&target_tag, arch);
+    let sha256sums_url = release_sha256sums_url(&target_tag);
 
     let temp_dir = std::env::temp_dir().join(format!("speechyyy_update_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
@@ -540,7 +596,7 @@ pub fn handle_update_command(force: bool) -> Result<(), String> {
     let tarball_path = temp_dir.join(&filename);
     let sha_path = temp_dir.join("SHA256SUMS");
 
-    println!("==> Downloading pre-built release {} and SHA256SUMS...", tag_name);
+    println!("==> Downloading pre-built release {} and SHA256SUMS...", target_tag);
     if let Err(e) = download_and_verify_release(
         &download_url,
         &sha256sums_url,
@@ -561,7 +617,7 @@ pub fn handle_update_command(force: bool) -> Result<(), String> {
     let paths = RuntimePaths::new();
 
     let install_result =
-        install_from_extracted_dir(&temp_dir, &target_dir, Some(&paths), tag_name);
+        install_from_extracted_dir(&temp_dir, &target_dir, Some(&paths), &target_tag);
 
     let _ = fs::remove_dir_all(&temp_dir);
     install_result?;

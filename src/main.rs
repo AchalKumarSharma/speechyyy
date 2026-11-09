@@ -85,7 +85,9 @@ fn main() {
         Command::Toggle => send_toggle(&paths),
         Command::Cancel => send_cancel(&paths),
         Command::Events => stream_events(&paths),
-        Command::Update { force } => speechyyy::update::handle_update_command(force),
+        Command::Update { force, tag } => {
+            speechyyy::update::handle_update_command(force, tag.as_deref())
+        }
     };
 
     if let Err(e) = result {

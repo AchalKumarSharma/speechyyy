@@ -105,11 +105,11 @@ fn test_cli_parsing_model_subcommands() {
 
     let cli_update =
         Cli::try_parse_from(["speechyyy", "update"]).expect("parse update");
-    assert_eq!(cli_update.command, Command::Update { force: false });
+    assert_eq!(cli_update.command, Command::Update { force: false, tag: None });
 
     let cli_update_force =
         Cli::try_parse_from(["speechyyy", "update", "--force"]).expect("parse update force");
-    assert_eq!(cli_update_force.command, Command::Update { force: true });
+    assert_eq!(cli_update_force.command, Command::Update { force: true, tag: None });
 }
 
 #[test]

@@ -2,7 +2,6 @@
 set -euo pipefail
 
 REPO="AchalKumarSharma/speechyyy"
-RELEASE_BASE="https://github.com/${REPO}/releases/latest/download"
 TARGET_BIN_DIR="${HOME}/.local/bin"
 CONFIG_DIR="${SPEECHYYY_CONFIG_DIR:-${HOME}/.config/speechyyy}"
 CONFIG_FILE="${SPEECHYYY_CONFIG_FILE:-${CONFIG_DIR}/config.toml}"
@@ -38,6 +37,21 @@ case "$ARCH" in
 esac
 echo "[✓] Architecture: ${TARGET_ARCH}"
 
+# Version override or default to latest
+if [ -n "${SPEECHYYY_VERSION:-}" ]; then
+    TAG_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+    if [[ ! "${SPEECHYYY_VERSION}" =~ $TAG_REGEX ]]; then
+        echo "Error: Invalid SPEECHYYY_VERSION '${SPEECHYYY_VERSION}'. Expected format: vMAJOR.MINOR.PATCH(-PRERELEASE), e.g. v0.2.0 or v0.2.0-rc1" >&2
+        exit 1
+    fi
+    TAG="${SPEECHYYY_VERSION}"
+    RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
+    echo "[✓] Target release version: ${TAG}"
+else
+    TAG=""
+    RELEASE_BASE="https://github.com/${REPO}/releases/latest/download"
+fi
+
 # Audio subsystem check
 if command -v pipewire >/dev/null 2>&1 || pgrep -x pipewire >/dev/null 2>&1 || [ -e "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pipewire-0" ]; then
     echo "[✓] PipeWire audio subsystem detected."
@@ -62,7 +76,7 @@ fi
 
 # 2. Binary Installation
 IS_LOCAL_CHECKOUT=0
-if [ -f "Cargo.toml" ] && grep -q 'name = "speechyyy"' Cargo.toml 2>/dev/null; then
+if [ -z "${SPEECHYYY_VERSION:-}" ] && [ -f "Cargo.toml" ] && grep -q 'name = "speechyyy"' Cargo.toml 2>/dev/null; then
     if [ -f "target/release/speechyyy" ] && [ -f "target/release/speechyyy-dock" ]; then
         IS_LOCAL_CHECKOUT=1
     fi
@@ -74,18 +88,24 @@ if [ "$IS_LOCAL_CHECKOUT" = "1" ]; then
         echo "[dry-run] Would create directory ${TARGET_BIN_DIR}"
         echo "[dry-run] Would install target/release/speechyyy to ${TARGET_BIN_DIR}/speechyyy (mode 0755)"
         echo "[dry-run] Would install target/release/speechyyy-dock to ${TARGET_BIN_DIR}/speechyyy-dock (mode 0755)"
+        echo "[dry-run] Would copy any companion shared libraries (*.so) to ${TARGET_BIN_DIR}/ (mode 0755)"
     else
         mkdir -p "$TARGET_BIN_DIR"
         install -m 755 "target/release/speechyyy" "${TARGET_BIN_DIR}/speechyyy"
         install -m 755 "target/release/speechyyy-dock" "${TARGET_BIN_DIR}/speechyyy-dock"
-        echo "[✓] Installed release binaries to ${TARGET_BIN_DIR}/"
+        find "target/release" -maxdepth 1 -type f -name "lib*.so*" -exec install -m 755 {} "${TARGET_BIN_DIR}/" \; 2>/dev/null || true
+        echo "[✓] Installed release binaries and libraries to ${TARGET_BIN_DIR}/"
     fi
 else
     if [ "$DRY_RUN" = "1" ]; then
         echo "[dry-run] Would create directory ${TARGET_BIN_DIR}"
-        echo "[dry-run] Would download release binaries and SHA256SUMS from ${RELEASE_BASE} for ${TARGET_ARCH}"
+        if [ -n "$TAG" ]; then
+            echo "[dry-run] Would download release archive (speechyyy-${TAG}-${TARGET_ARCH}-linux.tar.gz) and SHA256SUMS from ${RELEASE_BASE}"
+        else
+            echo "[dry-run] Would download release binaries and SHA256SUMS from ${RELEASE_BASE} for ${TARGET_ARCH}"
+        fi
         echo "[dry-run] Would verify SHA256 checksums before installation"
-        echo "[dry-run] Would install speechyyy and speechyyy-dock to ${TARGET_BIN_DIR}/ (mode 0755)"
+        echo "[dry-run] Would install speechyyy, speechyyy-dock, and companion libraries to ${TARGET_BIN_DIR}/ (mode 0755)"
     else
         TMP_DIR=$(mktemp -d)
         cleanup() {
@@ -96,8 +116,16 @@ else
         echo "==> Downloading release assets from ${RELEASE_BASE}..."
         DOWNLOAD_SUCCESS=0
         if curl -fsSL "${RELEASE_BASE}/SHA256SUMS" -o "${TMP_DIR}/SHA256SUMS" 2>/dev/null; then
-            TARBALL_NAME="speechyyy-${TARGET_ARCH}-unknown-linux-gnu.tar.gz"
-            if curl -fsSL "${RELEASE_BASE}/${TARBALL_NAME}" -o "${TMP_DIR}/${TARBALL_NAME}" 2>/dev/null; then
+            if [ -n "$TAG" ]; then
+                TARBALL_NAME="speechyyy-${TAG}-${TARGET_ARCH}-linux.tar.gz"
+            else
+                TARBALL_NAME=$(awk -v arch="${TARGET_ARCH}" '$2 ~ "^speechyyy-.*-" arch "-linux\\.tar\\.gz$" { print $2 }' "${TMP_DIR}/SHA256SUMS" | head -n1)
+                if [ -z "$TARBALL_NAME" ]; then
+                    TARBALL_NAME=$(grep -oE "speechyyy-[^ ]+-${TARGET_ARCH}-linux\.tar\.gz" "${TMP_DIR}/SHA256SUMS" | head -n1 || true)
+                fi
+            fi
+
+            if [ -n "$TARBALL_NAME" ] && curl -fsSL "${RELEASE_BASE}/${TARBALL_NAME}" -o "${TMP_DIR}/${TARBALL_NAME}" 2>/dev/null; then
                 echo "==> Verifying SHA256 checksum..."
                 (
                     cd "$TMP_DIR"
@@ -111,13 +139,14 @@ else
                     echo "[✓] SHA256 checksum verified."
                     tar -xzf "${TMP_DIR}/${TARBALL_NAME}" -C "${TMP_DIR}"
                     mkdir -p "$TARGET_BIN_DIR"
-                    if [ -f "${TMP_DIR}/speechyyy" ] && [ -f "${TMP_DIR}/speechyyy-dock" ]; then
-                        install -m 755 "${TMP_DIR}/speechyyy" "${TARGET_BIN_DIR}/speechyyy"
-                        install -m 755 "${TMP_DIR}/speechyyy-dock" "${TARGET_BIN_DIR}/speechyyy-dock"
-                        DOWNLOAD_SUCCESS=1
-                    elif [ -f "${TMP_DIR}/target/release/speechyyy" ] && [ -f "${TMP_DIR}/target/release/speechyyy-dock" ]; then
-                        install -m 755 "${TMP_DIR}/target/release/speechyyy" "${TARGET_BIN_DIR}/speechyyy"
-                        install -m 755 "${TMP_DIR}/target/release/speechyyy-dock" "${TARGET_BIN_DIR}/speechyyy-dock"
+                    SPEECHYYY_BIN=$(find "${TMP_DIR}" -type f -name "speechyyy" | head -n1)
+                    DOCK_BIN=$(find "${TMP_DIR}" -type f -name "speechyyy-dock" | head -n1)
+                    if [ -n "$SPEECHYYY_BIN" ] && [ -f "$SPEECHYYY_BIN" ]; then
+                        install -m 755 "$SPEECHYYY_BIN" "${TARGET_BIN_DIR}/speechyyy"
+                        if [ -n "$DOCK_BIN" ] && [ -f "$DOCK_BIN" ]; then
+                            install -m 755 "$DOCK_BIN" "${TARGET_BIN_DIR}/speechyyy-dock"
+                        fi
+                        find "${TMP_DIR}" -type f -name "lib*.so*" -exec install -m 755 {} "${TARGET_BIN_DIR}/" \; 2>/dev/null || true
                         DOWNLOAD_SUCCESS=1
                     fi
                 else
@@ -129,6 +158,11 @@ else
         fi
 
         if [ "$DOWNLOAD_SUCCESS" = "0" ]; then
+            if [ -n "$TAG" ]; then
+                echo "Error: Failed to download release assets for requested version ${TAG} from ${RELEASE_BASE}" >&2
+                echo "Please verify the tag exists at: https://github.com/${REPO}/releases/tag/${TAG}" >&2
+                exit 1
+            fi
             echo "[!] Pre-built binary download unavailable. Checking for cargo to build from source..."
             if command -v cargo >/dev/null 2>&1 && [ -f "Cargo.toml" ] && grep -q 'name = "speechyyy"' Cargo.toml 2>/dev/null; then
                 echo "==> Compiling from source via cargo build --release..."
@@ -136,6 +170,7 @@ else
                 mkdir -p "$TARGET_BIN_DIR"
                 install -m 755 "target/release/speechyyy" "${TARGET_BIN_DIR}/speechyyy"
                 install -m 755 "target/release/speechyyy-dock" "${TARGET_BIN_DIR}/speechyyy-dock"
+                find "target/release" -maxdepth 1 -type f -name "lib*.so*" -exec install -m 755 {} "${TARGET_BIN_DIR}/" \; 2>/dev/null || true
             else
                 echo "Error: Failed to download release binaries from GitHub and cargo is not available to build from source." >&2
                 echo "Please install cargo (https://rustup.rs/) or check release assets at: https://github.com/${REPO}/releases" >&2
