@@ -1,5 +1,10 @@
 # Speechyyy
 
+[![Latest Release](https://img.shields.io/github/v/release/AchalKumarSharma/speechyyy?color=f70776&style=flat-square)](https://github.com/AchalKumarSharma/speechyyy/releases/latest)
+[![Total Downloads](https://img.shields.io/github/downloads/AchalKumarSharma/speechyyy/total?color=c3195d&style=flat-square)](https://github.com/AchalKumarSharma/speechyyy/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/AchalKumarSharma/speechyyy?color=yellow&style=flat-square)](https://github.com/AchalKumarSharma/speechyyy/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](https://github.com/AchalKumarSharma/speechyyy/blob/main/LICENSE)
+
 Speech-to-text dictation for Linux on Wayland.
 Hold or toggle a shortcut key, speak, and transcribed text appears directly at your cursor.
 
