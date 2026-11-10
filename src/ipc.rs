@@ -12,11 +12,25 @@ use std::time::Duration;
 pub enum IpcRequest {
     Status,
     Stop,
+    Restart,
     Ping,
     PushDown,
     PushUp,
     Toggle,
     Cancel,
+}
+
+impl IpcRequest {
+    /// Recommended client timeout for this request.
+    /// Commands that trigger or wait on speech transcription (PushUp, Toggle)
+    /// receive a longer timeout (15s) to allow CPU decoders to process multi-second audio chunks.
+    /// Fast status/control commands retain a short timeout (2s) so stale clients fail fast.
+    pub fn timeout(&self) -> Duration {
+        match self {
+            IpcRequest::PushUp | IpcRequest::Toggle => Duration::from_secs(15),
+            _ => Duration::from_secs(2),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +59,7 @@ pub struct RuntimePaths {
     pub socket_path: PathBuf,
     pub events_socket_path: PathBuf,
     pub pid_path: PathBuf,
+    pub dock_pid_path: PathBuf,
     pub binary_path: Option<PathBuf>,
 }
 
@@ -73,11 +88,13 @@ impl RuntimePaths {
         let socket_path = dir.join("speechyyy.sock");
         let events_socket_path = dir.join("events.sock");
         let pid_path = dir.join("speechyyy.pid");
+        let dock_pid_path = dir.join("speechyyy-dock.pid");
         Self {
             dir,
             socket_path,
             events_socket_path,
             pid_path,
+            dock_pid_path,
             binary_path: None,
         }
     }
@@ -98,7 +115,13 @@ impl RuntimePaths {
     }
 
     pub fn cleanup(&self) {
-        PidFile::remove(&self.pid_path);
+        if let Some(pid) = PidFile::read_pid(&self.pid_path) {
+            if pid == std::process::id() || !PidFile::is_process_running(pid) {
+                PidFile::remove(&self.pid_path);
+            }
+        } else {
+            PidFile::remove(&self.pid_path);
+        }
         let _ = fs::remove_file(&self.socket_path);
         let _ = fs::remove_file(&self.events_socket_path);
     }
@@ -133,6 +156,10 @@ impl PidFile {
     }
 
     pub fn acquire(path: &Path) -> Result<(), String> {
+        Self::acquire_for_service(path, "Speechyyy")
+    }
+
+    pub fn acquire_for_service(path: &Path, service_name: &str) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             create_secure_dir(parent)
                 .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
@@ -141,8 +168,8 @@ impl PidFile {
         if let Some(existing_pid) = Self::read_pid(path) {
             if Self::is_process_running(existing_pid) {
                 return Err(format!(
-                    "Speechyyy is already running with PID {}",
-                    existing_pid
+                    "{} is already running with PID {}",
+                    service_name, existing_pid
                 ));
             }
             let _ = fs::remove_file(path);
@@ -156,12 +183,30 @@ impl PidFile {
     pub fn remove(path: &Path) {
         let _ = fs::remove_file(path);
     }
+
+    pub fn remove_if_dead(path: &Path) {
+        if let Some(pid) = Self::read_pid(path) {
+            if !Self::is_process_running(pid) {
+                let _ = fs::remove_file(path);
+            }
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 pub struct IpcClient;
 
 impl IpcClient {
     pub fn send_request(socket_path: &Path, req: &IpcRequest) -> Result<IpcResponse, String> {
+        Self::send_request_with_timeout(socket_path, req, req.timeout())
+    }
+
+    pub fn send_request_with_timeout(
+        socket_path: &Path,
+        req: &IpcRequest,
+        timeout: Duration,
+    ) -> Result<IpcResponse, String> {
         let mut stream = UnixStream::connect(socket_path).map_err(|e| {
             format!(
                 "Failed to connect to Speechyyy socket at {}: {}",
@@ -171,7 +216,7 @@ impl IpcClient {
         })?;
 
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(timeout))
             .map_err(|e| e.to_string())?;
 
         let mut payload = serde_json::to_string(req).map_err(|e| e.to_string())?;
@@ -253,21 +298,29 @@ impl IpcServer {
         Ok(listener)
     }
 
-    pub fn handle_connection(
-        stream: &mut UnixStream,
+    pub fn handle_request<R: BufRead, W: Write>(
+        reader: &mut R,
+        writer: &mut W,
         running: &AtomicBool,
         current_state: &str,
         hotkey: &str,
         pacing_delay_ms: u64,
     ) -> std::io::Result<Option<IpcRequest>> {
-        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
-
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
+        let line = match read_bounded_request(reader)? {
+            RequestReadResult::Eof => return Ok(None),
+            RequestReadResult::Malformed(err_msg) => {
+                let resp = IpcResponse::Error {
+                    message: format!("Malformed command: {}", err_msg),
+                };
+                let mut out = serde_json::to_string(&resp)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                out.push('\n');
+                writer.write_all(out.as_bytes())?;
+                writer.flush()?;
+                return Ok(None);
+            }
+            RequestReadResult::Valid(line) => line,
+        };
 
         let (resp, action) = match serde_json::from_str::<IpcRequest>(line.trim()) {
             Ok(IpcRequest::Ping) => (IpcResponse::Pong, None),
@@ -286,7 +339,16 @@ impl IpcServer {
                     IpcResponse::Ok {
                         message: "Speechyyy stopping".into(),
                     },
-                    None,
+                    Some(IpcRequest::Stop),
+                )
+            }
+            Ok(IpcRequest::Restart) => {
+                running.store(false, Ordering::SeqCst);
+                (
+                    IpcResponse::Ok {
+                        message: "Speechyyy restarting".into(),
+                    },
+                    Some(IpcRequest::Restart),
                 )
             }
             Ok(IpcRequest::PushDown) => (IpcResponse::PushDown, Some(IpcRequest::PushDown)),
@@ -314,15 +376,120 @@ impl IpcServer {
         let mut out = serde_json::to_string(&resp)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         out.push('\n');
-        stream.write_all(out.as_bytes())?;
-        stream.flush()?;
+        writer.write_all(out.as_bytes())?;
+        writer.flush()?;
         Ok(action)
+    }
+
+    pub fn handle_connection(
+        stream: &mut UnixStream,
+        running: &AtomicBool,
+        current_state: &str,
+        hotkey: &str,
+        pacing_delay_ms: u64,
+    ) -> std::io::Result<Option<IpcRequest>> {
+        stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+        stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        Self::handle_request(
+            &mut reader,
+            stream,
+            running,
+            current_state,
+            hotkey,
+            pacing_delay_ms,
+        )
+    }
+}
+
+pub const MAX_IPC_REQUEST_BYTES: usize = 64 * 1024; // 64 KiB
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RequestReadResult {
+    Eof,
+    Valid(String),
+    Malformed(String),
+}
+
+pub fn read_bounded_request<R: BufRead>(reader: &mut R) -> std::io::Result<RequestReadResult> {
+    let mut buf = Vec::new();
+    let mut hit_limit_without_newline = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+
+        let remaining_budget = MAX_IPC_REQUEST_BYTES.saturating_sub(buf.len());
+        if remaining_budget == 0 {
+            hit_limit_without_newline = true;
+            break;
+        }
+
+        let to_scan = available.len().min(remaining_budget);
+        if let Some(pos) = available[..to_scan].iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            break;
+        } else {
+            buf.extend_from_slice(&available[..to_scan]);
+            reader.consume(to_scan);
+            if buf.len() == MAX_IPC_REQUEST_BYTES {
+                hit_limit_without_newline = true;
+                break;
+            }
+        }
+    }
+
+    if hit_limit_without_newline {
+        // Drain remainder of the oversized request line until '\n' or EOF so reader remains aligned
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                reader.consume(pos + 1);
+                break;
+            } else {
+                let len = available.len();
+                reader.consume(len);
+            }
+        }
+        return Ok(RequestReadResult::Malformed(
+            "Payload exceeded 64 KiB limit without newline".to_string(),
+        ));
+    }
+
+    if buf.is_empty() {
+        return Ok(RequestReadResult::Eof);
+    }
+
+    match std::str::from_utf8(&buf) {
+        Ok(s) => Ok(RequestReadResult::Valid(s.to_string())),
+        Err(_) => Ok(RequestReadResult::Malformed(
+            "Invalid UTF-8 payload".to_string(),
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ipc_request_timeouts() {
+        assert_eq!(IpcRequest::PushUp.timeout(), Duration::from_secs(15));
+        assert_eq!(IpcRequest::Toggle.timeout(), Duration::from_secs(15));
+        assert_eq!(IpcRequest::Status.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::Ping.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::Stop.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::Restart.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::PushDown.timeout(), Duration::from_secs(2));
+        assert_eq!(IpcRequest::Cancel.timeout(), Duration::from_secs(2));
+    }
 
     #[test]
     fn test_ipc_roundtrip_ping_and_status() {
@@ -554,5 +721,303 @@ mod tests {
 
         paths.cleanup();
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_ipc_request_parsing_restart_and_existing() {
+        let restart_json = "{\"cmd\":\"restart\"}";
+        let parsed_restart: IpcRequest =
+            serde_json::from_str(restart_json).expect("parse restart");
+        assert_eq!(parsed_restart, IpcRequest::Restart);
+
+        let stop_json = "{\"cmd\":\"stop\"}";
+        let parsed_stop: IpcRequest = serde_json::from_str(stop_json).expect("parse stop");
+        assert_eq!(parsed_stop, IpcRequest::Stop);
+
+        let ping_json = "{\"cmd\":\"ping\"}";
+        let parsed_ping: IpcRequest = serde_json::from_str(ping_json).expect("parse ping");
+        assert_eq!(parsed_ping, IpcRequest::Ping);
+
+        let status_json = "{\"cmd\":\"status\"}";
+        let parsed_status: IpcRequest = serde_json::from_str(status_json).expect("parse status");
+        assert_eq!(parsed_status, IpcRequest::Status);
+
+        let push_down_json = "{\"cmd\":\"push_down\"}";
+        let parsed_pd: IpcRequest = serde_json::from_str(push_down_json).expect("parse push_down");
+        assert_eq!(parsed_pd, IpcRequest::PushDown);
+
+        let push_up_json = "{\"cmd\":\"push_up\"}";
+        let parsed_pu: IpcRequest = serde_json::from_str(push_up_json).expect("parse push_up");
+        assert_eq!(parsed_pu, IpcRequest::PushUp);
+
+        let toggle_json = "{\"cmd\":\"toggle\"}";
+        let parsed_toggle: IpcRequest = serde_json::from_str(toggle_json).expect("parse toggle");
+        assert_eq!(parsed_toggle, IpcRequest::Toggle);
+
+        let cancel_json = "{\"cmd\":\"cancel\"}";
+        let parsed_cancel: IpcRequest = serde_json::from_str(cancel_json).expect("parse cancel");
+        assert_eq!(parsed_cancel, IpcRequest::Cancel);
+    }
+
+    #[test]
+    fn test_dock_pid_file_lifecycle() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("speechyyy_dock_pid_test_{}", std::process::id()));
+        let paths = RuntimePaths::with_dir(temp_dir.clone());
+        paths.ensure_dir().expect("ensure dir");
+
+        let pid_path = paths.dock_pid_path.clone();
+
+        // 1. Initial acquire should succeed and write current PID
+        let res = PidFile::acquire_for_service(&pid_path, "speechyyy-dock");
+        assert!(res.is_ok(), "First acquire should succeed: {:?}", res);
+        assert_eq!(PidFile::read_pid(&pid_path), Some(std::process::id()));
+
+        // 2. Second acquire while current PID is running should fail with refusal
+        let res2 = PidFile::acquire_for_service(&pid_path, "speechyyy-dock");
+        assert!(res2.is_err(), "Acquire while process is live must fail");
+        assert!(res2.unwrap_err().contains("already running"));
+
+        // 3. Stale PID file (with dead PID 9999999) should be overwritten cleanly
+        fs::write(&pid_path, "9999999").expect("write stale pid");
+        assert!(!PidFile::is_process_running(9999999));
+        let res3 = PidFile::acquire_for_service(&pid_path, "speechyyy-dock");
+        assert!(res3.is_ok(), "Stale PID should be overwritten");
+        assert_eq!(PidFile::read_pid(&pid_path), Some(std::process::id()));
+
+        // 4. Removal on clean exit
+        PidFile::remove(&pid_path);
+        assert!(!pid_path.exists());
+
+        // 5. remove_if_dead should not delete if process is live, but deletes if dead
+        fs::write(&pid_path, std::process::id().to_string()).expect("write live pid");
+        PidFile::remove_if_dead(&pid_path);
+        assert!(
+            pid_path.exists(),
+            "remove_if_dead must leave live process PID file alone"
+        );
+
+        fs::write(&pid_path, "9999999").expect("write dead pid");
+        PidFile::remove_if_dead(&pid_path);
+        assert!(
+            !pid_path.exists(),
+            "remove_if_dead must delete dead process PID file"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_ipc_payload_caps_and_utf8_validation() {
+        use std::io::Cursor;
+
+        let running = AtomicBool::new(true);
+
+        // 1. Normal request works
+        {
+            let mut reader = Cursor::new(b"{\"cmd\":\"ping\"}\n");
+            let mut writer = Vec::new();
+            let action = IpcServer::handle_request(
+                &mut reader,
+                &mut writer,
+                &running,
+                "Idle",
+                "RightAlt",
+                3,
+            )
+            .expect("normal request");
+            assert_eq!(action, None);
+            let resp_str = String::from_utf8(writer).unwrap();
+            let resp: IpcResponse = serde_json::from_str(resp_str.trim()).unwrap();
+            assert_eq!(resp, IpcResponse::Pong);
+        }
+
+        // 2. Payload larger than 64 KiB without a newline is rejected with malformed error
+        {
+            let large_payload = vec![b'x'; 70 * 1024]; // 70 KiB without newline
+            let mut reader = Cursor::new(large_payload);
+            let mut writer = Vec::new();
+            let action = IpcServer::handle_request(
+                &mut reader,
+                &mut writer,
+                &running,
+                "Idle",
+                "RightAlt",
+                3,
+            )
+            .expect("should not io error on oversized");
+            assert_eq!(action, None);
+            let resp_str = String::from_utf8(writer).unwrap();
+            let resp: IpcResponse = serde_json::from_str(resp_str.trim()).unwrap();
+            match resp {
+                IpcResponse::Error { message } => {
+                    assert!(
+                        message.contains("64 KiB limit without newline"),
+                        "Expected limit error, got: {}",
+                        message
+                    );
+                }
+                other => panic!("Expected error response, got: {:?}", other),
+            }
+        }
+
+        // 3. Payload of exactly 64 KiB (65,535 bytes + newline = 65,536 bytes) behaves cleanly
+        {
+            // Create valid JSON matching {"cmd":"ping","pad":"..."}\n of exactly 65,536 bytes
+            let prefix = b"{\"cmd\":\"ping\",\"pad\":\"";
+            let suffix = b"\"}\n";
+            let pad_len = 65536 - prefix.len() - suffix.len();
+            let mut payload = Vec::with_capacity(65536);
+            payload.extend_from_slice(prefix);
+            payload.resize(payload.len() + pad_len, b'a');
+            payload.extend_from_slice(suffix);
+            assert_eq!(payload.len(), 65536);
+            assert_eq!(payload.last(), Some(&b'\n'));
+
+            let mut reader = Cursor::new(payload);
+            let mut writer = Vec::new();
+            let action = IpcServer::handle_request(
+                &mut reader,
+                &mut writer,
+                &running,
+                "Idle",
+                "RightAlt",
+                3,
+            )
+            .expect("64 KiB request should be handled cleanly");
+            assert_eq!(action, None);
+            let resp_str = String::from_utf8(writer).unwrap();
+            let resp: IpcResponse = serde_json::from_str(resp_str.trim()).unwrap();
+            assert_eq!(resp, IpcResponse::Pong);
+        }
+
+        // 4. Payload with invalid UTF-8 is rejected
+        {
+            let invalid_utf8 = vec![0xFF, 0xFE, 0xFD, b'\n'];
+            let mut reader = Cursor::new(invalid_utf8);
+            let mut writer = Vec::new();
+            let action = IpcServer::handle_request(
+                &mut reader,
+                &mut writer,
+                &running,
+                "Idle",
+                "RightAlt",
+                3,
+            )
+            .expect("invalid utf-8 handled cleanly");
+            assert_eq!(action, None);
+            let resp_str = String::from_utf8(writer).unwrap();
+            let resp: IpcResponse = serde_json::from_str(resp_str.trim()).unwrap();
+            match resp {
+                IpcResponse::Error { message } => {
+                    assert!(
+                        message.contains("invalid UTF-8") || message.contains("Invalid UTF-8"),
+                        "Expected UTF-8 error, got: {}",
+                        message
+                    );
+                }
+                other => panic!("Expected error response, got: {:?}", other),
+            }
+        }
+
+        // 5. Multiple valid requests on a long-lived reader where total bytes exceed 64 KiB succeed
+        {
+            // Build two 40 KiB requests (total 80 KiB)
+            let prefix = b"{\"cmd\":\"ping\",\"pad\":\"";
+            let suffix = b"\"}\n";
+            let pad_len = 40 * 1024 - prefix.len() - suffix.len();
+            let mut req1 = Vec::new();
+            req1.extend_from_slice(prefix);
+            req1.resize(req1.len() + pad_len, b'b');
+            req1.extend_from_slice(suffix);
+            assert_eq!(req1.len(), 40 * 1024);
+
+            let mut combined = req1.clone();
+            combined.extend_from_slice(&req1);
+            assert_eq!(combined.len(), 80 * 1024);
+
+            let mut reader = Cursor::new(combined);
+
+            // First request (40 KiB)
+            let mut writer1 = Vec::new();
+            let action1 = IpcServer::handle_request(
+                &mut reader,
+                &mut writer1,
+                &running,
+                "Idle",
+                "RightAlt",
+                3,
+            )
+            .expect("first 40 KiB request");
+            assert_eq!(action1, None);
+            let resp1_str = String::from_utf8(writer1).unwrap();
+            assert_eq!(
+                serde_json::from_str::<IpcResponse>(resp1_str.trim()).unwrap(),
+                IpcResponse::Pong
+            );
+
+            // Second request on the SAME reader (another 40 KiB, cumulative 80 KiB)
+            let mut writer2 = Vec::new();
+            let action2 = IpcServer::handle_request(
+                &mut reader,
+                &mut writer2,
+                &running,
+                "Idle",
+                "RightAlt",
+                3,
+            )
+            .expect("second 40 KiB request");
+            assert_eq!(action2, None);
+            let resp2_str = String::from_utf8(writer2).unwrap();
+            assert_eq!(
+                serde_json::from_str::<IpcResponse>(resp2_str.trim()).unwrap(),
+                IpcResponse::Pong
+            );
+        }
+
+        // 6. Reader recovery: Oversized request (>64 KiB) followed by valid request on the same stream
+        {
+            let mut stream_bytes = vec![b'z'; 70 * 1024]; // 70 KiB
+            stream_bytes.push(b'\n'); // newline terminating the oversized garbage
+            stream_bytes.extend_from_slice(b"{\"cmd\":\"ping\"}\n"); // valid request following it
+
+            let mut reader = Cursor::new(stream_bytes);
+
+            // First call encounters oversized request and rejects it
+            let mut writer1 = Vec::new();
+            let _ = IpcServer::handle_request(
+                &mut reader,
+                &mut writer1,
+                &running,
+                "Idle",
+                "RightAlt",
+                3,
+            )
+            .expect("oversized request handled");
+            let resp1: IpcResponse =
+                serde_json::from_str(String::from_utf8(writer1).unwrap().trim()).unwrap();
+            match resp1 {
+                IpcResponse::Error { message } => {
+                    assert!(message.contains("64 KiB limit without newline"));
+                }
+                other => panic!("Expected error, got {:?}", other),
+            }
+
+            // Second call on the SAME reader reads the subsequent well-formed ping request
+            let mut writer2 = Vec::new();
+            let action = IpcServer::handle_request(
+                &mut reader,
+                &mut writer2,
+                &running,
+                "Idle",
+                "RightAlt",
+                3,
+            )
+            .expect("subsequent request on same reader must succeed");
+            assert_eq!(action, None);
+            let resp2: IpcResponse =
+                serde_json::from_str(String::from_utf8(writer2).unwrap().trim()).unwrap();
+            assert_eq!(resp2, IpcResponse::Pong);
+        }
     }
 }

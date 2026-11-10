@@ -52,6 +52,10 @@ pub enum DaemonEvent {
     Canceled {
         reason: String,
     },
+    Shutdown {
+        #[serde(default)]
+        restart: bool,
+    },
 }
 
 impl DaemonEvent {
@@ -194,5 +198,35 @@ impl EventBroadcaster {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shutdown_event_serialization_and_deserialization() {
+        let event_false = DaemonEvent::Shutdown { restart: false };
+        let json_false = event_false.to_ndjson().expect("serialize false");
+        assert_eq!(json_false, "{\"event\":\"shutdown\",\"restart\":false}\n");
+
+        let de_false: DaemonEvent =
+            serde_json::from_str(&json_false).expect("deserialize false");
+        assert_eq!(de_false, DaemonEvent::Shutdown { restart: false });
+
+        let event_true = DaemonEvent::Shutdown { restart: true };
+        let json_true = event_true.to_ndjson().expect("serialize true");
+        assert_eq!(json_true, "{\"event\":\"shutdown\",\"restart\":true}\n");
+
+        let de_true: DaemonEvent =
+            serde_json::from_str(&json_true).expect("deserialize true");
+        assert_eq!(de_true, DaemonEvent::Shutdown { restart: true });
+
+        // Missing restart field defaults to false
+        let missing_restart = "{\"event\":\"shutdown\"}";
+        let de_missing: DaemonEvent =
+            serde_json::from_str(missing_restart).expect("deserialize missing restart");
+        assert_eq!(de_missing, DaemonEvent::Shutdown { restart: false });
     }
 }

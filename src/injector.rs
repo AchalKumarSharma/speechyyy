@@ -30,6 +30,11 @@ pub trait TextInjector: Send + Sync {
     }
 }
 
+/// Returns true if text is empty or contains only whitespace characters.
+pub fn is_whitespace_or_empty(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
 impl TextInjector for Box<dyn TextInjector> {
     fn inject(&mut self, text: &str) -> Result<(), String> {
         (**self).inject(text)
@@ -282,6 +287,11 @@ impl RecordingInjector {
 
 impl TextInjector for RecordingInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
+        if is_whitespace_or_empty(text) {
+            eprintln!("debug: Skipping keystroke injection on empty / whitespace text");
+            return Ok(());
+        }
+
         self.injected_strings.lock().unwrap().push(text.to_string());
 
         if self.settle_modifiers {
@@ -467,6 +477,11 @@ impl UinputInjector {
 
 impl TextInjector for UinputInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
+        if is_whitespace_or_empty(text) {
+            eprintln!("debug: Skipping keystroke injection on empty / whitespace text");
+            return Ok(());
+        }
+
         self.reset_modifiers()?;
 
         let res = match self.mode {
@@ -536,52 +551,215 @@ impl TextInjector for UinputInjector {
     }
 }
 
-pub struct WaylandClipboardInjector {
+pub trait ClipboardWriter: Send + Sync {
+    fn write_text(&self, text: &str) -> Result<(), String>;
+}
+
+pub trait KeySink: Send + Sync {
+    fn emit_key(&mut self, key: KeyCode, is_down: bool) -> Result<(), String>;
+}
+
+fn wl_copy_supports_sensitive() -> bool {
+    static SUPPORTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTS.get_or_init(|| {
+        std::process::Command::new("wl-copy")
+            .arg("--help")
+            .output()
+            .map(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.contains("--sensitive")
+            })
+            .unwrap_or(false)
+    })
+}
+
+pub struct WlClipboardWriter;
+
+impl ClipboardWriter for WlClipboardWriter {
+    fn write_text(&self, text: &str) -> Result<(), String> {
+        copy_to_wl_clipboard(text)
+    }
+}
+
+pub fn copy_to_wl_clipboard(text: &str) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("wl-copy");
+    if wl_copy_supports_sensitive() {
+        cmd.arg("--sensitive");
+    }
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn wl-copy: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("Failed to write to wl-copy stdin: {}", e))?;
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for wl-copy: {}", e))?;
+    if !status.success() {
+        return Err(format!("wl-copy exited with error status: {}", status));
+    }
+    Ok(())
+}
+
+pub struct UinputKeySink {
     device: Option<VirtualDevice>,
+}
+
+impl UinputKeySink {
+    pub fn new() -> Self {
+        Self {
+            device: create_virtual_device().ok(),
+        }
+    }
+
+    pub fn from_device(device: VirtualDevice) -> Self {
+        Self {
+            device: Some(device),
+        }
+    }
+}
+
+impl Default for UinputKeySink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeySink for UinputKeySink {
+    fn emit_key(&mut self, key: KeyCode, is_down: bool) -> Result<(), String> {
+        if self.device.is_none() {
+            self.device = create_virtual_device().ok();
+        }
+        let device = self.device.as_mut().ok_or_else(|| {
+            "Failed to access /dev/uinput virtual device for paste shortcut".to_string()
+        })?;
+        let val = if is_down { 1 } else { 0 };
+        let ev = InputEvent::new(EventType::KEY.0, key.0, val);
+        device
+            .emit(&[ev])
+            .map_err(|e| format!("Failed to emit uinput event: {}", e))
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct MockClipboardWriter {
+    pub written: Arc<Mutex<Vec<String>>>,
+    pub should_fail: Arc<Mutex<bool>>,
+    pub order: Arc<Mutex<Vec<String>>>,
+}
+
+impl MockClipboardWriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_order(order: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            written: Arc::new(Mutex::new(Vec::new())),
+            should_fail: Arc::new(Mutex::new(false)),
+            order,
+        }
+    }
+
+    pub fn failing() -> Self {
+        Self {
+            written: Arc::new(Mutex::new(Vec::new())),
+            should_fail: Arc::new(Mutex::new(true)),
+            order: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl ClipboardWriter for MockClipboardWriter {
+    fn write_text(&self, text: &str) -> Result<(), String> {
+        if *self.should_fail.lock().unwrap() {
+            return Err("Mock clipboard write failed".to_string());
+        }
+        self.written.lock().unwrap().push(text.to_string());
+        self.order.lock().unwrap().push(format!("clipboard:{}", text));
+        Ok(())
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct MockKeySink {
+    pub emitted: Arc<Mutex<Vec<(KeyCode, bool)>>>,
+    pub order: Arc<Mutex<Vec<String>>>,
+}
+
+impl MockKeySink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_order(order: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            emitted: Arc::new(Mutex::new(Vec::new())),
+            order,
+        }
+    }
+}
+
+impl KeySink for MockKeySink {
+    fn emit_key(&mut self, key: KeyCode, is_down: bool) -> Result<(), String> {
+        self.emitted.lock().unwrap().push((key, is_down));
+        self.order.lock().unwrap().push(format!(
+            "key:{:?}:{}",
+            key,
+            if is_down { "down" } else { "up" }
+        ));
+        Ok(())
+    }
+}
+
+pub struct WaylandClipboardInjector {
+    writer: Box<dyn ClipboardWriter>,
+    key_sink: Box<dyn KeySink>,
     settle_delay: Duration,
 }
 
 impl WaylandClipboardInjector {
     pub const SETTLE_DELAY: Duration = Duration::from_millis(80);
     pub const PASTE_HOLD_DELAY: Duration = Duration::from_millis(20);
+    pub const DEFAULT_SETTLE_DELAY: Duration = Duration::from_millis(15);
 
     pub fn new(_pacing_delay: Duration) -> Self {
-        let device = create_virtual_device().ok();
         Self {
-            device,
-            settle_delay: Self::SETTLE_DELAY,
+            writer: Box::new(WlClipboardWriter),
+            key_sink: Box::new(UinputKeySink::new()),
+            settle_delay: Self::DEFAULT_SETTLE_DELAY,
+        }
+    }
+
+    pub fn with_parts(
+        writer: Box<dyn ClipboardWriter>,
+        key_sink: Box<dyn KeySink>,
+        settle_delay: Duration,
+    ) -> Self {
+        Self {
+            writer,
+            key_sink,
+            settle_delay,
         }
     }
 
     pub fn with_device(device: Option<VirtualDevice>, settle_delay: Duration) -> Self {
         Self {
-            device,
+            writer: Box::new(WlClipboardWriter),
+            key_sink: Box::new(UinputKeySink { device }),
             settle_delay,
         }
     }
 
     pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
-        let mut child = std::process::Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn wl-copy: {}", e))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin
-                .write_all(text.as_bytes())
-                .map_err(|e| format!("Failed to write to wl-copy stdin: {}", e))?;
-        }
-
-        let status = child
-            .wait()
-            .map_err(|e| format!("Failed to wait for wl-copy: {}", e))?;
-        if !status.success() {
-            return Err(format!("wl-copy exited with error status: {}", status));
-        }
-        Ok(())
+        copy_to_wl_clipboard(text)
     }
 
     pub fn trigger_uinput_paste(device: &mut VirtualDevice) -> Result<(), String> {
@@ -611,21 +789,50 @@ impl WaylandClipboardInjector {
 
 impl TextInjector for WaylandClipboardInjector {
     fn inject(&mut self, text: &str) -> Result<(), String> {
-        Self::copy_to_clipboard(text)?;
-        thread::sleep(self.settle_delay);
-
-        if self.device.is_none() {
-            self.device = create_virtual_device().ok();
+        if is_whitespace_or_empty(text) {
+            eprintln!("debug: Skipping keystroke injection on empty / whitespace text");
+            return Ok(());
         }
 
-        if let Some(ref mut device) = self.device {
-            Self::trigger_uinput_paste(device)?;
-        } else if let Err(e) = Self::fallback_wtype_paste() {
+        // 1. Write transcript to clipboard
+        if let Err(e) = self.writer.write_text(text) {
             eprintln!(
-                "Wayland paste warning: could not emit uinput paste chord and wtype failed: {}. Transcript is in clipboard.",
+                "Clipboard paste warning: failed to write transcript to clipboard: {}. No keys will be emitted.",
                 e
             );
+            return Err(e);
         }
+
+        // 2. Settle delay to ensure clipboard manager/server has landed content
+        if !self.settle_delay.is_zero() {
+            thread::sleep(self.settle_delay);
+        }
+
+        // 3. Emit KEY_LEFTCTRL press -> KEY_V press -> KEY_V release -> KEY_LEFTCTRL release
+        if let Err(e) = self.key_sink.emit_key(KeyCode::KEY_LEFTCTRL, true) {
+            eprintln!("Clipboard paste warning: failed to emit KEY_LEFTCTRL press: {}", e);
+            return Err(e);
+        }
+
+        if let Err(e) = self.key_sink.emit_key(KeyCode::KEY_V, true) {
+            eprintln!("Clipboard paste warning: failed to emit KEY_V press: {}", e);
+            let _ = self.key_sink.emit_key(KeyCode::KEY_LEFTCTRL, false);
+            return Err(e);
+        }
+
+        thread::sleep(Self::PASTE_HOLD_DELAY);
+
+        if let Err(e) = self.key_sink.emit_key(KeyCode::KEY_V, false) {
+            eprintln!("Clipboard paste warning: failed to emit KEY_V release: {}", e);
+            let _ = self.key_sink.emit_key(KeyCode::KEY_LEFTCTRL, false);
+            return Err(e);
+        }
+
+        if let Err(e) = self.key_sink.emit_key(KeyCode::KEY_LEFTCTRL, false) {
+            eprintln!("Clipboard paste warning: failed to emit KEY_LEFTCTRL release: {}", e);
+            return Err(e);
+        }
+
         Ok(())
     }
 
@@ -634,49 +841,44 @@ impl TextInjector for WaylandClipboardInjector {
     }
 }
 
+pub fn has_wl_copy() -> bool {
+    std::process::Command::new("wl-copy")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn create_injector(config: &crate::config::Config) -> Result<Box<dyn TextInjector>, String> {
     let pacing = Duration::from_millis(config.pacing_delay_ms);
-    let method = config.injector.method.to_lowercase();
+    let mode = if config.injector.method.eq_ignore_ascii_case("typewriter")
+        || config.injection_mode == crate::config::InjectionMode::Typewriter
+    {
+        crate::config::InjectionMode::Typewriter
+    } else {
+        crate::config::InjectionMode::Clipboard
+    };
 
-    match method.as_str() {
-        "clipboard" | "wayland" | "paste" => Ok(Box::new(WaylandClipboardInjector::new(pacing))),
-        "uinput" => {
-            let inj = UinputInjector::new(pacing)?;
+    match mode {
+        crate::config::InjectionMode::Clipboard => {
+            if !has_wl_copy() {
+                eprintln!("[!] Warning: 'wl-copy' is missing from PATH.");
+                eprintln!("[!] Falling back to Typewriter injection mode for this session.");
+                eprintln!("[!] Install 'wl-clipboard' to enable direct clipboard pasting.");
+                let inj = UinputInjector::new(pacing)?.with_mode(InjectionMode::Typewriter {
+                    delay_ms: config.pacing_delay_ms,
+                });
+                Ok(Box::new(inj))
+            } else {
+                Ok(Box::new(WaylandClipboardInjector::new(pacing)))
+            }
+        }
+        crate::config::InjectionMode::Typewriter => {
+            let inj = UinputInjector::new(pacing)?.with_mode(InjectionMode::Typewriter {
+                delay_ms: config.pacing_delay_ms,
+            });
             Ok(Box::new(inj))
         }
-        "typewriter" => match UinputInjector::new(pacing) {
-            Ok(inj) => Ok(Box::new(inj.with_mode(InjectionMode::Typewriter {
-                delay_ms: config.pacing_delay_ms,
-            }))),
-            Err(e) => {
-                eprintln!(
-                    "UinputInjector initialization failed ({}); typewriter mode falling back to clipboard paste",
-                    e
-                );
-                Ok(Box::new(WaylandClipboardInjector::new(pacing)))
-            }
-        },
-        "auto" => {
-            let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-            if is_wayland {
-                Ok(Box::new(WaylandClipboardInjector::new(pacing)))
-            } else {
-                match UinputInjector::new(pacing) {
-                    Ok(inj) => Ok(Box::new(inj)),
-                    Err(e) => {
-                        eprintln!(
-                            "UinputInjector initialization failed ({}); falling back to Wayland clipboard injector",
-                            e
-                        );
-                        Ok(Box::new(WaylandClipboardInjector::new(pacing)))
-                    }
-                }
-            }
-        }
-        other => Err(format!(
-            "Unknown injector method '{}'. Supported: 'auto', 'typewriter', 'uinput', 'clipboard', 'paste'.",
-            other
-        )),
     }
 }
 

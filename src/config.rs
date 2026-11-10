@@ -1,4 +1,5 @@
 use crate::engine::{Modifier, TargetChord};
+use crate::inference::wire::Secret;
 use evdev::KeyCode;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -153,8 +154,45 @@ fn default_pacing_ms() -> u64 {
     15
 }
 
+/// Delivery mechanism for emitting dictation into the focused window/caret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InjectionMode {
+    /// Fast paste via `Ctrl+V`; leaves the transcription in the clipboard and is immune
+    /// to browser hotkey hijacking. Does not work in most terminals (they need `Ctrl+Shift+V`).
+    #[default]
+    Clipboard,
+    /// Character-by-character typing via `/dev/uinput`. Works in terminals, but triggers
+    /// page shortcuts if no text field is focused.
+    Typewriter,
+}
+
+impl std::fmt::Display for InjectionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InjectionMode::Clipboard => write!(f, "clipboard"),
+            InjectionMode::Typewriter => write!(f, "typewriter"),
+        }
+    }
+}
+
+impl std::str::FromStr for InjectionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "clipboard" | "paste" | "wayland" => Ok(InjectionMode::Clipboard),
+            "typewriter" | "uinput" => Ok(InjectionMode::Typewriter),
+            other => Err(format!(
+                "Unknown injection mode '{}'. Supported: 'clipboard', 'typewriter'.",
+                other
+            )),
+        }
+    }
+}
+
 fn default_injector_method() -> String {
-    "typewriter".to_string()
+    "clipboard".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -194,8 +232,16 @@ fn default_provider() -> String {
     "local".to_string()
 }
 
-fn default_model() -> String {
-    "saaras:v4".to_string()
+/// Single source of truth for default models across inference providers.
+pub fn default_model_for(provider: &str) -> &'static str {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "local" => "parakeet-tdt-v3",
+        "sarvam" => "saaras:v4",
+        "groq" => crate::inference::DEFAULT_GROQ_MODEL,
+        "openai" => crate::inference::DEFAULT_OPENAI_MODEL,
+        "openai-compatible" | "custom" => "",
+        _ => "",
+    }
 }
 
 fn default_language_code() -> String {
@@ -215,44 +261,135 @@ pub struct CustomModelConfig {
     pub tokens: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Config,
+    Env,
+}
+
+impl std::fmt::Display for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeySource::Config => write!(f, "config"),
+            KeySource::Env => write!(f, "environment"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferenceConfig {
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default, alias = "sarvam_api_key")]
-    pub api_key: String,
-    #[serde(default = "default_model", alias = "sarvam_model")]
+    pub api_key: Secret,
+    #[serde(default, alias = "sarvam_model")]
     pub model: String,
     #[serde(default = "default_language_code")]
     pub language_code: String,
     #[serde(default = "default_mode", alias = "sarvam_mode")]
     pub mode: String,
     #[serde(default)]
+    pub groq_api_key: Option<Secret>,
+    #[serde(default)]
+    pub openai_api_key: Option<Secret>,
+    #[serde(default)]
+    pub openai_compatible_endpoint: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_model: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_api_key: Option<Secret>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+    #[serde(default)]
     pub custom: Option<CustomModelConfig>,
 }
 
 impl Default for InferenceConfig {
     fn default() -> Self {
+        let provider = default_provider();
+        let model = default_model_for(&provider).to_string();
         Self {
-            provider: default_provider(),
-            api_key: String::new(),
-            model: default_model(),
+            provider,
+            api_key: Secret::default(),
+            model,
             language_code: default_language_code(),
             mode: default_mode(),
+            groq_api_key: None,
+            openai_api_key: None,
+            openai_compatible_endpoint: None,
+            openai_compatible_model: None,
+            openai_compatible_api_key: None,
+            language: None,
+            request_timeout_secs: None,
             custom: None,
         }
     }
 }
 
 impl InferenceConfig {
-    pub fn resolve_api_key(&self) -> Option<String> {
-        if !self.api_key.trim().is_empty() {
-            Some(self.api_key.trim().to_string())
-        } else {
-            std::env::var("SARVAM_API_KEY")
-                .ok()
-                .filter(|k| !k.trim().is_empty())
+    /// Pure key resolution function:
+    /// - Returns Option<(Secret, KeySource)>
+    /// - For sarvam: config api_key, env SARVAM_API_KEY
+    /// - For groq: config groq_api_key, env GROQ_API_KEY
+    /// - For openai: config openai_api_key, env OPENAI_API_KEY
+    /// - For openai-compatible: config openai_compatible_api_key, env OPENAI_COMPATIBLE_API_KEY (optional: None if missing)
+    /// - Strict isolation: a Sarvam key must never resolve for Groq or OpenAI, and vice versa.
+    /// - Empty strings count as unset.
+    pub fn resolve_key_for_provider(&self, provider: &str) -> Option<(Secret, KeySource)> {
+        match provider.to_lowercase().as_str() {
+            "sarvam" => {
+                if !self.api_key.trim().is_empty() {
+                    Some((self.api_key.clone(), KeySource::Config))
+                } else {
+                    std::env::var("SARVAM_API_KEY")
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .map(|k| (Secret::new(k.trim()), KeySource::Env))
+                }
+            }
+            "groq" => {
+                if let Some(k) = self.groq_api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    Some((k.clone(), KeySource::Config))
+                } else {
+                    std::env::var("GROQ_API_KEY")
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .map(|k| (Secret::new(k.trim()), KeySource::Env))
+                }
+            }
+            "openai" => {
+                if let Some(k) = self.openai_api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    Some((k.clone(), KeySource::Config))
+                } else {
+                    std::env::var("OPENAI_API_KEY")
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .map(|k| (Secret::new(k.trim()), KeySource::Env))
+                }
+            }
+            "openai-compatible" => {
+                if let Some(k) = self.openai_compatible_api_key.as_ref().filter(|k| !k.trim().is_empty()) {
+                    Some((k.clone(), KeySource::Config))
+                } else {
+                    std::env::var("OPENAI_COMPATIBLE_API_KEY")
+                        .ok()
+                        .filter(|k| !k.trim().is_empty())
+                        .map(|k| (Secret::new(k.trim()), KeySource::Env))
+                }
+            }
+            _ => None,
         }
+    }
+
+    pub fn resolve_provider_key(&self) -> Option<(Secret, KeySource)> {
+        self.resolve_key_for_provider(&self.provider)
+    }
+
+    pub fn resolve_api_key(&self) -> Option<String> {
+        self.resolve_key_for_provider("sarvam")
+            .map(|(k, _)| k.expose().to_string())
     }
 }
 
@@ -297,11 +434,44 @@ fn default_ui_config() -> UiConfig {
 pub struct Config {
     pub hotkey: String,
     pub pacing_delay_ms: u64,
+    /// Active text injection mode (`clipboard` paste vs `typewriter` uinput typing).
+    #[serde(default)]
+    pub injection_mode: InjectionMode,
     pub input: InputConfig,
     pub audio: AudioConfig,
     pub inference: InferenceConfig,
     pub injector: InjectorConfig,
     pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawInferenceConfig {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default, alias = "sarvam_api_key")]
+    pub api_key: Option<Secret>,
+    #[serde(default, alias = "sarvam_model")]
+    pub model: Option<String>,
+    #[serde(default = "default_language_code")]
+    pub language_code: String,
+    #[serde(default = "default_mode", alias = "sarvam_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub groq_api_key: Option<Secret>,
+    #[serde(default)]
+    pub openai_api_key: Option<Secret>,
+    #[serde(default)]
+    pub openai_compatible_endpoint: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_model: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_api_key: Option<Secret>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub custom: Option<CustomModelConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -317,7 +487,7 @@ struct RawConfig {
     #[serde(default)]
     audio: AudioConfig,
     #[serde(default)]
-    inference: InferenceConfig,
+    inference: RawInferenceConfig,
     #[serde(default)]
     injector: InjectorConfig,
     #[serde(default = "default_ui_config")]
@@ -332,28 +502,55 @@ struct RawConfig {
     #[serde(default)]
     sarvam_model: Option<String>,
     #[serde(default)]
-    injection_mode: Option<String>,
+    injection_mode: Option<InjectionMode>,
 }
 
 impl From<RawConfig> for Config {
     fn from(raw: RawConfig) -> Self {
-        let mut inference = raw.inference;
-        if let Some(p) = raw.provider {
-            inference.provider = p;
-        }
-        if let Some(k) = raw.sarvam_api_key {
-            inference.api_key = k;
-        }
-        if let Some(m) = raw.sarvam_mode {
-            inference.mode = m;
-        }
-        if let Some(mdl) = raw.sarvam_model {
-            inference.model = mdl;
-        }
+        let provider = raw
+            .provider
+            .or(raw.inference.provider)
+            .unwrap_or_else(default_provider);
+
+        let api_key = raw
+            .sarvam_api_key
+            .map(Secret::new)
+            .or(raw.inference.api_key)
+            .unwrap_or_default();
+
+        let mode = raw
+            .sarvam_mode
+            .unwrap_or(raw.inference.mode);
+
+        let model = raw
+            .sarvam_model
+            .or(raw.inference.model)
+            .unwrap_or_else(|| default_model_for(&provider).to_string());
+
+        let inference = InferenceConfig {
+            provider,
+            api_key,
+            model,
+            language_code: raw.inference.language_code,
+            mode,
+            groq_api_key: raw.inference.groq_api_key,
+            openai_api_key: raw.inference.openai_api_key,
+            openai_compatible_endpoint: raw.inference.openai_compatible_endpoint,
+            openai_compatible_model: raw.inference.openai_compatible_model,
+            openai_compatible_api_key: raw.inference.openai_compatible_api_key,
+            language: raw.inference.language,
+            request_timeout_secs: raw.inference.request_timeout_secs,
+            custom: raw.inference.custom,
+        };
+
+        let injection_mode = raw
+            .injection_mode
+            .or_else(|| raw.injector.method.parse::<InjectionMode>().ok())
+            .unwrap_or_default();
 
         let mut injector = raw.injector;
-        if let Some(inj) = raw.injection_mode {
-            injector.method = inj;
+        if raw.injection_mode.is_some() {
+            injector.method = injection_mode.to_string();
         }
 
         let delay = raw
@@ -384,6 +581,7 @@ impl From<RawConfig> for Config {
         Config {
             hotkey,
             pacing_delay_ms: delay,
+            injection_mode,
             input,
             audio: raw.audio,
             inference,
@@ -398,6 +596,7 @@ impl Default for Config {
         Self {
             hotkey: default_hotkey(),
             pacing_delay_ms: default_pacing_ms(),
+            injection_mode: InjectionMode::default(),
             input: InputConfig::default(),
             audio: AudioConfig::default(),
             inference: InferenceConfig::default(),
@@ -491,7 +690,11 @@ impl Config {
         write_secure_config(path, &table)
     }
 
-    pub fn save_sarvam_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+    fn mutate_inference_table<F: FnOnce(&mut toml::Table)>(
+        path: &Path,
+        cleanup_legacy: bool,
+        f: F,
+    ) -> Result<(), String> {
         let mut table = read_toml_table(path)?;
 
         let inf_val = table
@@ -499,18 +702,67 @@ impl Config {
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
 
         if let toml::Value::Table(ref mut inf_table) = inf_val {
-            inf_table.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
+            f(inf_table);
         } else {
             let mut inf_table = toml::Table::new();
-            inf_table.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
+            f(&mut inf_table);
             table.insert("inference".into(), toml::Value::Table(inf_table));
         }
 
-        table.remove("provider");
-        table.remove("sarvam_api_key");
-        table.remove("sarvam_model");
+        if cleanup_legacy {
+            table.remove("provider");
+            table.remove("sarvam_api_key");
+            table.remove("sarvam_model");
+        }
 
         write_secure_config(path, &table)
+    }
+
+    pub fn save_sarvam_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+        Self::mutate_inference_table(path, true, |inf| {
+            inf.insert("api_key".into(), toml::Value::String(api_key.trim().to_string()));
+        })
+    }
+
+    pub fn save_groq_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+        Self::mutate_inference_table(path, false, |inf| {
+            inf.insert("groq_api_key".into(), toml::Value::String(api_key.trim().to_string()));
+        })
+    }
+
+    pub fn save_openai_credentials_in_file(path: &Path, api_key: &str) -> Result<(), String> {
+        Self::mutate_inference_table(path, false, |inf| {
+            inf.insert("openai_api_key".into(), toml::Value::String(api_key.trim().to_string()));
+        })
+    }
+
+    pub fn save_openai_compatible_config_in_file(
+        path: &Path,
+        endpoint: &str,
+        model: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Result<(), String> {
+        Self::mutate_inference_table(path, false, |inf| {
+            inf.insert(
+                "openai_compatible_endpoint".into(),
+                toml::Value::String(endpoint.trim().to_string()),
+            );
+            if let Some(m) = model {
+                inf.insert(
+                    "openai_compatible_model".into(),
+                    toml::Value::String(m.trim().to_string()),
+                );
+            }
+            if let Some(k) = api_key {
+                let trimmed = k.trim();
+                if !trimmed.is_empty() {
+                    inf.insert(
+                        "openai_compatible_api_key".into(),
+                        toml::Value::String(trimmed.to_string()),
+                    );
+                }
+            }
+        })
     }
 
     pub fn to_target_chord(&self) -> TargetChord {
@@ -533,7 +785,12 @@ impl Config {
             self.inference.mode = m.to_string();
         }
         if let Some(inj) = injection {
-            self.injector.method = inj.to_string();
+            if let Ok(m) = inj.parse::<InjectionMode>() {
+                self.injection_mode = m;
+                self.injector.method = m.to_string();
+            } else {
+                self.injector.method = inj.to_string();
+            }
         }
         if let Some(d) = typing_delay {
             self.pacing_delay_ms = d;
@@ -569,31 +826,58 @@ fn write_secure_config(path: &Path, table: &toml::Table) -> Result<(), String> {
     let serialized = toml::to_string_pretty(&toml::Value::Table(table.clone()))
         .map_err(|e| format!("Failed to serialize TOML: {}", e))?;
 
+    let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_path = parent_dir.join(format!(
+        ".config.toml.tmp.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         let mut file = fs::OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .mode(0o600)
-            .open(path)
-            .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+            .open(&temp_path)
+            .map_err(|e| {
+                format!(
+                    "Failed to create secure temp config {}: {}",
+                    temp_path.display(),
+                    e
+                )
+            })?;
 
-        file.write_all(serialized.as_bytes())
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        file.write_all(serialized.as_bytes()).map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            format!("Failed to write to {}: {}", temp_path.display(), e)
+        })?;
 
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Failed to set permissions on {}: {}", path.display(), e))?;
+        file.sync_all().map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            format!("Failed to sync {}: {}", temp_path.display(), e)
+        })?;
     }
 
     #[cfg(not(unix))]
     {
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        fs::write(&temp_path, &serialized)
+            .map_err(|e| format!("Failed to write to {}: {}", temp_path.display(), e))?;
     }
+
+    fs::rename(&temp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "Failed to atomically rename config to {}: {}",
+            path.display(),
+            e
+        )
+    })?;
 
     Ok(())
 }
@@ -701,7 +985,8 @@ grab_key = false
         let default_cfg = Config::default();
         assert_eq!(default_cfg.hotkey, "RightAlt");
         assert_eq!(default_cfg.pacing_delay_ms, 15);
-        assert_eq!(default_cfg.injector.method, "typewriter");
+        assert_eq!(default_cfg.injection_mode, InjectionMode::Clipboard);
+        assert_eq!(default_cfg.injector.method, "clipboard");
         assert_eq!(default_cfg.to_target_chord(), TargetChord::right_alt());
 
         let toml_data = r#"
@@ -741,7 +1026,7 @@ mode = "codemix"
     fn test_inference_config_api_key_env_var_fallback() {
         let mut cfg = InferenceConfig::default();
         assert_eq!(cfg.provider, "local");
-        assert_eq!(cfg.model, "saaras:v4");
+        assert_eq!(cfg.model, "parakeet-tdt-v3");
         assert_eq!(cfg.language_code, "unknown");
 
         std::env::remove_var("SARVAM_API_KEY");
@@ -836,7 +1121,7 @@ model = "saaras:v4"
         let loaded = Config::load_from_path(&config_file);
         assert_eq!(loaded.inference.provider, "local");
         assert_eq!(loaded.inference.api_key, "sarvam_test_token_abc");
-        assert_eq!(loaded.inference.model, "saaras:v4");
+        assert_eq!(loaded.inference.model, "parakeet-tdt-v3");
 
         // 2. Existing file -> updates api_key, preserves existing provider, model and other configs
         let custom_toml = r#"
@@ -900,5 +1185,86 @@ model = "parakeet-tdt-v3"
         assert_eq!(mode, 0o600, "Config file permissions must be 0600");
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_injection_mode_defaults_and_parsing() {
+        // Missing from TOML defaults to Clipboard
+        let toml_empty = "";
+        let cfg: Config = toml::from_str(toml_empty).unwrap();
+        assert_eq!(cfg.injection_mode, InjectionMode::Clipboard);
+        assert_eq!(cfg.injector.method, "clipboard");
+
+        // Parses explicit "clipboard"
+        let toml_clip = "injection_mode = \"clipboard\"";
+        let cfg_clip: Config = toml::from_str(toml_clip).unwrap();
+        assert_eq!(cfg_clip.injection_mode, InjectionMode::Clipboard);
+        assert_eq!(cfg_clip.injector.method, "clipboard");
+
+        // Parses explicit "typewriter"
+        let toml_type = "injection_mode = \"typewriter\"";
+        let cfg_type: Config = toml::from_str(toml_type).unwrap();
+        assert_eq!(cfg_type.injection_mode, InjectionMode::Typewriter);
+        assert_eq!(cfg_type.injector.method, "typewriter");
+
+        // Parses legacy [injector] method = "typewriter"
+        let toml_legacy = "[injector]\nmethod = \"typewriter\"";
+        let cfg_legacy: Config = toml::from_str(toml_legacy).unwrap();
+        assert_eq!(cfg_legacy.injection_mode, InjectionMode::Typewriter);
+
+        // String parsing
+        assert_eq!("clipboard".parse::<InjectionMode>(), Ok(InjectionMode::Clipboard));
+        assert_eq!("typewriter".parse::<InjectionMode>(), Ok(InjectionMode::Typewriter));
+        assert!("invalid".parse::<InjectionMode>().is_err());
+    }
+
+    #[test]
+    fn test_default_model_for_providers() {
+        assert_eq!(default_model_for("local"), "parakeet-tdt-v3");
+        assert_eq!(default_model_for("sarvam"), "saaras:v4");
+        assert_eq!(default_model_for("groq"), "whisper-large-v3-turbo");
+        assert_eq!(default_model_for("openai"), "whisper-1");
+        assert_eq!(default_model_for("openai-compatible"), "");
+        assert_eq!(default_model_for("custom"), "");
+        assert_eq!(default_model_for("unknown"), "");
+    }
+
+    #[test]
+    fn test_omitted_model_resolves_to_provider_default() {
+        // 1. Fresh config (empty TOML) defaults to local + parakeet-tdt-v3
+        let cfg_empty: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg_empty.inference.provider, "local");
+        assert_eq!(cfg_empty.inference.model, "parakeet-tdt-v3");
+
+        // 2. Existing config specifying provider = "sarvam" without model resolves to saaras:v4
+        let cfg_sarvam: Config = toml::from_str("[inference]\nprovider = \"sarvam\"").unwrap();
+        assert_eq!(cfg_sarvam.inference.provider, "sarvam");
+        assert_eq!(cfg_sarvam.inference.model, "saaras:v4");
+
+        // 3. Provider = "groq" without model resolves to whisper-large-v3-turbo
+        let cfg_groq: Config = toml::from_str("[inference]\nprovider = \"groq\"").unwrap();
+        assert_eq!(cfg_groq.inference.provider, "groq");
+        assert_eq!(cfg_groq.inference.model, "whisper-large-v3-turbo");
+
+        // 4. Provider = "openai" without model resolves to whisper-1
+        let cfg_openai: Config = toml::from_str("[inference]\nprovider = \"openai\"").unwrap();
+        assert_eq!(cfg_openai.inference.provider, "openai");
+        assert_eq!(cfg_openai.inference.model, "whisper-1");
+
+        // 5. Provider = "openai-compatible" without model resolves to empty string
+        let cfg_compat: Config = toml::from_str("[inference]\nprovider = \"openai-compatible\"").unwrap();
+        assert_eq!(cfg_compat.inference.provider, "openai-compatible");
+        assert_eq!(cfg_compat.inference.model, "");
+    }
+
+    #[test]
+    fn test_explicit_model_preserved_across_providers() {
+        let cfg_local: Config = toml::from_str("[inference]\nprovider = \"local\"\nmodel = \"whisper-small\"").unwrap();
+        assert_eq!(cfg_local.inference.provider, "local");
+        assert_eq!(cfg_local.inference.model, "whisper-small");
+
+        let cfg_sarvam: Config = toml::from_str("[inference]\nprovider = \"sarvam\"\nmodel = \"custom-sarvam-model\"").unwrap();
+        assert_eq!(cfg_sarvam.inference.provider, "sarvam");
+        assert_eq!(cfg_sarvam.inference.model, "custom-sarvam-model");
     }
 }

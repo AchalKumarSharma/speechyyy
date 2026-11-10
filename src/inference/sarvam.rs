@@ -1,32 +1,43 @@
 use crate::audio::AudioChunk;
-use crate::audio::wav::encode_wav_16k_mono;
+use crate::inference::wire::{build_in_memory_wav, Secret};
 use crate::inference::{InferenceError, SpeechInference};
 use serde::Deserialize;
+
+pub use crate::inference::wire::build_multipart_body;
 
 pub const DEFAULT_SARVAM_ENDPOINT: &str = "https://api.sarvam.ai/speech-to-text";
 pub const DEFAULT_SARVAM_MODEL: &str = "saaras:v4";
 pub const DEFAULT_SARVAM_MODE: &str = "translit";
 pub const DEFAULT_SARVAM_LANGUAGE: &str = "unknown";
 
+/// Resolves the Sarvam request timeout, defaulting 0 or None to 30 seconds.
+pub fn resolve_request_timeout(timeout_secs: Option<u64>) -> std::time::Duration {
+    match timeout_secs {
+        Some(s) if s > 0 => std::time::Duration::from_secs(s),
+        _ => std::time::Duration::from_secs(30),
+    }
+}
+
+#[derive(Debug)]
 pub struct SarvamSpeechInference {
-    pub api_key: String,
+    pub api_key: Secret,
     pub model: String,
     pub language_code: String,
     pub mode: String,
     pub endpoint: String,
-    pub timeout: Option<std::time::Duration>,
+    pub timeout: std::time::Duration,
 }
 
 impl SarvamSpeechInference {
-    pub fn new(api_key: String, model: String, language_code: String, mode: String) -> Self {
-        let sanitized_key = api_key.trim().trim_matches('"').to_string();
+    pub fn new(api_key: Secret, model: String, language_code: String, mode: String) -> Self {
+        let sanitized_key = Secret::new(api_key.expose().trim().trim_matches('"'));
         Self {
             api_key: sanitized_key,
             model,
             language_code,
             mode,
             endpoint: DEFAULT_SARVAM_ENDPOINT.to_string(),
-            timeout: None,
+            timeout: resolve_request_timeout(None),
         }
     }
 
@@ -34,12 +45,14 @@ impl SarvamSpeechInference {
         let api_key = config.resolve_api_key().ok_or_else(|| {
             InferenceError::MissingApiKey("SARVAM_API_KEY is not configured".to_string())
         })?;
+        let timeout = resolve_request_timeout(config.request_timeout_secs);
         Ok(Self::new(
-            api_key,
+            Secret::new(api_key),
             config.model.clone(),
             config.language_code.clone(),
             config.mode.clone(),
-        ))
+        )
+        .with_timeout(timeout))
     }
 
     pub fn with_endpoint(mut self, endpoint: &str) -> Self {
@@ -48,7 +61,7 @@ impl SarvamSpeechInference {
     }
 
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.timeout = Some(timeout);
+        self.timeout = timeout;
         self
     }
 }
@@ -60,57 +73,13 @@ pub struct SarvamResponse {
     pub language_code: Option<String>,
 }
 
-/// Constructs a valid RFC 7578 multipart/form-data payload with boundaries.
-pub fn build_multipart_body(
-    boundary: &str,
-    wav_bytes: &[u8],
-    model: &str,
-    mode: &str,
-    language_code: &str,
-) -> Vec<u8> {
-    let mut body = Vec::new();
-
-    // 1. file field
-    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    body.extend_from_slice(
-        b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n",
-    );
-    body.extend_from_slice(b"Content-Type: audio/wav\r\n\r\n");
-    body.extend_from_slice(wav_bytes);
-    body.extend_from_slice(b"\r\n");
-
-    // 2. model field
-    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
-    body.extend_from_slice(model.as_bytes());
-    body.extend_from_slice(b"\r\n");
-
-    // 3. mode field
-    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"mode\"\r\n\r\n");
-    body.extend_from_slice(mode.as_bytes());
-    body.extend_from_slice(b"\r\n");
-
-    // 4. language_code field (if not "unknown" or empty)
-    if !language_code.is_empty() && language_code != "unknown" {
-        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-        body.extend_from_slice(b"Content-Disposition: form-data; name=\"language_code\"\r\n\r\n");
-        body.extend_from_slice(language_code.as_bytes());
-        body.extend_from_slice(b"\r\n");
-    }
-
-    // End boundary
-    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
-    body
-}
-
 impl SpeechInference for SarvamSpeechInference {
     fn transcribe(&mut self, chunk: &AudioChunk) -> Result<String, InferenceError> {
         if self.api_key.is_empty() {
             return Err(InferenceError::MissingApiKey("SARVAM_API_KEY".to_string()));
         }
 
-        let wav_bytes = encode_wav_16k_mono(&chunk.samples);
+        let wav_bytes = build_in_memory_wav(&chunk.samples);
         let boundary = format!(
             "----Speechyyy{:x}",
             std::time::SystemTime::now()
@@ -126,15 +95,14 @@ impl SpeechInference for SarvamSpeechInference {
             &self.language_code,
         );
 
-        let mut agent_builder = ureq::builder();
-        if let Some(timeout) = self.timeout {
-            agent_builder = agent_builder.timeout(timeout);
-        }
-        let agent = agent_builder.build();
+        let agent = ureq::builder()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout(self.timeout)
+            .build();
 
         let response = agent
             .post(&self.endpoint)
-            .set("api-subscription-key", &self.api_key)
+            .set("api-subscription-key", self.api_key.expose())
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={}", boundary),
@@ -147,15 +115,9 @@ impl SpeechInference for SarvamSpeechInference {
                         .unwrap_or_else(|_| "Unknown HTTP error".into());
                     match status {
                         401 => {
-                            let details = if msg.is_empty() {
-                                String::new()
-                            } else {
-                                format!(": {}", msg)
-                            };
-                            InferenceError::Authentication(format!(
-                                "Invalid or expired Sarvam API key. Check 'speechyyy doctor' or replenish credentials at https://dashboard.sarvam.ai{}",
-                                details
-                            ))
+                            InferenceError::Authentication(
+                                "Invalid or expired Sarvam API key. Check 'speechyyy doctor' or replenish credentials at https://dashboard.sarvam.ai".into(),
+                            )
                         }
                         429 => {
                             let details = if msg.is_empty() {
@@ -186,14 +148,9 @@ impl SpeechInference for SarvamSpeechInference {
                             .unwrap_or(false);
 
                     if is_timeout {
-                        let details = if msg.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {}", msg)
-                        };
                         InferenceError::Timeout(format!(
-                            "Sarvam AI connection timed out. Check network connectivity{}",
-                            details
+                            "Sarvam AI connection timed out after {:?}. Check your network connection or raise 'request_timeout_secs' in config.toml",
+                            self.timeout
                         ))
                     } else {
                         InferenceError::Network(msg)

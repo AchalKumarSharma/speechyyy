@@ -22,12 +22,16 @@ fn test_config_defaults() {
         "Default Sarvam mode must be 'translit'"
     );
 
-    assert_eq!(cfg.inference.model, "saaras:v4");
+    assert_eq!(cfg.inference.model, "parakeet-tdt-v3");
 
-    // Default text injection mode must be "typewriter"
+    // Default text injection mode must be "clipboard"
     assert_eq!(
-        cfg.injector.method, "typewriter",
-        "Default injector method must be 'typewriter'"
+        cfg.injection_mode,
+        speechyyy::config::InjectionMode::Clipboard
+    );
+    assert_eq!(
+        cfg.injector.method, "clipboard",
+        "Default injector method must be 'clipboard'"
     );
 
     // Default typing delay must be 15ms
@@ -135,12 +139,16 @@ fn test_cli_flags_parsing_on_start() {
             mode,
             injection,
             typing_delay,
+            no_dock,
+            with_dock,
         } => {
             assert!(!foreground);
             assert_eq!(provider, Some("sarvam".into()));
             assert_eq!(mode, Some("codemix".into()));
             assert_eq!(injection, Some("paste".into()));
             assert_eq!(typing_delay, Some(25));
+            assert!(!no_dock);
+            assert!(!with_dock);
         }
         other => panic!("Expected Command::Start, got {:?}", other),
     }

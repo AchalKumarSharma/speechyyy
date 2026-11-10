@@ -15,6 +15,14 @@ pub enum ActiveRecognizer {
     SenseVoice(SenseVoiceRecognizer),
 }
 
+/// Formats a privacy-preserving decode log entry without leaking transcript contents.
+pub fn format_decode_log(model: &str, secs: f32, samples: usize) -> String {
+    format!(
+        "Local INT8 decoder ({}) decoded {:.2}s chunk ({} samples)",
+        model, secs, samples
+    )
+}
+
 pub struct LocalSpeechInference {
     pub model_type: LocalModelType,
     pub model_dir: PathBuf,
@@ -247,10 +255,12 @@ impl SpeechInference for LocalSpeechInference {
 
         let trimmed = text.trim();
         eprintln!(
-            "Local INT8 decoder ({}) decoded {:.2}s chunk: \"{}\"",
-            self.model_type.display_name(),
-            chunk.duration_secs(),
-            trimmed
+            "{}",
+            format_decode_log(
+                self.model_type.display_name(),
+                chunk.duration_secs(),
+                chunk.samples.len(),
+            )
         );
 
         Ok(trimmed.to_string())
@@ -399,10 +409,12 @@ impl SpeechInference for CustomSpeechInference {
 
         let trimmed = text.trim();
         eprintln!(
-            "Custom INT8 decoder ({}) decoded {:.2}s chunk: \"{}\"",
-            self.config.r#type,
-            chunk.duration_secs(),
-            trimmed
+            "{}",
+            format_decode_log(
+                &self.config.r#type,
+                chunk.duration_secs(),
+                chunk.samples.len(),
+            )
         );
 
         Ok(trimmed.to_string())

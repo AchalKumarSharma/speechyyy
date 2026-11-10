@@ -1,6 +1,12 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use std::fs::{self};
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum LocalModelType {
@@ -189,131 +195,1038 @@ impl ModelManager {
         })
     }
 
-    /// Downloads the model archive (.tar.bz2) and unpacks into `target_dir`.
+    /// Downloads the model archive (.tar.bz2), verifies its SHA-256 and size against the pinned manifest,
+    /// safely extracts it into staging with traversal guards, and atomically promotes it into `target_dir`.
     pub fn download_model(
         model_type: LocalModelType,
         target_dir: &Path,
     ) -> Result<ModelInfo, String> {
-        fs::create_dir_all(target_dir).map_err(|e| {
-            format!(
-                "Failed to create target directory {}: {}",
-                target_dir.display(),
-                e
-            )
-        })?;
+        let fetcher = UreqFetcher;
+        download_and_install_model(model_type, target_dir, &fetcher, None)
+    }
 
-        let url = model_type.download_url();
-        println!(
-            "Downloading {} from {} into {}...",
-            model_type.display_name(),
-            url,
-            target_dir.display()
-        );
+    /// Downloads and installs model with a custom fetcher and optional manifest override (for hermetic testing).
+    pub fn download_model_with_fetcher<F: Fetcher>(
+        model_type: LocalModelType,
+        target_dir: &Path,
+        fetcher: &F,
+        manifest: Option<&ModelsManifest>,
+    ) -> Result<ModelInfo, String> {
+        download_and_install_model(model_type, target_dir, fetcher, manifest)
+    }
+}
 
-        let resp = ureq::get(url)
-            .call()
-            .map_err(|e| format!("Download request failed for {}: {}", url, e))?;
+pub const EMBEDDED_MANIFEST: &str = include_str!("../assets/models.toml");
 
-        let total_bytes = resp
-            .header("content-length")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelManifestEntry {
+    pub id: String,
+    pub url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub max_extracted_bytes: u64,
+    pub max_files: usize,
+    pub expected_files: Vec<String>,
+    pub license: String,
+    pub license_url: String,
+    pub attribution: String,
+}
 
-        let pb = ProgressBar::new(total_bytes);
-        let style = ProgressStyle::with_template(
-            "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("##-");
-        pb.set_style(style);
-
-        let temp_archive_path = target_dir.join(format!("{}.tar.bz2.part", model_type.folder_name()));
-        if temp_archive_path.exists() {
-            let _ = fs::remove_file(&temp_archive_path);
-        }
-
-        let mut reader = pb.wrap_read(resp.into_reader());
-        let mut dest_file = fs::File::create(&temp_archive_path).map_err(|e| {
-            format!(
-                "Failed to create temp archive {}: {}",
-                temp_archive_path.display(),
-                e
-            )
-        })?;
-
-        std::io::copy(&mut reader, &mut dest_file).map_err(|e| {
-            let _ = fs::remove_file(&temp_archive_path);
-            format!("Failed to download archive: {}", e)
-        })?;
-        drop(dest_file);
-
-        pb.set_message("Extracting archive...");
-
-        let archive_file = fs::File::open(&temp_archive_path).map_err(|e| {
-            let _ = fs::remove_file(&temp_archive_path);
-            format!(
-                "Failed to open downloaded archive {}: {}",
-                temp_archive_path.display(),
-                e
-            )
-        })?;
-        let decompressor = bzip2::read::BzDecoder::new(archive_file);
-        let mut archive = tar::Archive::new(decompressor);
-
-        for entry in archive
-            .entries()
-            .map_err(|e| {
-                let _ = fs::remove_file(&temp_archive_path);
-                format!("Failed to read tar archive: {}", e)
-            })?
+impl ModelManifestEntry {
+    pub fn validate_for_download(&self) -> Result<(), String> {
+        let hash = self.sha256.trim();
+        if hash.is_empty()
+            || hash == "unverified"
+            || hash == "placeholder"
+            || hash == "TODO"
+            || hash.len() != 64
         {
-            let mut entry = entry.map_err(|e| {
-                let _ = fs::remove_file(&temp_archive_path);
-                format!("Failed to read tar entry: {}", e)
-            })?;
-            let path = entry
-                .path()
-                .map_err(|e| {
-                    let _ = fs::remove_file(&temp_archive_path);
-                    format!("Invalid path in tar: {}", e)
-                })?;
-            let components: Vec<_> = path.components().collect();
-            let relative_path: PathBuf = if components.len() > 1 {
-                components[1..].iter().collect()
-            } else {
-                path.to_path_buf()
-            };
-            if relative_path.as_os_str().is_empty() {
+            return Err(format!(
+                "error: model '{}' does not have a pinned checksum in this build.\nhint: run 'scripts/update-model-manifest.sh' or set up a verified build.",
+                self.id
+            ));
+        }
+        if self.size_bytes == 0 {
+            return Err(format!(
+                "error: model '{}' has no pinned archive size in this build.\nhint: run 'scripts/update-model-manifest.sh' or set up a verified build.",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelsManifest {
+    #[serde(default)]
+    pub models: HashMap<String, ModelManifestEntry>,
+}
+
+impl ModelsManifest {
+    pub fn parse(content: &str) -> Result<Self, String> {
+        toml::from_str(content).map_err(|e| format!("Failed to parse models.toml: {}", e))
+    }
+
+    pub fn embedded() -> Result<Self, String> {
+        Self::parse(EMBEDDED_MANIFEST)
+    }
+
+    pub fn get(&self, model_id: &str) -> Option<&ModelManifestEntry> {
+        self.models.get(model_id)
+    }
+}
+
+pub fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(to_hex(&hasher.finalize()))
+}
+
+/// Pure function validating that a model download URL conforms strictly to the URL policy:
+/// - Must begin with 'https://'
+/// - Host up to '/', '?', '#', or ':' must be exactly 'github.com' or end with '.githubusercontent.com' on a dot boundary
+/// - Must not contain userinfo ('@') before authority ends
+pub fn validate_download_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("URL scheme must be exactly 'https://'".into());
+    }
+    let after_scheme = &url["https://".len()..];
+
+    let authority_end = after_scheme
+        .find(['/', '?', '#', ':'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+
+    if authority.contains('@') {
+        return Err("Userinfo ('@') is not allowed in model download URL".into());
+    }
+
+    let host = authority.to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("Host cannot be empty".into());
+    }
+
+    let is_allowed = host == "github.com"
+        || (host.ends_with(".githubusercontent.com")
+            && host.len() > ".githubusercontent.com".len()
+            && !host[..host.len() - ".githubusercontent.com".len()].is_empty()
+            && !host[..host.len() - ".githubusercontent.com".len()].ends_with('.'));
+
+    if !is_allowed {
+        return Err(format!(
+            "Host '{}' is not an allowlisted GitHub download domain",
+            host
+        ));
+    }
+
+    Ok(())
+}
+
+/// Pure function resolving the next hop of an HTTP redirect.
+///
+/// Rules:
+/// - Valid only for HTTP statuses 301, 302, 303, 307, 308.
+/// - Missing or empty `location` is an error.
+/// - Hops count check: if `hops_so_far >= 5`, returns an error (exceeded 5 redirects).
+/// - Resolves relative `Location` headers against `current_url`:
+///   - Handles absolute URLs (`http://`, `https://`)
+///   - Handles scheme-relative URLs (`//host/path`)
+///   - Handles root-relative URLs (`/path`)
+///   - Handles document-relative URLs (`rel/path`, `?query`, `#hash`)
+/// - Validates the resolved URL against `policy` before returning.
+pub fn next_hop(
+    current_url: &str,
+    status: u16,
+    location: Option<&str>,
+    hops_so_far: u32,
+    policy: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return Err(format!(
+            "HTTP status {} is not a supported redirect status",
+            status
+        ));
+    }
+
+    if hops_so_far >= 5 {
+        return Err(format!(
+            "Too many redirects (exceeded 5) while fetching {}",
+            current_url
+        ));
+    }
+
+    let raw_loc = match location {
+        Some(l) if !l.trim().is_empty() => l.trim(),
+        _ => {
+            return Err(format!(
+                "Redirect status {} missing Location header while fetching {}",
+                status, current_url
+            ))
+        }
+    };
+
+    let scheme_end = current_url
+        .find("://")
+        .ok_or_else(|| format!("Invalid current URL '{}': missing scheme", current_url))?;
+    let scheme = &current_url[..scheme_end];
+
+    let resolved = if raw_loc.starts_with("http://") || raw_loc.starts_with("https://") {
+        raw_loc.to_string()
+    } else if raw_loc.starts_with("//") {
+        format!("{}:{}", scheme, raw_loc)
+    } else if raw_loc.starts_with('/') {
+        let after_scheme = &current_url[scheme_end + 3..];
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .map(|idx| scheme_end + 3 + idx)
+            .unwrap_or(current_url.len());
+        format!("{}{}", &current_url[..authority_end], raw_loc)
+    } else if raw_loc.starts_with('?') || raw_loc.starts_with('#') {
+        let base = current_url
+            .find(['?', '#'])
+            .map(|idx| &current_url[..idx])
+            .unwrap_or(current_url);
+        format!("{}{}", base, raw_loc)
+    } else {
+        let base_no_query = current_url
+            .find(['?', '#'])
+            .map(|idx| &current_url[..idx])
+            .unwrap_or(current_url);
+        let last_slash = base_no_query.rfind('/').unwrap_or(base_no_query.len());
+        if last_slash < scheme_end + 3 {
+            format!("{}/{}", base_no_query, raw_loc)
+        } else {
+            format!("{}{}", &base_no_query[..=last_slash], raw_loc)
+        }
+    };
+
+    policy(&resolved)?;
+    Ok(resolved)
+}
+
+pub fn compute_available_disk_space(bavail: u64, frsize: u64) -> u64 {
+    bavail.saturating_mul(frsize)
+}
+
+pub fn compute_required_disk_space(archive_size: u64, max_extracted_bytes: u64) -> u64 {
+    let archive_part = (archive_size as f64 * 2.5) as u64;
+    archive_part.saturating_add(max_extracted_bytes)
+}
+
+pub fn check_disk_space(target_dir: &Path, required_bytes: u64) -> Result<u64, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut check_dir = target_dir.to_path_buf();
+    while !check_dir.exists() {
+        if let Some(parent) = check_dir.parent() {
+            check_dir = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    let c_path = CString::new(check_dir.as_os_str().as_bytes())
+        .map_err(|e| format!("Invalid path for statvfs: {}", e))?;
+
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if res != 0 {
+        return Err(format!(
+            "statvfs failed on {}: {}",
+            check_dir.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let available = compute_available_disk_space(stat.f_bavail as u64, stat.f_frsize as u64);
+    if available < required_bytes {
+        let req_mb = required_bytes as f64 / (1024.0 * 1024.0);
+        let avail_mb = available as f64 / (1024.0 * 1024.0);
+        return Err(format!(
+            "Insufficient disk space in {}: required {:.1} MB, available {:.1} MB",
+            check_dir.display(),
+            req_mb,
+            avail_mb
+        ));
+    }
+
+    Ok(available)
+}
+
+pub trait Fetcher {
+    fn fetch(
+        &self,
+        url: &str,
+        dest: &Path,
+        max_bytes: u64,
+        progress_cb: Option<&mut dyn FnMut(u64)>,
+    ) -> Result<String, String>;
+}
+
+pub struct UreqFetcher;
+
+impl UreqFetcher {
+    pub fn fetch_with_policy(
+        &self,
+        initial_url: &str,
+        dest: &Path,
+        max_bytes: u64,
+        mut progress_cb: Option<&mut dyn FnMut(u64)>,
+        policy: &dyn Fn(&str) -> Result<(), String>,
+    ) -> Result<String, String> {
+        policy(initial_url)?;
+
+        let mut current_url = initial_url.to_string();
+        let mut hops = 0;
+        let mut visited_urls = std::collections::HashSet::new();
+        visited_urls.insert(current_url.clone());
+
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(60))
+            .build();
+
+        loop {
+            let mut attempts = 0;
+            let mut last_err = String::new();
+            let mut response = None;
+            let mut is_redirect = false;
+
+            while attempts < 3 {
+                attempts += 1;
+                match agent.get(&current_url).call() {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if (200..=299).contains(&status) && status != 206 {
+                            response = Some(resp);
+                            break;
+                        } else if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                            let loc = resp.header("location");
+                            let next = next_hop(&current_url, status, loc, hops, policy)?;
+                            if visited_urls.contains(&next) {
+                                return Err(format!(
+                                    "Redirect loop detected: '{}' was already visited while fetching '{}'",
+                                    next, initial_url
+                                ));
+                            }
+                            visited_urls.insert(next.clone());
+                            current_url = next;
+                            hops += 1;
+                            is_redirect = true;
+                            response = None;
+                            break;
+                        } else {
+                            return Err(format!(
+                                "Unexpected HTTP status {} fetching {}",
+                                status, current_url
+                            ));
+                        }
+                    }
+                    Err(ureq::Error::Status(code, resp)) => {
+                        if (400..=499).contains(&code) {
+                            if code == 404 {
+                                return Err(format!(
+                                    "HTTP 404 fetching {}: the pinned URL no longer exists and the model manifest needs updating",
+                                    current_url
+                                ));
+                            } else {
+                                return Err(format!(
+                                    "HTTP error {} fetching {}: {}",
+                                    code, current_url, resp.status_text()
+                                ));
+                            }
+                        }
+                        last_err = format!("HTTP error {} fetching {}: {}", code, current_url, resp.status_text());
+                        if attempts < 3 {
+                            let backoff = Duration::from_millis(500 * (1 << (attempts - 1)));
+                            std::thread::sleep(backoff);
+                        }
+                    }
+                    Err(ureq::Error::Transport(e)) => {
+                        last_err = format!("Network failure on {}: {}", current_url, e);
+                        if attempts < 3 {
+                            let backoff = Duration::from_millis(500 * (1 << (attempts - 1)));
+                            std::thread::sleep(backoff);
+                        }
+                    }
+                }
+            }
+
+            if is_redirect {
                 continue;
             }
-            let dest = target_dir.join(relative_path);
-            if entry.header().entry_type().is_dir() {
-                let _ = fs::create_dir_all(&dest);
-            } else {
-                if let Some(parent) = dest.parent() {
-                    let _ = fs::create_dir_all(parent);
+
+            if response.is_none() {
+                if attempts >= 3 && !last_err.is_empty() {
+                    return Err(format!("Download failed after 3 attempts: {}", last_err));
                 }
-                entry
-                    .unpack(&dest)
-                    .map_err(|e| {
-                        let _ = fs::remove_file(&temp_archive_path);
-                        format!("Failed to extract file {}: {}", dest.display(), e)
-                    })?;
+                continue;
+            }
+
+            let resp = response.unwrap();
+
+            if dest.exists() {
+                let _ = fs::remove_file(dest);
+            }
+            if let Some(p) = dest.parent() {
+                fs::create_dir_all(p)
+                    .map_err(|e| format!("Failed to create staging dir {}: {}", p.display(), e))?;
+            }
+
+            #[cfg(unix)]
+            let mut dest_file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(dest)
+                    .map_err(|e| format!("Failed to create staging file {}: {}", dest.display(), e))?
+            };
+            #[cfg(not(unix))]
+            let mut dest_file = File::create(dest)
+                .map_err(|e| format!("Failed to create staging file {}: {}", dest.display(), e))?;
+
+            let mut reader = resp.into_reader();
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 65536];
+            let mut total_bytes = 0u64;
+
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        drop(dest_file);
+                        let _ = fs::remove_file(dest);
+                        return Err(format!("Failed reading stream from {}: {}", current_url, e));
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+                total_bytes += n as u64;
+                if total_bytes > max_bytes {
+                    drop(dest_file);
+                    let _ = fs::remove_file(dest);
+                    return Err(format!(
+                        "Download aborted: received {} bytes, exceeding allowed maximum of {} bytes",
+                        total_bytes, max_bytes
+                    ));
+                }
+                hasher.update(&buf[..n]);
+                if let Err(e) = dest_file.write_all(&buf[..n]) {
+                    drop(dest_file);
+                    let _ = fs::remove_file(dest);
+                    return Err(format!("Failed to write to {}: {}", dest.display(), e));
+                }
+
+                if let Some(ref mut cb) = progress_cb {
+                    cb(total_bytes);
+                }
+            }
+
+            if total_bytes == 0 {
+                drop(dest_file);
+                let _ = fs::remove_file(dest);
+                return Err(format!(
+                    "Download failed: server sent an empty body from {}",
+                    current_url
+                ));
+            }
+
+            if let Err(e) = dest_file.flush() {
+                drop(dest_file);
+                let _ = fs::remove_file(dest);
+                return Err(format!("Failed to flush {}: {}", dest.display(), e));
+            }
+
+            let computed_hash = to_hex(&hasher.finalize());
+            return Ok(computed_hash);
+        }
+    }
+}
+
+impl Fetcher for UreqFetcher {
+    fn fetch(
+        &self,
+        initial_url: &str,
+        dest: &Path,
+        max_bytes: u64,
+        progress_cb: Option<&mut dyn FnMut(u64)>,
+    ) -> Result<String, String> {
+        self.fetch_with_policy(initial_url, dest, max_bytes, progress_cb, &validate_download_url)
+    }
+}
+
+pub fn clean_stale_staging_dirs(staging_root: &Path) {
+    if !staging_root.exists() {
+        return;
+    }
+    let entries = match fs::read_dir(staging_root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let pid_opt = dir_name.rsplit('-').next().and_then(|p| p.parse::<libc::pid_t>().ok());
+        let mut should_clean = false;
+
+        if let Some(pid) = pid_opt {
+            let res = unsafe { libc::kill(pid, 0) };
+            if res != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    should_clean = true;
+                }
             }
         }
 
-        let _ = fs::remove_file(&temp_archive_path);
+        if let Ok(meta) = fs::metadata(&path) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
+                    if elapsed >= Duration::from_secs(86400) {
+                        should_clean = true;
+                    }
+                }
+            }
+        }
 
-        let info = Self::verify_model_files(model_type, target_dir)?;
-        let completion_msg = format!(
-            "[✓] Successfully installed {} to {}",
-            model_type.folder_name(),
-            target_dir.display()
+        if should_clean {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+pub fn safe_extract_tar_bz2(
+    archive_path: &Path,
+    dest_dir: &Path,
+    max_files: usize,
+    max_extracted_bytes: u64,
+) -> Result<usize, String> {
+    if dest_dir.exists() {
+        let _ = fs::remove_dir_all(dest_dir);
+    }
+    fs::create_dir_all(dest_dir)
+        .map_err(|e| format!("Failed to create extraction directory {}: {}", dest_dir.display(), e))?;
+
+    let file = File::open(archive_path)
+        .map_err(|e| format!("Failed to open archive {}: {}", archive_path.display(), e))?;
+    let decompressor = bzip2::read::BzDecoder::new(file);
+    let mut archive = tar::Archive::new(decompressor);
+
+    let mut file_count = 0usize;
+    let mut total_bytes_written = 0u64;
+
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Corrupted tar archive {}: {}", archive_path.display(), e))?;
+
+    for entry_res in entries {
+        let mut entry = entry_res.map_err(|e| format!("Failed to read archive entry: {}", e))?;
+        let entry_type = entry.header().entry_type();
+
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(format!(
+                "Archive contains forbidden entry type '{:?}'",
+                entry_type
+            ));
+        }
+
+        let raw_path = entry
+            .path()
+            .map_err(|e| format!("Invalid path in archive: {}", e))?
+            .to_path_buf();
+
+        let mut normalized_parts = Vec::new();
+        for comp in raw_path.components() {
+            match comp {
+                Component::CurDir => continue,
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(format!(
+                        "Archive entry '{}' contains illegal absolute path component",
+                        raw_path.display()
+                    ));
+                }
+                Component::ParentDir => {
+                    return Err(format!(
+                        "Archive entry '{}' contains illegal path traversal component '..'",
+                        raw_path.display()
+                    ));
+                }
+                Component::Normal(c) => {
+                    normalized_parts.push(PathBuf::from(c));
+                }
+            }
+        }
+
+        if normalized_parts.is_empty() {
+            continue;
+        }
+
+        let relative_path: PathBuf = if normalized_parts.len() > 1 {
+            normalized_parts[1..].iter().collect()
+        } else {
+            if entry_type.is_dir() {
+                continue;
+            }
+            normalized_parts[0].clone()
+        };
+
+        let target_path = dest_dir.join(&relative_path);
+
+        if entry_type.is_dir() {
+            fs::create_dir_all(&target_path)
+                .map_err(|e| format!("Failed to create directory {}: {}", target_path.display(), e))?;
+            let _ = fs::set_permissions(&target_path, fs::Permissions::from_mode(0o755));
+        } else if entry_type.is_file() {
+            file_count += 1;
+            if file_count > max_files {
+                return Err(format!(
+                    "Decompression rejected: archive exceeded file count cap of {}",
+                    max_files
+                ));
+            }
+
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!("Failed to create parent dir {}: {}", parent.display(), e)
+                })?;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
+            }
+
+            let mut out_file = File::create(&target_path)
+                .map_err(|e| format!("Failed to create file {}: {}", target_path.display(), e))?;
+            let _ = fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644));
+
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = entry
+                    .read(&mut buf)
+                    .map_err(|e| format!("Decompression read error on {}: {}", relative_path.display(), e))?;
+                if n == 0 {
+                    break;
+                }
+                total_bytes_written += n as u64;
+                if total_bytes_written > max_extracted_bytes {
+                    drop(out_file);
+                    let _ = fs::remove_file(&target_path);
+                    return Err(format!(
+                        "Decompression bomb aborted: extracted bytes exceeded cap of {} bytes",
+                        max_extracted_bytes
+                    ));
+                }
+                out_file
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("Failed writing {}: {}", target_path.display(), e))?;
+            }
+            out_file
+                .flush()
+                .map_err(|e| format!("Failed to flush {}: {}", target_path.display(), e))?;
+        }
+    }
+
+    Ok(file_count)
+}
+
+pub fn recover_interrupted_install(model_dir: &Path, model_id: &str) -> Result<(), String> {
+    let old_dir = PathBuf::from(format!("{}.old", model_dir.display()));
+    if old_dir.exists() && !model_dir.exists() {
+        fs::rename(&old_dir, model_dir).map_err(|e| {
+            format!(
+                "Failed to restore interrupted model backup from {}: {}",
+                old_dir.display(),
+                e
+            )
+        })?;
+        println!(
+            "[✓] Restored previous model '{}' from .old backup after an interrupted install.",
+            model_id
         );
-        pb.finish_with_message(completion_msg.clone());
-        println!("{}", completion_msg);
+    } else if old_dir.exists() && model_dir.exists() {
+        let _ = fs::remove_dir_all(&old_dir);
+    }
+    Ok(())
+}
 
-        Ok(info)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChecksumInfo {
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledModelInfo {
+    pub model_id: String,
+    pub source_url: String,
+    pub archive_sha256: String,
+    pub files: HashMap<String, FileChecksumInfo>,
+    pub license: String,
+    pub license_url: String,
+    pub attribution: String,
+    pub installed_at: String,
+}
+
+impl InstalledModelInfo {
+    pub fn load(model_dir: &Path) -> Result<Self, String> {
+        let path = model_dir.join("MODEL_INFO.json");
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Corrupt {}: {}", path.display(), e))
+    }
+}
+
+pub fn generate_and_save_model_info(
+    manifest_entry: &ModelManifestEntry,
+    archive_sha256: &str,
+    model_dir: &Path,
+) -> Result<(), String> {
+    let mut files_map = HashMap::new();
+    let entries = fs::read_dir(model_dir)
+        .map_err(|e| format!("Failed to read {}: {}", model_dir.display(), e))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if name == "MODEL_INFO.json" {
+                continue;
+            }
+            let size = match fs::metadata(&path) {
+                Ok(m) => m.len(),
+                Err(e) => return Err(format!("Failed to stat {}: {}", path.display(), e)),
+            };
+            let hash = compute_file_sha256(&path)?;
+            files_map.insert(
+                name,
+                FileChecksumInfo {
+                    sha256: hash,
+                    size_bytes: size,
+                },
+            );
+        }
+    }
+
+    let now_ts = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(dur) => dur.as_secs().to_string(),
+        Err(_) => "0".to_string(),
+    };
+
+    let info = InstalledModelInfo {
+        model_id: manifest_entry.id.clone(),
+        source_url: manifest_entry.url.clone(),
+        archive_sha256: archive_sha256.to_string(),
+        files: files_map,
+        license: manifest_entry.license.clone(),
+        license_url: manifest_entry.license_url.clone(),
+        attribution: manifest_entry.attribution.clone(),
+        installed_at: now_ts,
+    };
+
+    let json_content = serde_json::to_string_pretty(&info)
+        .map_err(|e| format!("Failed to serialize MODEL_INFO.json: {}", e))?;
+    let info_path = model_dir.join("MODEL_INFO.json");
+    fs::write(&info_path, json_content)
+        .map_err(|e| format!("Failed to write {}: {}", info_path.display(), e))?;
+
+    Ok(())
+}
+
+pub fn download_and_install_model<F: Fetcher>(
+    model_type: LocalModelType,
+    target_dir: &Path,
+    fetcher: &F,
+    manifest: Option<&ModelsManifest>,
+) -> Result<ModelInfo, String> {
+    let embedded = ModelsManifest::embedded()?;
+    let manifest = manifest.unwrap_or(&embedded);
+    let entry = manifest.get(model_type.folder_name()).ok_or_else(|| {
+        format!(
+            "error: model '{}' does not have a pinned checksum in this build.\nhint: run 'scripts/update-model-manifest.sh' or set up a verified build.",
+            model_type.folder_name()
+        )
+    })?;
+
+    entry.validate_for_download()?;
+
+    println!("Model: {}", model_type.display_name());
+    println!("License: {} ({})", entry.license, entry.license_url);
+    println!("Attribution: {}", entry.attribution);
+
+    let models_root = target_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let staging_root = models_root.join(".staging");
+    fs::create_dir_all(&staging_root).map_err(|e| {
+        format!("Failed to create staging directory {}: {}", staging_root.display(), e)
+    })?;
+
+    clean_stale_staging_dirs(&staging_root);
+
+    let required_bytes = compute_required_disk_space(entry.size_bytes, entry.max_extracted_bytes);
+    check_disk_space(target_dir, required_bytes)?;
+
+    recover_interrupted_install(target_dir, model_type.folder_name())?;
+
+    let pid = std::process::id();
+    let attempt_staging = staging_root.join(format!("{}-{}", model_type.folder_name(), pid));
+    if attempt_staging.exists() {
+        let _ = fs::remove_dir_all(&attempt_staging);
+    }
+    fs::create_dir_all(&attempt_staging).map_err(|e| {
+        format!("Failed to create staging attempt directory {}: {}", attempt_staging.display(), e)
+    })?;
+
+    let archive_path = attempt_staging.join("archive.tar.bz2");
+    let extracted_dir = attempt_staging.join("extracted");
+
+    let pb = ProgressBar::new(entry.size_bytes);
+    let style = ProgressStyle::with_template(
+        "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("##-");
+    pb.set_style(style);
+    pb.set_message("Downloading verified model archive...");
+
+    let mut on_progress = |bytes: u64| {
+        pb.set_position(bytes);
+    };
+
+    let fetch_res = fetcher.fetch(
+        &entry.url,
+        &archive_path,
+        entry.size_bytes,
+        Some(&mut on_progress),
+    );
+
+    let actual_sha256 = match fetch_res {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&attempt_staging);
+            return Err(e);
+        }
+    };
+    pb.finish_with_message("Download complete. Verifying SHA-256 integrity...");
+
+    let archive_size = match fs::metadata(&archive_path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&attempt_staging);
+            return Err(format!("Failed to inspect staging archive {}: {}", archive_path.display(), e));
+        }
+    };
+    if archive_size != entry.size_bytes {
+        let _ = fs::remove_dir_all(&attempt_staging);
+        return Err(format!(
+            "Archive size mismatch for '{}': expected {} bytes, got {}. Nothing was extracted.",
+            entry.id, entry.size_bytes, archive_size
+        ));
+    }
+
+    const EMPTY_INPUT_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    if !actual_sha256.eq_ignore_ascii_case(&entry.sha256) {
+        let _ = fs::remove_dir_all(&attempt_staging);
+        if actual_sha256.eq_ignore_ascii_case(EMPTY_INPUT_SHA256) {
+            return Err(format!(
+                "SHA-256 checksum mismatch for '{}': empty download (actual: {}). Expected {}. Nothing was extracted.",
+                entry.id, actual_sha256, entry.sha256
+            ));
+        }
+        return Err(format!(
+            "SHA-256 checksum mismatch for '{}': expected {}, got {}. Nothing was extracted.",
+            entry.id, entry.sha256, actual_sha256
+        ));
+    }
+
+    println!("[✓] Checksum verified: {}", actual_sha256);
+    println!("Extracting archive safely...");
+
+    if let Err(e) = safe_extract_tar_bz2(
+        &archive_path,
+        &extracted_dir,
+        entry.max_files,
+        entry.max_extracted_bytes,
+    ) {
+        let _ = fs::remove_dir_all(&attempt_staging);
+        return Err(format!("Safe extraction failed: {}", e));
+    }
+
+    let verified_info = match ModelManager::verify_model_files(model_type, &extracted_dir) {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&attempt_staging);
+            return Err(format!("Extracted assets failed file verification: {}", e));
+        }
+    };
+
+    let old_dir = PathBuf::from(format!("{}.old", target_dir.display()));
+    if old_dir.exists() {
+        let _ = fs::remove_dir_all(&old_dir);
+    }
+
+    let had_previous = target_dir.exists();
+    if had_previous {
+        fs::rename(target_dir, &old_dir).map_err(|e| {
+            let _ = fs::remove_dir_all(&attempt_staging);
+            format!("Failed to backup current model to {}: {}", old_dir.display(), e)
+        })?;
+    }
+
+    if let Err(e) = fs::rename(&extracted_dir, target_dir) {
+        if had_previous && old_dir.exists() {
+            let _ = fs::rename(&old_dir, target_dir);
+        }
+        let _ = fs::remove_dir_all(&attempt_staging);
+        return Err(format!("Failed to promote model directory: {}", e));
+    }
+
+    if old_dir.exists() {
+        let _ = fs::remove_dir_all(&old_dir);
+    }
+
+    if let Err(e) = generate_and_save_model_info(entry, &actual_sha256, target_dir) {
+        eprintln!("Warning: Failed to write MODEL_INFO.json: {}", e);
+    }
+
+    let _ = fs::remove_dir_all(&attempt_staging);
+
+    let completion_msg = format!(
+        "[✓] Successfully installed {} to {}",
+        model_type.folder_name(),
+        target_dir.display()
+    );
+    println!("{}", completion_msg);
+
+    Ok(verified_info)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedModelTarget {
+    CloudProvider {
+        provider: String,
+        default_model: String,
+    },
+    LocalModel {
+        model_type: LocalModelType,
+        canonical_name: &'static str,
+    },
+}
+
+pub fn resolve_model_target(name: &str) -> Result<ResolvedModelTarget, String> {
+    let raw_trimmed = name.trim();
+    if raw_trimmed.is_empty() {
+        return Err("Model name cannot be empty.".to_string());
+    }
+
+    let normalized = raw_trimmed.to_lowercase().replace('_', "-");
+
+    // (a) Provider names
+    match normalized.as_str() {
+        "sarvam" | "saaras:v4" | "sarvam:saaras-v4" | "saaras" => {
+            return Ok(ResolvedModelTarget::CloudProvider {
+                provider: "sarvam".to_string(),
+                default_model: "saaras:v4".to_string(),
+            });
+        }
+        "groq" => {
+            return Ok(ResolvedModelTarget::CloudProvider {
+                provider: "groq".to_string(),
+                default_model: crate::inference::DEFAULT_GROQ_MODEL.to_string(),
+            });
+        }
+        "openai" => {
+            return Ok(ResolvedModelTarget::CloudProvider {
+                provider: "openai".to_string(),
+                default_model: crate::inference::DEFAULT_OPENAI_MODEL.to_string(),
+            });
+        }
+        "openai-compatible" => {
+            return Ok(ResolvedModelTarget::CloudProvider {
+                provider: "openai-compatible".to_string(),
+                default_model: crate::inference::DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    // (b) Names not on the roster
+    if normalized.starts_with("phonon") || normalized.starts_with("voxtral") {
+        return Err(format!(
+            "Oh, darling! '{}' isn't on Speechyyy's roster. Run 'speechyyy models' to see what's ready to roll!",
+            raw_trimmed
+        ));
+    }
+
+    // (c) Alias normalization & (d) Manifest/model lookup
+    match normalized.as_str() {
+        "whisper-large-v3-turbo" | "whisper-turbo" | "turbo" => {
+            Ok(ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::WhisperLargeV3Turbo,
+                canonical_name: "whisper-large-v3-turbo",
+            })
+        }
+        "parakeet-tdt-v3" | "parakeet-v3" | "parakeet" => {
+            Ok(ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::ParakeetTdtV3,
+                canonical_name: "parakeet-tdt-v3",
+            })
+        }
+        "whisper-small" | "small" => {
+            Ok(ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::WhisperSmall,
+                canonical_name: "whisper-small",
+            })
+        }
+        "moonshine-base" | "moonshine" => {
+            Ok(ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::MoonshineBase,
+                canonical_name: "moonshine-base",
+            })
+        }
+        #[cfg(target_os = "macos")]
+        "apple-speech" | "apple" => {
+            Ok(ResolvedModelTarget::CloudProvider {
+                provider: "apple".to_string(),
+                default_model: "apple-speech".to_string(),
+            })
+        }
+        _ => Err(unsupported_model_error(raw_trimmed)),
     }
 }
 
@@ -325,12 +1238,20 @@ pub fn is_sarvam_cloud_model(name: &str) -> bool {
     )
 }
 
+/// Checks if a model identifier refers to another cloud provider (Groq or OpenAI).
+pub fn is_cloud_provider(name: &str) -> bool {
+    matches!(
+        name.trim().to_lowercase().replace('_', "-").as_str(),
+        "groq" | "openai"
+    )
+}
+
 /// Generates a descriptive error message listing all supported local and cloud models.
 pub fn unsupported_model_error(model: &str) -> String {
     #[cfg(target_os = "macos")]
-    let supported = "Cloud: saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base, apple-speech.";
+    let supported = "Cloud: groq, openai, openai-compatible, saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base, apple-speech.";
     #[cfg(not(target_os = "macos"))]
-    let supported = "Cloud: saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base.";
+    let supported = "Cloud: groq, openai, openai-compatible, saaras:v4 (sarvam:saaras-v4). Local: parakeet-tdt-v3, whisper-small, whisper-large-v3-turbo, moonshine-base.";
     format!(
         "Unsupported model '{}'. Supported models: {}",
         model, supported
@@ -378,63 +1299,125 @@ where
     C: FnMut() -> Result<bool, String>,
     F: FnMut() -> Result<String, String>,
 {
-    let trimmed = model_name.trim();
+    let target = resolve_model_target(model_name)?;
     let cfg = crate::config::Config::load_from_path(config_path);
     let nickname = cfg.nickname();
-    if is_sarvam_cloud_model(trimmed) {
-        if let Some(key) = cfg.inference.resolve_api_key() {
-            if !key.trim().is_empty() {
-                let should_replace = if force {
-                    true
-                } else {
-                    confirm_replace_fn()?
-                };
 
-                if !should_replace {
-                    println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
-                    println!(
-                        "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
-                        nickname
-                    );
-                    return Ok(());
+    match target {
+        ResolvedModelTarget::CloudProvider { provider, .. } => {
+            if provider == "sarvam" {
+                if let Some(key) = cfg.inference.resolve_api_key() {
+                    if !key.trim().is_empty() {
+                        let should_replace = if force {
+                            true
+                        } else {
+                            confirm_replace_fn()?
+                        };
+
+                        if !should_replace {
+                            println!("[✓] Sarvam API key is already configured. saaras:v4 is ready to use.");
+                            println!(
+                                "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
+                                nickname
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
+
+                let raw_key = prompt_key_fn()?;
+                let key = raw_key.trim().trim_matches('"');
+                if key.is_empty() {
+                    return Err("Sarvam API key cannot be empty.".to_string());
+                }
+
+                crate::config::Config::save_sarvam_credentials_in_file(config_path, key)?;
+                println!("[✓] Sarvam API key configured successfully. saaras:v4 is ready to use.");
+                println!(
+                    "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
+                    nickname
+                );
+                Ok(())
+            } else if provider == "groq" || provider == "openai" {
+                let (prov_name, env_var) = if provider == "groq" {
+                    ("Groq", "GROQ_API_KEY")
+                } else {
+                    ("OpenAI", "OPENAI_API_KEY")
+                };
+                let key_opt = cfg.inference.resolve_key_for_provider(&provider);
+                println!(
+                    "[i] {} is a cloud provider — there are no weights to download onto your machine.",
+                    prov_name
+                );
+                match key_opt {
+                    Some((_, source)) => {
+                        println!("[✓] {} API key is configured (source: {}).", prov_name, source);
+                        println!(
+                            "[✓] Run 'speechyyy use {}' whenever you want me to speak it, {}!",
+                            provider,
+                            nickname
+                        );
+                    }
+                    None => {
+                        println!("[!] No {} API key is configured.", prov_name);
+                        use std::io::{stdin, IsTerminal};
+                        if stdin().is_terminal() {
+                            let raw_key = prompt_key_fn()?;
+                            let key = raw_key.trim().trim_matches('"');
+                            if !key.is_empty() {
+                                if provider == "groq" {
+                                    crate::config::Config::save_groq_credentials_in_file(config_path, key)?;
+                                } else {
+                                    crate::config::Config::save_openai_credentials_in_file(config_path, key)?;
+                                }
+                                println!("[✓] {} API key configured successfully.", prov_name);
+                                println!(
+                                    "[✓] Run 'speechyyy use {}' whenever you want me to speak it, {}!",
+                                    provider,
+                                    nickname
+                                );
+                            } else {
+                                println!("[!] Blank key entered. Configuration unchanged.");
+                            }
+                        } else {
+                            println!(
+                                "[i] To configure, set {} in your environment or run 'speechyyy use {}' in an interactive terminal.",
+                                env_var,
+                                provider
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            } else {
+                println!(
+                    "[i] {} is an endpoint provider — there are no weights to download onto your machine.",
+                    provider
+                );
+                Ok(())
             }
         }
-
-        let raw_key = prompt_key_fn()?;
-        let key = raw_key.trim().trim_matches('"');
-        if key.is_empty() {
-            return Err("Sarvam API key cannot be empty.".to_string());
+        ResolvedModelTarget::LocalModel { model_type, canonical_name } => {
+            let target_dir = match models_dir {
+                Some(d) => d.join(canonical_name),
+                None => ModelManager::model_dir(model_type),
+            };
+            ModelManager::download_model(model_type, &target_dir)?;
+            println!(
+                "[✓] Model '{}' is all yours, {}! Run 'speechyyy use {}' whenever you want me to speak it.",
+                canonical_name,
+                nickname,
+                canonical_name
+            );
+            Ok(())
         }
-
-        crate::config::Config::save_sarvam_credentials_in_file(config_path, key)?;
-        println!("[✓] Sarvam API key configured successfully. saaras:v4 is ready to use.");
-        println!(
-            "[✓] Model 'saaras:v4' is all yours, {}! Run 'speechyyy use saaras:v4' whenever you want me to speak it.",
-            nickname
-        );
-        Ok(())
-    } else if let Some(local_type) = LocalModelType::from_str_name(trimmed) {
-        let target_dir = match models_dir {
-            Some(d) => d.join(local_type.folder_name()),
-            None => ModelManager::model_dir(local_type),
-        };
-        ModelManager::download_model(local_type, &target_dir)?;
-        println!(
-            "[✓] Model '{}' is all yours, {}! Run 'speechyyy use {}' whenever you want me to speak it.",
-            local_type.folder_name(),
-            nickname,
-            local_type.folder_name()
-        );
-        Ok(())
-    } else {
-        Err(unsupported_model_error(trimmed))
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupportedModel {
     pub id: &'static str,
+    pub alias: Option<&'static str>,
     pub provider_name: &'static str,
     pub provider_type: &'static str,
     pub is_local: bool,
@@ -443,14 +1426,8 @@ pub struct SupportedModel {
 
 pub const SUPPORTED_MODELS: &[SupportedModel] = &[
     SupportedModel {
-        id: "saaras:v4",
-        provider_name: "Sarvam AI Cloud",
-        provider_type: "sarvam",
-        is_local: false,
-        local_type: None,
-    },
-    SupportedModel {
         id: "parakeet-tdt-v3",
+        alias: Some("parakeet-v3"),
         provider_name: "Local Transducer",
         provider_type: "local",
         is_local: true,
@@ -458,6 +1435,7 @@ pub const SUPPORTED_MODELS: &[SupportedModel] = &[
     },
     SupportedModel {
         id: "whisper-small",
+        alias: None,
         provider_name: "Local Whisper",
         provider_type: "local",
         is_local: true,
@@ -465,6 +1443,7 @@ pub const SUPPORTED_MODELS: &[SupportedModel] = &[
     },
     SupportedModel {
         id: "whisper-large-v3-turbo",
+        alias: Some("whisper-turbo"),
         provider_name: "Local Whisper",
         provider_type: "local",
         is_local: true,
@@ -472,14 +1451,48 @@ pub const SUPPORTED_MODELS: &[SupportedModel] = &[
     },
     SupportedModel {
         id: "moonshine-base",
+        alias: None,
         provider_name: "Local Moonshine",
         provider_type: "local",
         is_local: true,
         local_type: Some(LocalModelType::MoonshineBase),
     },
+    SupportedModel {
+        id: "saaras:v4",
+        alias: Some("sarvam"),
+        provider_name: "Sarvam AI Cloud",
+        provider_type: "sarvam",
+        is_local: false,
+        local_type: None,
+    },
+    SupportedModel {
+        id: "groq",
+        alias: None,
+        provider_name: "Groq Cloud (Whisper)",
+        provider_type: "groq",
+        is_local: false,
+        local_type: None,
+    },
+    SupportedModel {
+        id: "openai",
+        alias: None,
+        provider_name: "OpenAI Cloud (Whisper)",
+        provider_type: "openai",
+        is_local: false,
+        local_type: None,
+    },
+    SupportedModel {
+        id: "openai-compatible",
+        alias: None,
+        provider_name: "OpenAI-compatible Endpoint",
+        provider_type: "openai-compatible",
+        is_local: false,
+        local_type: None,
+    },
     #[cfg(target_os = "macos")]
     SupportedModel {
         id: "apple-speech",
+        alias: Some("apple"),
         provider_name: "Apple Native",
         provider_type: "apple",
         is_local: false,
@@ -500,19 +1513,21 @@ pub fn check_local_model_exists(model_type: LocalModelType, base_dir: Option<&Pa
 }
 
 pub fn is_model_active(cfg: &crate::config::Config, model_id: &str) -> bool {
-    if cfg.inference.model.trim().is_empty() {
-        return false;
-    }
+    let prov = cfg.inference.provider.to_lowercase();
     match model_id {
         "saaras:v4" => {
-            cfg.inference.provider.eq_ignore_ascii_case("sarvam")
+            prov == "sarvam"
                 && (cfg.inference.model.eq_ignore_ascii_case("saaras:v4")
-                    || cfg.inference.model.eq_ignore_ascii_case("sarvam:saaras-v4"))
+                    || cfg.inference.model.eq_ignore_ascii_case("sarvam:saaras-v4")
+                    || cfg.inference.model.is_empty())
         }
+        "groq" => prov == "groq",
+        "openai" => prov == "openai",
+        "openai-compatible" => prov == "openai-compatible",
         #[cfg(target_os = "macos")]
-        "apple-speech" => cfg.inference.provider.eq_ignore_ascii_case("apple"),
+        "apple-speech" => prov == "apple",
         preset => {
-            if !cfg.inference.provider.eq_ignore_ascii_case("local") {
+            if prov != "local" {
                 return false;
             }
             if let Some(target_type) = LocalModelType::from_str_name(preset) {
@@ -531,8 +1546,8 @@ pub fn format_model_list_with_models_dir(
 ) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
-        "{:<24} {:<18} {:<16} {}",
-        "NAME", "PROVIDER", "STATUS", "ACTIVE"
+        "{:<24} {:<16} {:<8} {:<26} {:<16} {}",
+        "NAME", "ALIAS", "TYPE", "PROVIDER", "STATUS", "ACTIVE"
     ));
 
     for model in SUPPORTED_MODELS {
@@ -541,6 +1556,9 @@ pub fn format_model_list_with_models_dir(
         } else {
             "no"
         };
+
+        let alias_str = model.alias.unwrap_or("-");
+        let type_str = if model.is_local { "local" } else { "cloud" };
 
         let status_str = if model.is_local {
             if let Some(lt) = model.local_type {
@@ -552,26 +1570,60 @@ pub fn format_model_list_with_models_dir(
             } else {
                 "Unknown"
             }
-        } else if model.provider_type == "sarvam" {
-            let has_key = !cfg.inference.api_key.trim().is_empty()
-                || std::env::var("SARVAM_API_KEY").is_ok_and(|k| !k.trim().is_empty());
-            if has_key {
-                "Configured"
-            } else {
-                "API Key Required"
-            }
         } else {
-            "Available"
+            match model.provider_type {
+                "sarvam" => {
+                    let has_key = cfg
+                        .inference
+                        .resolve_api_key()
+                        .is_some_and(|k| !k.trim().is_empty());
+                    if has_key {
+                        "Configured"
+                    } else {
+                        "API Key Required"
+                    }
+                }
+                "groq" => {
+                    let has_key = cfg.inference.resolve_key_for_provider("groq").is_some();
+                    if has_key {
+                        "Configured"
+                    } else {
+                        "API Key Required"
+                    }
+                }
+                "openai" => {
+                    let has_key = cfg.inference.resolve_key_for_provider("openai").is_some();
+                    if has_key {
+                        "Configured"
+                    } else {
+                        "API Key Required"
+                    }
+                }
+                "openai-compatible" => {
+                    let has_endpoint = cfg
+                        .inference
+                        .openai_compatible_endpoint
+                        .as_ref()
+                        .is_some_and(|e| !e.trim().is_empty());
+                    if has_endpoint {
+                        "Configured"
+                    } else {
+                        "Endpoint Required"
+                    }
+                }
+                _ => "Available",
+            }
         };
 
         lines.push(format!(
-            "{:<24} {:<18} {:<16} {}",
-            model.id, model.provider_name, status_str, active_str
+            "{:<24} {:<16} {:<8} {:<26} {:<16} {}",
+            model.id, alias_str, type_str, model.provider_name, status_str, active_str
         ));
     }
 
     lines.push(String::new());
     lines.push("Tip: For custom ONNX models, set provider = 'custom' in ~/.config/speechyyy/config.toml".to_string());
+    lines.push("Tip: Run 'speechyyy use <model>' to activate, or 'speechyyy download <model>' to fetch weights.".to_string());
 
     lines.join("\n")
 }
@@ -600,73 +1652,73 @@ pub fn resolve_model_use(
     models_dir: Option<&Path>,
     config_path: Option<&Path>,
 ) -> Result<(String, String, Option<String>), String> {
-    let lower = model_arg.trim().to_lowercase().replace('_', "-");
-    match lower.as_str() {
-        s if is_sarvam_cloud_model(s) => {
+    let target = resolve_model_target(model_arg)?;
+    match target {
+        ResolvedModelTarget::CloudProvider { provider, default_model } => {
             let cfg = match config_path {
                 Some(p) => crate::config::Config::load_from_path(p),
                 None => crate::config::Config::load(),
             };
-            let has_key = cfg
-                .inference
-                .resolve_api_key()
-                .map(|k| !k.trim().is_empty())
-                .unwrap_or(false);
-
-            let notice = if !has_key {
-                Some("[!] No API key found. Run 'speechyyy download saaras:v4' first to configure.".to_string())
-            } else {
-                None
+            let notice = match provider.as_str() {
+                "sarvam" => {
+                    let has_key = cfg
+                        .inference
+                        .resolve_api_key()
+                        .is_some_and(|k| !k.trim().is_empty());
+                    if !has_key {
+                        Some("[!] No API key found. Run 'speechyyy download saaras:v4' first to configure.".to_string())
+                    } else {
+                        None
+                    }
+                }
+                "groq" => {
+                    let has_key = cfg.inference.resolve_key_for_provider("groq").is_some();
+                    if !has_key {
+                        Some("[!] No Groq API key found. Set GROQ_API_KEY in config.toml or environment.".to_string())
+                    } else {
+                        None
+                    }
+                }
+                "openai" => {
+                    let has_key = cfg.inference.resolve_key_for_provider("openai").is_some();
+                    if !has_key {
+                        Some("[!] No OpenAI API key found. Set OPENAI_API_KEY in config.toml or environment.".to_string())
+                    } else {
+                        None
+                    }
+                }
+                "openai-compatible" => {
+                    let has_endpoint = cfg
+                        .inference
+                        .openai_compatible_endpoint
+                        .as_ref()
+                        .is_some_and(|e| !e.trim().is_empty());
+                    if !has_endpoint {
+                        Some("[!] No OpenAI-compatible endpoint configured. Set 'openai_compatible_endpoint' in config.toml.".to_string())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             };
-            Ok(("sarvam".to_string(), "saaras:v4".to_string(), notice))
+            let model = if provider == "openai-compatible" {
+                cfg.inference
+                    .openai_compatible_model
+                    .unwrap_or(default_model)
+            } else {
+                default_model
+            };
+            Ok((provider, model, notice))
         }
-        "parakeet-tdt-v3" | "parakeet-v3" => {
-            let lt = LocalModelType::ParakeetTdtV3;
-            let exists = check_local_model_exists(lt, models_dir);
+        ResolvedModelTarget::LocalModel { model_type, canonical_name } => {
+            let exists = check_local_model_exists(model_type, models_dir);
             let notice = if !exists {
-                Some("Weights not found. Run `speechyyy model download -m parakeet-tdt-v3`".to_string())
+                Some(format!("Weights not found. Run `speechyyy model download -m {}`", canonical_name))
             } else {
                 None
             };
-            Ok(("local".to_string(), "parakeet-tdt-v3".to_string(), notice))
+            Ok(("local".to_string(), canonical_name.to_string(), notice))
         }
-        "whisper-small" => {
-            let lt = LocalModelType::WhisperSmall;
-            let exists = check_local_model_exists(lt, models_dir);
-            let notice = if !exists {
-                Some("Weights not found. Run `speechyyy model download -m whisper-small`".to_string())
-            } else {
-                None
-            };
-            Ok(("local".to_string(), "whisper-small".to_string(), notice))
-        }
-        "whisper-large-v3-turbo" | "whisper-turbo" => {
-            let lt = LocalModelType::WhisperLargeV3Turbo;
-            let exists = check_local_model_exists(lt, models_dir);
-            let notice = if !exists {
-                Some("Weights not found. Run `speechyyy model download -m whisper-large-v3-turbo`".to_string())
-            } else {
-                None
-            };
-            Ok((
-                "local".to_string(),
-                "whisper-large-v3-turbo".to_string(),
-                notice,
-            ))
-        }
-        "moonshine-base" => {
-            let lt = LocalModelType::MoonshineBase;
-            let exists = check_local_model_exists(lt, models_dir);
-            let notice = if !exists {
-                Some("Weights not found. Run `speechyyy model download -m moonshine-base`".to_string())
-            } else {
-                None
-            };
-            Ok(("local".to_string(), "moonshine-base".to_string(), notice))
-        }
-        #[cfg(target_os = "macos")]
-        "apple-speech" => Ok(("apple".to_string(), "apple-speech".to_string(), None)),
-        _ => Err(unsupported_model_error(model_arg)),
     }
 }
 
@@ -695,6 +1747,86 @@ pub fn handle_model_use_command_internal(
 
 pub fn handle_model_use_command(model_arg: &str) -> Result<(), String> {
     let config_path = crate::config::Config::config_path();
+    let lower = model_arg.trim().to_lowercase().replace('_', "-");
+
+    // 1. If key / endpoint missing for cloud providers, prompt interactively
+    if lower == "groq" {
+        let cfg = crate::config::Config::load_from_path(&config_path);
+        if cfg.inference.resolve_key_for_provider("groq").is_none() {
+            use std::io::{stdin, IsTerminal};
+            if !stdin().is_terminal() {
+                return Err("GROQ_API_KEY is not configured. Set GROQ_API_KEY in environment or run 'speechyyy use groq' in an interactive terminal.".to_string());
+            }
+            let key = rpassword::prompt_password("✦ Enter your Groq API Key: ")
+                .map_err(|e| format!("Failed to read API key: {}", e))?;
+            let trimmed = key.trim().trim_matches('"');
+            if trimmed.is_empty() {
+                return Err("Blank entry. Cancelled — configuration unchanged.".to_string());
+            }
+            crate::config::Config::save_groq_credentials_in_file(&config_path, trimmed)?;
+        }
+    } else if lower == "openai" {
+        let cfg = crate::config::Config::load_from_path(&config_path);
+        if cfg.inference.resolve_key_for_provider("openai").is_none() {
+            use std::io::{stdin, IsTerminal};
+            if !stdin().is_terminal() {
+                return Err("OPENAI_API_KEY is not configured. Set OPENAI_API_KEY in environment or run 'speechyyy use openai' in an interactive terminal.".to_string());
+            }
+            let key = rpassword::prompt_password("✦ Enter your OpenAI API Key: ")
+                .map_err(|e| format!("Failed to read API key: {}", e))?;
+            let trimmed = key.trim().trim_matches('"');
+            if trimmed.is_empty() {
+                return Err("Blank entry. Cancelled — configuration unchanged.".to_string());
+            }
+            crate::config::Config::save_openai_credentials_in_file(&config_path, trimmed)?;
+        }
+    } else if lower == "openai-compatible" {
+        let cfg = crate::config::Config::load_from_path(&config_path);
+        if cfg
+            .inference
+            .openai_compatible_endpoint
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            use std::io::{stdin, stdout, IsTerminal, Write};
+            if !stdin().is_terminal() {
+                return Err("OpenAI-compatible endpoint is not configured. Set 'openai_compatible_endpoint' in config.toml or run 'speechyyy use openai-compatible' in an interactive terminal.".to_string());
+            }
+            print!("✦ Enter your OpenAI-compatible endpoint URL (e.g. http://localhost:11434/v1): ");
+            let _ = stdout().flush();
+            let mut line = String::new();
+            stdin()
+                .read_line(&mut line)
+                .map_err(|e| format!("Failed to read endpoint: {}", e))?;
+            let endpoint = line.trim();
+            if endpoint.is_empty() {
+                return Err("Blank entry. Cancelled — configuration unchanged.".to_string());
+            }
+            crate::inference::validate_endpoint(endpoint)
+                .map_err(|e| format!("Invalid endpoint: {}", e))?;
+
+            let key_input = rpassword::prompt_password(
+                "✦ Enter an optional API Key (press Enter to skip): ",
+            )
+            .unwrap_or_default();
+            let trimmed_key = key_input.trim().trim_matches('"');
+            let key_opt = if trimmed_key.is_empty() {
+                None
+            } else {
+                Some(trimmed_key)
+            };
+
+            crate::config::Config::save_openai_compatible_config_in_file(
+                &config_path,
+                endpoint,
+                Some("whisper-1"),
+                key_opt,
+            )?;
+        }
+    }
+
     let result = handle_model_use_command_internal(
         model_arg,
         &config_path,
@@ -705,9 +1837,39 @@ pub fn handle_model_use_command(model_arg: &str) -> Result<(), String> {
         println!("{}", notice);
     }
 
-    let config = crate::config::Config::load_from_path(&config_path);
-    let nickname = config.nickname();
+    // Privacy notice
+    let cfg = crate::config::Config::load_from_path(&config_path);
+    match result.provider.as_str() {
+        "groq" => {
+            println!("[i] Privacy notice: Audio will be streamed to api.groq.com for transcription.");
+        }
+        "openai" => {
+            println!("[i] Privacy notice: Audio will be streamed to api.openai.com for transcription.");
+        }
+        "sarvam" => {
+            println!("[i] Privacy notice: Audio will be streamed to api.sarvam.ai for transcription.");
+        }
+        "openai-compatible" => {
+            if let Some(endpoint) = cfg.inference.openai_compatible_endpoint.as_deref() {
+                let host = crate::inference::extract_endpoint_host(endpoint)
+                    .unwrap_or_else(|| "endpoint".to_string());
+                if crate::inference::is_loopback_host(&host) {
+                    println!(
+                        "[i] Privacy notice: Audio stays on this machine ({}) — no external network calls.",
+                        host
+                    );
+                } else {
+                    println!(
+                        "[i] Privacy notice: Audio will be streamed to {} for transcription.",
+                        host
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
 
+    let nickname = cfg.nickname();
     let paths = crate::ipc::RuntimePaths::new();
     let is_running = crate::ipc::PidFile::read_pid(&paths.pid_path)
         .is_some_and(crate::ipc::PidFile::is_process_running);
@@ -757,28 +1919,32 @@ pub fn handle_model_remove_full(
     config_path: Option<&Path>,
     paths_override: Option<&crate::ipc::RuntimePaths>,
 ) -> Result<(), String> {
-    let trimmed = model_name.trim();
-    if trimmed.is_empty() {
-        return Err("Model name cannot be empty".to_string());
-    }
+    let target = resolve_model_target(model_name)?;
+    let (lt, canonical_name) = match target {
+        ResolvedModelTarget::CloudProvider { provider, .. } => {
+            return Err(format!(
+                "Cannot remove cloud provider '{}': cloud providers do not store local model weights.",
+                provider
+            ));
+        }
+        ResolvedModelTarget::LocalModel { model_type, canonical_name } => (model_type, canonical_name),
+    };
 
     let base_dir = models_dir
         .map(PathBuf::from)
         .unwrap_or_else(ModelManager::default_models_dir);
 
-    let target_dir = if let Some(lt) = LocalModelType::from_str_name(trimmed) {
-        let preset_dir = base_dir.join(lt.folder_name());
+    let target_dir = {
+        let preset_dir = base_dir.join(canonical_name);
         if preset_dir.exists() {
             preset_dir
         } else {
-            base_dir.join(trimmed)
+            base_dir.join(lt.folder_name())
         }
-    } else {
-        base_dir.join(trimmed)
     };
 
     if !target_dir.exists() {
-        println!("[!] Model '{}' is not installed locally.", trimmed);
+        println!("[!] Model '{}' is not installed locally.", canonical_name);
         return Ok(());
     }
 
@@ -791,7 +1957,7 @@ pub fn handle_model_remove_full(
     };
     let nickname = cfg.nickname();
 
-    if is_model_active(&cfg, trimmed) {
+    if is_model_active(&cfg, canonical_name) {
         let paths = paths_override.cloned().unwrap_or_else(crate::ipc::RuntimePaths::new);
         let is_running = crate::ipc::PidFile::read_pid(&paths.pid_path)
             .is_some_and(crate::ipc::PidFile::is_process_running)
@@ -807,7 +1973,7 @@ pub fn handle_model_remove_full(
 
         println!(
             "[!] Notice: '{}' was your active model, {}. Speechyyy has been stopped and deactivated. Pick another model with 'speechyyy use <model>' whenever you're ready.",
-            trimmed, nickname
+            canonical_name, nickname
         );
     }
 
@@ -817,7 +1983,7 @@ pub fn handle_model_remove_full(
     let size_str = format!("{:.1} MB", size_mb);
     println!(
         "[✓] Removed '{}', {}. Reclaimed {} for you.",
-        trimmed, nickname, size_str
+        canonical_name, nickname, size_str
     );
 
     Ok(())
@@ -1236,5 +2402,97 @@ mod tests {
         assert!(err_msg.contains("parakeet-tdt-v3"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_model_target_whisper_turbo_and_never_groq() {
+        let res_alias = resolve_model_target("whisper-turbo").unwrap();
+        assert_eq!(
+            res_alias,
+            ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::WhisperLargeV3Turbo,
+                canonical_name: "whisper-large-v3-turbo",
+            }
+        );
+
+        let res_canonical = resolve_model_target("whisper-large-v3-turbo").unwrap();
+        assert_eq!(
+            res_canonical,
+            ResolvedModelTarget::LocalModel {
+                model_type: LocalModelType::WhisperLargeV3Turbo,
+                canonical_name: "whisper-large-v3-turbo",
+            }
+        );
+
+        let res_groq = resolve_model_target("groq").unwrap();
+        assert!(matches!(
+            res_groq,
+            ResolvedModelTarget::CloudProvider { ref provider, .. } if provider == "groq"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_model_target_phonon_and_voxtral_roster_rejection() {
+        let rejected_inputs = ["phonon", "Phonon-2", "phonon-2.5", "voxtral", "Voxtral-Small"];
+        for input in rejected_inputs {
+            let err = resolve_model_target(input).unwrap_err();
+            assert!(
+                err.contains("isn't on Speechyyy's roster"),
+                "Expected roster rejection for '{}', got: {}",
+                input,
+                err
+            );
+            assert!(
+                err.contains("speechyyy models"),
+                "Expected advice to check 'speechyyy models' for '{}', got: {}",
+                input,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_whisper_turbo_alias_in_use_and_remove() {
+        let temp_dir = std::env::temp_dir().join(format!("test_turbo_alias_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let models_dir = temp_dir.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        // 1. resolve_model_use("whisper-turbo") must resolve to local whisper-large-v3-turbo
+        let (prov, model, _) = resolve_model_use("whisper-turbo", Some(&models_dir), None).unwrap();
+        assert_eq!(prov, "local");
+        assert_eq!(model, "whisper-large-v3-turbo");
+
+        // 2. handle_model_remove_full("whisper-turbo") targets whisper-large-v3-turbo directory
+        let turbo_dir = models_dir.join("whisper-large-v3-turbo");
+        fs::create_dir_all(&turbo_dir).unwrap();
+        fs::write(turbo_dir.join("dummy.bin"), b"dummy model data").unwrap();
+
+        let rem_res = handle_model_remove_full("whisper-turbo", Some(&models_dir), None, None);
+        assert!(rem_res.is_ok());
+        assert!(!turbo_dir.exists(), "whisper-large-v3-turbo dir should have been removed");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_speechyyy_models_list_output() {
+        let cfg = crate::config::Config::default();
+        let output = format_model_list(&cfg);
+
+        // Required models and providers
+        assert!(output.contains("parakeet-tdt-v3"));
+        assert!(output.contains("whisper-large-v3-turbo"));
+        assert!(output.contains("whisper-turbo"));
+        assert!(output.contains("moonshine-base"));
+        assert!(output.contains("saaras:v4"));
+        assert!(output.contains("groq"));
+        assert!(output.contains("openai"));
+        assert!(output.contains("openai-compatible"));
+
+        // Must not contain Phonon or Voxtral
+        let lower = output.to_lowercase();
+        assert!(!lower.contains("phonon"), "Output should not contain phonon");
+        assert!(!lower.contains("voxtral"), "Output should not contain voxtral");
     }
 }

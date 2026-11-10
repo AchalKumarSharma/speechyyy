@@ -4,7 +4,7 @@ use smithay_client_toolkit::compositor::{
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
-use smithay_client_toolkit::reexports::calloop::{channel, EventLoop};
+use smithay_client_toolkit::reexports::calloop::{channel, ping, EventLoop};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::{wl_output, wl_shm, wl_surface};
@@ -17,9 +17,9 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry};
-use speechyyy::dock::{DockModel, DockRenderer};
+use speechyyy::dock::{handle_daemon_event_action, DockEventAction, DockModel, DockRenderer};
 use speechyyy::events::{DaemonEvent, DictationState};
-use speechyyy::ipc::RuntimePaths;
+use speechyyy::ipc::{PidFile, RuntimePaths};
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -209,16 +209,155 @@ impl ProvidesRegistryState for DockApp {
 
 delegate_dispatch2!(DockApp);
 
+use smithay_client_toolkit::reexports::client::globals::GlobalListContents;
+use smithay_client_toolkit::reexports::client::protocol::wl_registry;
+use smithay_client_toolkit::reexports::client::Dispatch;
+
+struct DockCheckApp;
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for DockCheckApp {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+const DOCK_HELP: &str = "\
+speechyyy-dock
+Companion Wayland layer-shell HUD dock for Speechyyy
+
+USAGE:
+    speechyyy-dock [OPTIONS]
+
+OPTIONS:
+    -h, --help       Print help information
+    -V, --version    Print version information
+        --check      Check zwlr_layer_shell_v1 compositor support and exit
+";
+
+const DOCK_VERSION: &str = concat!("speechyyy-dock ", env!("CARGO_PKG_VERSION"));
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DockCliAction {
+    Run,
+    Help,
+    Version,
+    Check,
+    Invalid(String),
+}
+
+pub fn parse_dock_args<I>(args: I) -> DockCliAction
+where
+    I: IntoIterator<Item = String>,
+{
+    let items: Vec<String> = args.into_iter().skip(1).collect();
+    if items.is_empty() {
+        return DockCliAction::Run;
+    }
+
+    if items.iter().any(|a| a == "--help" || a == "-h") {
+        return DockCliAction::Help;
+    }
+
+    if items.iter().any(|a| a == "--version" || a == "-V") {
+        return DockCliAction::Version;
+    }
+
+    let mut has_check = false;
+    for item in &items {
+        match item.as_str() {
+            "--check" => has_check = true,
+            other => {
+                return DockCliAction::Invalid(format!(
+                    "error: unexpected argument '{}' found\n\nUsage: speechyyy-dock [OPTIONS]\n\nFor more information, try '--help'.",
+                    other
+                ));
+            }
+        }
+    }
+
+    if has_check {
+        DockCliAction::Check
+    } else {
+        DockCliAction::Run
+    }
+}
+
+pub fn parse_check_flag<I>(args: I) -> bool
+where
+    I: IntoIterator<Item = String>,
+{
+    matches!(parse_dock_args(args), DockCliAction::Check)
+}
+
+fn run_layer_shell_check() -> ! {
+    let conn = match Connection::connect_to_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("speechyyy-dock: failed to connect to Wayland display: {}", e);
+            std::process::exit(2);
+        }
+    };
+
+    let (globals, mut event_queue) = match registry_queue_init::<DockCheckApp>(&conn) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("speechyyy-dock: failed to initialize Wayland registry: {}", e);
+            std::process::exit(2);
+        }
+    };
+
+    let mut state = DockCheckApp;
+    if let Err(e) = event_queue.roundtrip(&mut state) {
+        eprintln!("speechyyy-dock: Wayland roundtrip failed: {}", e);
+        std::process::exit(2);
+    }
+
+    let has_layer_shell = globals
+        .contents()
+        .with_list(|list| list.iter().any(|g| g.interface == "zwlr_layer_shell_v1"));
+
+    if has_layer_shell {
+        println!("zwlr_layer_shell_v1 supported");
+        std::process::exit(0);
+    } else {
+        eprintln!("zwlr_layer_shell_v1 unsupported");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
+    match parse_dock_args(std::env::args()) {
+        DockCliAction::Help => {
+            print!("{}", DOCK_HELP);
+            std::process::exit(0);
+        }
+        DockCliAction::Version => {
+            println!("{}", DOCK_VERSION);
+            std::process::exit(0);
+        }
+        DockCliAction::Check => {
+            run_layer_shell_check();
+        }
+        DockCliAction::Invalid(err) => {
+            eprintln!("{}", err);
+            std::process::exit(2);
+        }
+        DockCliAction::Run => {}
+    }
+
+    let paths = RuntimePaths::default();
+    if let Err(e) = PidFile::acquire_for_service(&paths.dock_pid_path, "speechyyy-dock") {
+        println!("speechyyy-dock: {}", e);
+        return;
+    }
+
     let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let _ = signal_hook::flag::register(
-        signal_hook::consts::SIGINT,
-        Arc::clone(&shutdown_requested),
-    );
-    let _ = signal_hook::flag::register(
-        signal_hook::consts::SIGTERM,
-        Arc::clone(&shutdown_requested),
-    );
 
     // Connect to Wayland server
     let conn = match Connection::connect_to_env() {
@@ -228,6 +367,7 @@ fn main() {
                 "speechyyy-dock: Wayland display not detected (WAYLAND_DISPLAY unset or unreachable: {}). Exiting.",
                 e
             );
+            PidFile::remove(&paths.dock_pid_path);
             std::process::exit(1);
         }
     };
@@ -236,6 +376,7 @@ fn main() {
         Ok(res) => res,
         Err(e) => {
             eprintln!("speechyyy-dock: failed to initialize Wayland registry: {}", e);
+            PidFile::remove(&paths.dock_pid_path);
             std::process::exit(1);
         }
     };
@@ -310,6 +451,38 @@ fn main() {
 
     let handle = event_loop.handle();
 
+    // Ping source to wake event loop immediately on SIGINT / SIGTERM
+    let (pinger, ping_source) = match ping::make_ping() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("speechyyy-dock: failed to create calloop ping source: {}", e);
+            PidFile::remove(&paths.dock_pid_path);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = handle.insert_source(ping_source, |_, _, app: &mut DockApp| {
+        app.exit = true;
+    }) {
+        eprintln!("speechyyy-dock: failed to insert ping source into event loop: {}", e);
+        PidFile::remove(&paths.dock_pid_path);
+        std::process::exit(1);
+    }
+
+    let pinger_for_signal = pinger.clone();
+    let shutdown_signal = Arc::clone(&shutdown_requested);
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ]) {
+        std::thread::spawn(move || {
+            if signals.forever().next().is_some() {
+                shutdown_signal.store(true, Ordering::SeqCst);
+                pinger_for_signal.ping();
+            }
+        });
+    }
+
     // Insert Wayland source into calloop
     if let Err(e) = WaylandSource::new(conn, event_queue).insert(handle.clone()) {
         eprintln!("speechyyy-dock: failed to insert Wayland source into event loop: {}", e);
@@ -322,6 +495,13 @@ fn main() {
 
     if let Err(e) = handle.insert_source(channel, move |event, _, app: &mut DockApp| {
         if let channel::Event::Msg(daemon_event) = event {
+            let action = handle_daemon_event_action(&daemon_event);
+            if action == DockEventAction::Exit {
+                println!("speechyyy-dock: received shutdown notice, exiting cleanly");
+                app.exit = true;
+                return;
+            }
+
             let was_settled_hidden = app.model.is_settled_hidden();
             let is_recording_event = matches!(
                 daemon_event,
@@ -346,11 +526,12 @@ fn main() {
         }
     }) {
         eprintln!("speechyyy-dock: failed to insert IPC channel into event loop: {}", e);
+        PidFile::remove(&paths.dock_pid_path);
         std::process::exit(1);
     }
 
     // Spawn IPC background thread connecting to $XDG_RUNTIME_DIR/speechyyy/events.sock
-    let socket_path = RuntimePaths::default().events_socket_path;
+    let socket_path = paths.events_socket_path.clone();
     let thread_shutdown = Arc::clone(&shutdown_requested);
 
     std::thread::spawn(move || {
@@ -365,8 +546,18 @@ fn main() {
                         match line {
                             Ok(l) => {
                                 if let Ok(event) = serde_json::from_str::<DaemonEvent>(&l) {
-                                    if tx.send(event).is_err() {
-                                        return;
+                                    let action = handle_daemon_event_action(&event);
+                                    let _ = tx.send(event);
+                                    match action {
+                                        DockEventAction::Exit => {
+                                            // Daemon stopped: terminate IPC thread without reconnecting
+                                            return;
+                                        }
+                                        DockEventAction::Reconnect => {
+                                            // Daemon restarting: break out to reconnect loop
+                                            break;
+                                        }
+                                        DockEventAction::Continue => {}
                                     }
                                 }
                             }
@@ -407,5 +598,52 @@ fn main() {
         }
     }
 
+    PidFile::remove(&paths.dock_pid_path);
     println!("speechyyy-dock: shutting down cleanly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_dock_args() {
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into()]),
+            DockCliAction::Run
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "--help".into()]),
+            DockCliAction::Help
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "-h".into()]),
+            DockCliAction::Help
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "--version".into()]),
+            DockCliAction::Version
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "-V".into()]),
+            DockCliAction::Version
+        );
+        assert_eq!(
+            parse_dock_args(vec!["speechyyy-dock".into(), "--check".into()]),
+            DockCliAction::Check
+        );
+        match parse_dock_args(vec!["speechyyy-dock".into(), "--unknown".into()]) {
+            DockCliAction::Invalid(msg) => {
+                assert!(msg.contains("unexpected argument '--unknown'"));
+            }
+            other => panic!("Expected DockCliAction::Invalid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_flag_parsing() {
+        assert!(parse_check_flag(vec!["speechyyy-dock".into(), "--check".into()]));
+        assert!(!parse_check_flag(vec!["speechyyy-dock".into()]));
+        assert!(!parse_check_flag(vec!["speechyyy-dock".into(), "--other".into()]));
+    }
 }

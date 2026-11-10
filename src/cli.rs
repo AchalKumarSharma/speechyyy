@@ -20,7 +20,7 @@ pub enum Command {
         /// Run in foreground instead of detaching in background
         #[arg(short, long)]
         foreground: bool,
-        /// Speech-to-text inference provider ('local' or 'sarvam')
+        /// Speech-to-text inference provider ('local', 'sarvam', 'groq', 'openai', or 'openai-compatible')
         #[arg(long)]
         provider: Option<String>,
         /// Sarvam operating mode ('translit', 'transcribe', 'translate', 'codemix')
@@ -32,6 +32,12 @@ pub enum Command {
         /// Keystroke typing delay in milliseconds for typewriter mode
         #[arg(long)]
         typing_delay: Option<u64>,
+        /// Disable companion dock launch on start (takes precedence over --with-dock)
+        #[arg(long)]
+        no_dock: bool,
+        /// Launch companion dock on start (dock is launched by default; overridden by --no-dock)
+        #[arg(long)]
+        with_dock: bool,
     },
     /// Stop running Speechyyy
     Stop,
@@ -50,7 +56,11 @@ pub enum Command {
     /// Stream real-time daemon events in NDJSON format
     Events,
     /// Inspect system permissions, audio inputs, and model weights
-    Doctor,
+    Doctor {
+        /// Perform deep integrity check, re-verifying file SHA-256 checksums
+        #[arg(long)]
+        deep: bool,
+    },
     /// List available speech recognition models (alias: model)
     #[command(alias = "model")]
     Models {
@@ -114,6 +124,9 @@ pub enum Command {
         /// Force re-installation even if already on the latest version
         #[arg(long)]
         force: bool,
+        /// Explicit release tag to install (e.g. v0.2.0, v0.2.0-rc1)
+        #[arg(long)]
+        tag: Option<String>,
     },
 }
 
@@ -172,6 +185,8 @@ mod tests {
                 mode: None,
                 injection: None,
                 typing_delay: None,
+                no_dock: false,
+                with_dock: false,
             }
         );
     }
@@ -188,6 +203,24 @@ mod tests {
                 mode: None,
                 injection: None,
                 typing_delay: None,
+                no_dock: false,
+                with_dock: false,
+            }
+        );
+
+        let cli_with_dock =
+            Cli::try_parse_from(["speechyyy", "start", "--foreground", "--with-dock"])
+                .expect("parse start with dock");
+        assert_eq!(
+            cli_with_dock.command,
+            Command::Start {
+                foreground: true,
+                provider: None,
+                mode: None,
+                injection: None,
+                typing_delay: None,
+                no_dock: false,
+                with_dock: true,
             }
         );
     }
@@ -203,6 +236,23 @@ mod tests {
                 mode: None,
                 injection: None,
                 typing_delay: None,
+                no_dock: false,
+                with_dock: false,
+            }
+        );
+
+        let cli_no_dock =
+            Cli::try_parse_from(["speechyyy", "start", "--no-dock"]).expect("parse start no dock");
+        assert_eq!(
+            cli_no_dock.command,
+            Command::Start {
+                foreground: false,
+                provider: None,
+                mode: None,
+                injection: None,
+                typing_delay: None,
+                no_dock: true,
+                with_dock: false,
             }
         );
     }
@@ -255,7 +305,11 @@ mod tests {
     #[test]
     fn test_parse_doctor() {
         let cli = Cli::try_parse_from(["speechyyy", "doctor"]).expect("parse doctor");
-        assert_eq!(cli.command, Command::Doctor);
+        assert_eq!(cli.command, Command::Doctor { deep: false });
+
+        let cli_deep =
+            Cli::try_parse_from(["speechyyy", "doctor", "--deep"]).expect("parse doctor --deep");
+        assert_eq!(cli_deep.command, Command::Doctor { deep: true });
     }
 
     #[test]
@@ -548,11 +602,21 @@ mod tests {
     #[test]
     fn test_parse_update() {
         let cli = Cli::try_parse_from(["speechyyy", "update"]).expect("parse update");
-        assert_eq!(cli.command, Command::Update { force: false });
+        assert_eq!(cli.command, Command::Update { force: false, tag: None });
 
         let cli_force =
             Cli::try_parse_from(["speechyyy", "update", "--force"]).expect("parse update force");
-        assert_eq!(cli_force.command, Command::Update { force: true });
+        assert_eq!(cli_force.command, Command::Update { force: true, tag: None });
+
+        let cli_tag =
+            Cli::try_parse_from(["speechyyy", "update", "--tag", "v0.2.0-rc1"]).expect("parse update tag");
+        assert_eq!(
+            cli_tag.command,
+            Command::Update {
+                force: false,
+                tag: Some("v0.2.0-rc1".to_string())
+            }
+        );
     }
 
     #[test]
@@ -571,5 +635,20 @@ mod tests {
         assert!(help.contains("remove"));
         assert!(help.contains("uninstall"));
         assert!(help.contains("unlearn"));
+    }
+
+    #[test]
+    fn test_start_subcommand_dock_flags_help_guidance() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let start_sub = cmd.find_subcommand("start").expect("start subcommand");
+        let mut buf = Vec::new();
+        start_sub.clone().write_help(&mut buf).unwrap();
+        let help = String::from_utf8(buf).unwrap();
+
+        assert!(help.contains("--no-dock"));
+        assert!(help.contains("--with-dock"));
+        assert!(help.contains("takes precedence over --with-dock"));
+        assert!(help.contains("overridden by --no-dock"));
     }
 }

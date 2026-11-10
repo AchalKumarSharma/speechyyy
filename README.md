@@ -1,236 +1,192 @@
-# Speechyyy (`v0.2.0`)
+# Speechyyy
 
-[![GitHub Release](https://img.shields.io/github/v/release/AchalKumarSharma/speechyyy?style=flat-square&color=blue)](https://github.com/AchalKumarSharma/speechyyy/releases)
-[![Release Downloads](https://img.shields.io/github/downloads/AchalKumarSharma/speechyyy/total?style=flat-square&color=success)](https://github.com/AchalKumarSharma/speechyyy/releases)
-[![GitHub Stars](https://img.shields.io/github/stars/AchalKumarSharma/speechyyy?style=flat-square&color=yellow)](https://github.com/AchalKumarSharma/speechyyy/stargazers)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
-
-> **Sub-300ms ambient dictation daemon & native Wayland companion dock for Linux in safe Rust.**
-
-Speechyyy is an open-source, ultra-lightweight desktop dictation engine written in Rust. It streams transcribed speech directly into the active OS cursor in real time via global push-to-talk.
+Speech-to-text dictation for Linux on Wayland.
+Hold or toggle a shortcut key, speak, and transcribed text appears directly at your cursor.
 
 ---
 
-## Quick Install (One-Liner)
+## Before you start
 
-Install the pre-compiled binary, configure udev permissions, and set up your desktop integration automatically:
+- **Wayland compositor:** Needs `wlr-layer-shell` support for the dock overlay. Tested on Hyprland. Other wlroots-based compositors should work, untested. (GNOME Mutter and X11 lack layer-shell; the dock will not display there).
+- **Clipboard tool:** `wl-copy` (from `wl-clipboard`) for default clipboard paste mode.
+- **Input access:** Write permission to `/dev/uinput` to emit simulated typing keystrokes. Run `speechyyy doctor` to check your setup.
+- **Microphone:** A working audio input device.
+
+---
+
+## Install
+
+Run the automated installer:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/AchalKumarSharma/speechyyy/main/install.sh)"
 ```
 
-> **Tip:** The `curl -fsSL https://raw.githubusercontent.com/AchalKumarSharma/speechyyy/main/install.sh | bash` pipe form also works identically because the installer reads prompts directly from `/dev/tty`.  
-> *Note:* If the command prints nothing, the download likely failed due to network issues; check your internet connectivity.
-
-### What the installer handles:
-- **Binary Deployment:** Installs checksum-verified (`SHA256SUMS`) `speechyyy` daemon and `speechyyy-dock` to `~/.local/bin/` (`0755`).
-- **Hardware Access:** Automatically sets up `/etc/udev/rules.d/99-uinput.rules` and kernel modules for non-root `/dev/uinput` keystroke injection.
-- **Secure Configuration:** Generates `~/.config/speechyyy/config.toml` locked to user-only read/write (`chmod 600`).
-- **Optional API Key:** Interactively prompts for your Sarvam AI API Key (hidden input). You can press <kbd>Enter</kbd> to skip and add it later in `~/.config/speechyyy/config.toml`.
-- **Desktop Autostart:** Automatically configures Hyprland (`exec-once` & keybinding in `hyprland.conf`) and generates systemd user services (`speechyyy.service`, `speechyyy-dock.service`).
-- **Dry-Run & Non-Interactive:** Inspect actions beforehand using `SPEECHYYY_DRY_RUN=1 bash install.sh`, or pass `SPEECHYYY_API_KEY="your-key"` for automated CI setups.
+This installs `speechyyy` and `speechyyy-dock` into `~/.local/bin/` and creates `~/.config/speechyyy/config.toml`. The command also works piped (`curl -fsSL ... | bash`). To preview every step without making changes, set `SPEECHYYY_DRY_RUN=1`.
 
 ---
 
-## Architecture & Internals
+## First run
 
-Speechyyy decouples background audio capture and inference from UI rendering via dual local UNIX domain sockets:
-
-- **Control IPC (`speechyyy.sock`)**: Lightweight request-reply socket for hotkey press/release triggers (`push-down`, `push-up`, `toggle`, `cancel`) and status checks.
-- **Telemetry Stream (`events.sock`)**: Non-blocking NDJSON event broadcaster emitting real-time dictation lifecycle changes (`Recording`, `Processing`, `Emitting`, `Error`) alongside **40 Hz atomic RMS audio level telemetry**.
-- **Wayland Layer-Shell UI (`speechyyy-dock`)**: Standalone companion dock rendered using `smithay-client-toolkit` (`wlr-layer-shell`) and `tiny-skia` software rasterization.
-- **Zero Telemetry & Sub-30 MB Footprint**: Standalone binary compiled in Rust (< 10 MB binary, < 30 MB idle RAM, 0.00% idle CPU draw).
-
-```
-[ Microphone ] ──> ( PipeWire / ALSA ) ──> [ speechyyy daemon ]
-                                                 │       │
-                       control (`speechyyy.sock`)│       │ telemetry (`events.sock`)
-                                                 ▼       ▼
-                                         [ Keybindings ] [ speechyyy-dock ] ──> ( wlr-layer-shell )
-                                                 │
-                                                 ▼
-                                        [ /dev/uinput ] ──> Active Caret / Focused Window
-```
-
----
-
-## UX & Aesthetic Identity
-
-- **Neon-Synth Palette**: High-contrast Apple HIG capsule geometry bordered in neon pink (`#f70776`) with deep magenta (`#c3195d`) reactive waveform bars and pulsing processing dots over a dark glassmorphism canvas (`rgba(18, 18, 20, 0.85)`).
-- **Interactive Equalizer**: Multi-bar logarithmic Gaussian envelope with micro-phase harmonics dancing dynamically in real time to microphone volume.
-- **Transparent Quiescent Surface**: When parked idle, the companion dock maintains its active Wayland configured surface while committing a single transparent frame, ceasing frame callbacks to preserve **0.00% idle CPU** and 100% click-through input transparency.
-- **Instantaneous Collapse**: Snaps the exit spring immediately upon text emission (`DictationState::Emitting`), making text insertion feel instant.
-
----
-
-## Quick Start
-
-1. **Diagnose Your Setup**:
+1. Check your environment and permissions:
    ```bash
    speechyyy doctor
    ```
+2. Pick how you want to transcribe (more options below):
 
-2. **Select & Configure a Model**:
-   - **Local Offline Models** (Sherpa-ONNX):
-     ```bash
-     speechyyy download parakeet-tdt-v3
-     speechyyy use parakeet-tdt-v3
-     ```
-   - **Cloud BYOK Models** (Sarvam AI 22+ Indic / Hinglish transliteration):
-     ```bash
-     speechyyy download saaras:v4
-     speechyyy use saaras:v4
-     ```
+   **Offline, on your device:** Parakeet. It's a big download, so give it a minute.
 
-3. **Start the Daemon & Dock**:
    ```bash
-   speechyyy daemon &
-   speechyyy-dock &
+   speechyyy download parakeet-tdt-v3
+   speechyyy use parakeet-tdt-v3
    ```
 
-4. **Dictate**:
-   - Focus any text input in any application (editor, browser, terminal).
-   - Hold <kbd>RightAlt</kbd>, speak, and release.
-   - Text streams directly into your caret!
+   **Cloud, bring your own key:** Sarvam. This is the one to pick for Indian languages. Your audio is sent to Sarvam to be transcribed.
+
+   ```bash
+   speechyyy use sarvam
+   ```
+
+3. Start the engine:
+   ```bash
+   speechyyy start
+   ```
+   The companion dock appears automatically. Pass `--no-dock` if you want to run headless.
+4. Focus any text field, hold your shortcut key, and speak.
 
 ---
 
-## CLI Command Reference
+## Daily use
 
-Speechyyy provides a fast CLI interface for both daily usage and window manager bindings:
+### Compositor bindings
 
-| Command | Description |
-|---|---|
-| `speechyyy daemon [-f]` | Start the background daemon (alias: `start`). Pass `-f` / `--foreground` for live logging |
-| `speechyyy toggle` | IPC trigger to toggle recording on/off (ideal for single-key shortcuts) |
-| `speechyyy doctor` | Audit system permissions (`/dev/uinput`), audio inputs (PipeWire), Wayland session, and models |
-| `speechyyy status` | Query active daemon status over `speechyyy.sock` |
-| `speechyyy events` | Stream live NDJSON state changes and 40 Hz audio RMS metering over `events.sock` |
-| `speechyyy stop` | Terminate the active Speechyyy daemon process |
-| `speechyyy cancel` | Cancel current recording or processing without text insertion |
-| `speechyyy push-down` | Start recording via IPC (bind to hotkey press event) |
-| `speechyyy push-up` | Stop recording & transcribe via IPC (bind to hotkey release event) |
-| `speechyyy model` | List all supported speech recognition models (alias: `models`) |
-| `speechyyy download <MODEL>` | Fetch weights or configure credentials for a model preset |
-| `speechyyy use <MODEL>` | Switch active model with automatic hot-reload |
-| `speechyyy remove <MODEL>` | Delete local model weights to reclaim disk space (alias: `rm`) |
-| `speechyyy learn <HEARD> <TYPED>` | Add a phonetic replacement rule to `dictionary.toml` |
-| `speechyyy fix <EXPECTED>` | Calculate diff against last utterance and store replacement rule |
-| `speechyyy unlearn [KEY]` | Remove a replacement rule from `dictionary.toml` |
-| `speechyyy history` | View recent dictation transcripts |
-| `speechyyy update [--force]` | Self-update to the newest GitHub release in-place |
-| `speechyyy uninstall [-y]` | Autonomous complete removal of binaries, weights, and configs |
+Add these lines to your Hyprland configuration (`~/.config/hypr/hyprland.conf`):
 
----
-
-## Compositor Keybindings
-
-Configure push-to-talk in your Wayland compositor:
-
-### Hyprland (`~/.config/hypr/hyprland.conf`)
 ```ini
-# Start daemon and dock on login
-exec-once = speechyyy daemon
-exec-once = speechyyy-dock
+# Start daemon and companion dock on login
+exec-once = speechyyy start
 
-# Push-to-talk with RightAlt:
+# Push-to-talk via Right Alt (Keycode 108)
 bind = , code:108, exec, speechyyy push-down
 bindr = , code:108, exec, speechyyy push-up
 
-# Or toggle with RightAlt:
+# Toggle mode alternative:
 # bind = , code:108, exec, speechyyy toggle
 ```
 
-### Sway / i3 (`~/.config/sway/config`)
-```ini
-exec speechyyy daemon
-exec speechyyy-dock
+Push-to-talk requires a shortcut that triggers on key release (`bindr`). If your desktop only supports keypress shortcuts, use `speechyyy toggle`.
 
-bindsym Mod3 exec speechyyy push-down
-bindsym --release Mod3 exec speechyyy push-up
-```
+### Where text goes
+
+Speechyyy pastes via clipboard by default (`wl-copy` followed by a synthetic `Ctrl+V`). Standard terminal emulators ignore `Ctrl+V`; if you dictate into terminals, set `injection_mode = "typewriter"` in `config.toml` or start with `speechyyy start --injection typewriter`.
 
 ---
 
-<details>
-<summary><strong>Manual Setup & Build from Source</strong></summary>
+## Choose how it transcribes
 
-### 1. Prerequisites
-- Rust 2021 Edition (`cargo`, `rustc`)
-- PipeWire / ALSA audio development libraries
-- Wayland development headers
+### Cloud (bring your own key)
 
-On Arch / CachyOS:
-```bash
-sudo pacman -S base-devel pipewire pipewire-pulse wayland
-```
+Audio is sent over HTTPS to your chosen provider for transcription. Sarvam is the pick for Indian languages.
 
-### 2. Build Release Binaries
-```bash
-git clone https://github.com/AchalKumarSharma/speechyyy.git
-cd speechyyy
-cargo build --release --bin speechyyy --bin speechyyy-dock
+| Provider  | Setup command                     | Environment key fallback    |
+| --------- | --------------------------------- | --------------------------- |
+| Sarvam AI | `speechyyy use sarvam`            | `SARVAM_API_KEY`            |
+| Groq      | `speechyyy use groq`              | `GROQ_API_KEY`              |
+| OpenAI    | `speechyyy use openai`            | `OPENAI_API_KEY`            |
+| Custom    | `speechyyy use openai-compatible` | `OPENAI_COMPATIBLE_API_KEY` |
 
-mkdir -p ~/.local/bin
-install -m 755 target/release/speechyyy ~/.local/bin/
-install -m 755 target/release/speechyyy-dock ~/.local/bin/
-```
+Enter your API key when prompted; it is saved with `0600` permissions to `config.toml`. You can also provide `SPEECHYYY_API_KEY="<key>"` during installation.
 
-### 3. Configure `/dev/uinput` Permissions
-Hardware keystroke injection requires non-root write access to `/dev/uinput`:
+### Local (offline)
 
-```bash
-sudo modprobe uinput
-echo 'uinput' | sudo tee /etc/modules-load.d/uinput.conf > /dev/null
-echo 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/99-uinput.rules > /dev/null
-sudo udevadm control --reload-rules
-sudo udevadm trigger /dev/uinput
-```
+Runs completely on your machine with no network connection during dictation.
 
-*(Note: Log out and log back in for `uaccess` ACLs to take effect on your user session).*
+| Model                                            | Size                     | Setup command                                                         |
+| ------------------------------------------------ | ------------------------ | --------------------------------------------------------------------- |
+| `parakeet-tdt-v3`                                | Large download (~487 MB) | `speechyyy download parakeet-tdt-v3 && speechyyy use parakeet-tdt-v3` |
+| `whisper-large-v3-turbo` (alias `whisper-turbo`) | Large download           | `speechyyy download whisper-turbo && speechyyy use whisper-turbo`     |
+| `moonshine-base`                                 | Medium download          | `speechyyy download moonshine-base && speechyyy use moonshine-base`   |
 
-### 4. Create Configuration File
-Create `~/.config/speechyyy/config.toml` with restricted user-only permissions:
-
-```bash
-mkdir -p ~/.config/speechyyy
-(
-    umask 077
-    cat > ~/.config/speechyyy/config.toml << 'EOF'
-hotkey = "RightAlt"
-pacing_delay_ms = 15
-
-[input]
-hotkey = "RightAlt"
-grab_key = true
-
-[audio]
-sample_rate = 16000
-vad_threshold = 0.005
-min_duration_ms = 200
-
-[inference]
-provider = "sarvam"
-api_key = ""
-model = "saaras:v4"
-language_code = "unknown"
-mode = "translit"
-
-[injector]
-method = "typewriter"
-pacing_delay_ms = 15
-
-[ui]
-nickname = "babe"
-EOF
-)
-chmod 600 ~/.config/speechyyy/config.toml
-```
-
-</details>
+View installed models with `speechyyy models`, and delete local model files with `speechyyy remove <model>`.
 
 ---
 
-## License
+## Commands cheat-sheet
 
-MIT License. Crafted with safe Rust.
+| Command                      | What it does                                                                          |
+| ---------------------------- | ------------------------------------------------------------------------------------- |
+| `speechyyy start`            | Starts daemon and dock. Use `-f` for foreground logs, `--no-dock` to skip dock.       |
+| `speechyyy stop`             | Stops the running daemon and dock cleanly via SIGTERM.                                |
+| `speechyyy status`           | Shows daemon PID, current state, and active model.                                    |
+| `speechyyy doctor`           | Audits microphone, `/dev/uinput`, dock, and models. Add `--deep` to verify checksums. |
+| `speechyyy push-down`        | Starts recording (press shortcut).                                                    |
+| `speechyyy push-up`          | Stops recording and transcribes (release shortcut).                                   |
+| `speechyyy toggle`           | Toggles recording state on or off.                                                    |
+| `speechyyy cancel`           | Discards current audio without emitting text.                                         |
+| `speechyyy events`           | Streams live daemon state and audio RMS levels as NDJSON.                             |
+| `speechyyy history`          | Shows recent dictation transcripts (default: last 10).                                |
+| `speechyyy models`           | Lists available and installed speech models.                                          |
+| `speechyyy download <model>` | Downloads and verifies model weights.                                                 |
+| `speechyyy use <model>`      | Switches active model and reloads the daemon.                                         |
+| `speechyyy remove <model>`   | Deletes local model files to free disk space.                                         |
+| `speechyyy update`           | Updates binaries in-place to the newest release.                                      |
+| `speechyyy uninstall`        | Stops services and removes binaries, models, and config.                              |
+
+Run `speechyyy --help` for flag details on any command.
+
+- **Dock flag priority:** The dock launches by default in both background and foreground modes. `--no-dock` turns it off. `--with-dock` is accepted; if both are passed, `--no-dock` wins.
+- **Timeouts:** Control requests (`status`, `stop`, `ping`) time out after 2 seconds so stuck states fail fast; commands waiting on transcription (`push-up`, `toggle`) wait up to 15 seconds.
+
+---
+
+## Update and uninstall
+
+```bash
+# Update to latest stable release
+speechyyy update
+
+# Completely remove Speechyyy
+speechyyy uninstall
+```
+
+**Pre-releases:** GitHub's standard release feed skips pre-releases. To install or update to a release candidate (such as `v0.2.0-rc1`), pass the tag explicitly:
+
+```bash
+SPEECHYYY_VERSION=v0.2.0-rc1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/AchalKumarSharma/speechyyy/main/install.sh)"
+# Or update an existing install:
+speechyyy update --tag v0.2.0-rc1
+```
+
+_Upgrade note:_ If you started a dock under a pre-v0.2.0 version before PID tracking existed, close it manually once (`killall speechyyy-dock`).
+
+---
+
+## Troubleshooting
+
+- **The dock does not appear:** Verify you are running a Wayland compositor with `wlr-layer-shell` support. GNOME Mutter and X11 cannot display the dock. Run `speechyyy doctor` to inspect compositor compatibility.
+- **No text is pasted:** In terminal emulators, `Ctrl+V` paste does not work; set `injection_mode = "typewriter"` in `config.toml` or paste manually with `Ctrl+Shift+V`. Outside terminals, verify `/dev/uinput` write access with `speechyyy doctor`.
+- **Cloud provider errors:** Verify your API key in `~/.config/speechyyy/config.toml` or reconfigure it with `speechyyy use <provider>`.
+- **`speechyyy stop` seems to pause:** If speech inference is currently running on your CPU, `stop` waits until decoding completes before terminating.
+
+---
+
+## Known limits
+
+- The companion dock requires `wlr-layer-shell`; GNOME has none, and X11 is unsupported.
+- Transcription is synchronous: during multi-second CPU decoding, `stop` and `cancel` wait until decoding completes.
+- Clipboard mode overwrites your active clipboard and does not paste in most terminal emulators.
+- Speechyyy cannot detect whether your cursor is in an active text input field.
+- Cloud providers transmit audio over the network to external servers.
+- Idle CPU usage is low but not zero (measured at approximately 0.8% to 1.1% on one tested system).
+
+---
+
+## Privacy
+
+API keys and user options are stored in `~/.config/speechyyy/config.toml` with restricted `0600` permissions. Recent transcript history is stored locally in `~/.local/share/speechyyy/history.jsonl` (capped at 500 records, `0600` permissions) and is never sent to external servers. Terminal logs and standard output never print your speech transcripts.
+
+---
+
+## Under the hood
+
+Speechyyy consists of two standalone binaries: `speechyyy` (daemon and CLI) and `speechyyy-dock` (ambient HUD overlay). Both are written in synchronous Rust with no async runtime and communicate over local Unix domain sockets in `$XDG_RUNTIME_DIR/speechyyy/`.

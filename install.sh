@@ -2,7 +2,6 @@
 set -euo pipefail
 
 REPO="AchalKumarSharma/speechyyy"
-RELEASE_BASE="https://github.com/${REPO}/releases/latest/download"
 TARGET_BIN_DIR="${HOME}/.local/bin"
 CONFIG_DIR="${SPEECHYYY_CONFIG_DIR:-${HOME}/.config/speechyyy}"
 CONFIG_FILE="${SPEECHYYY_CONFIG_FILE:-${CONFIG_DIR}/config.toml}"
@@ -38,6 +37,21 @@ case "$ARCH" in
 esac
 echo "[✓] Architecture: ${TARGET_ARCH}"
 
+# Version override or default to latest
+if [ -n "${SPEECHYYY_VERSION:-}" ]; then
+    TAG_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+    if [[ ! "${SPEECHYYY_VERSION}" =~ $TAG_REGEX ]]; then
+        echo "Error: Invalid SPEECHYYY_VERSION '${SPEECHYYY_VERSION}'. Expected format: vMAJOR.MINOR.PATCH(-PRERELEASE), e.g. v0.2.0 or v0.2.0-rc1" >&2
+        exit 1
+    fi
+    TAG="${SPEECHYYY_VERSION}"
+    RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
+    echo "[✓] Target release version: ${TAG}"
+else
+    TAG=""
+    RELEASE_BASE="https://github.com/${REPO}/releases/latest/download"
+fi
+
 # Audio subsystem check
 if command -v pipewire >/dev/null 2>&1 || pgrep -x pipewire >/dev/null 2>&1 || [ -e "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pipewire-0" ]; then
     echo "[✓] PipeWire audio subsystem detected."
@@ -52,9 +66,17 @@ else
     echo "[!] Warning: Wayland session not detected (\$WAYLAND_DISPLAY / \$XDG_CURRENT_DESKTOP unset). speechyyy-dock requires a Wayland compositor supporting wlr-layer-shell."
 fi
 
+# Clipboard tool check (wl-clipboard / wl-copy)
+if command -v wl-copy >/dev/null 2>&1; then
+    echo "[✓] wl-clipboard (wl-copy) detected for instant paste."
+else
+    echo "[!] Warning: wl-copy not found. Speechyyy defaults to clipboard paste via 'wl-clipboard'."
+    echo "    Please install the 'wl-clipboard' package (e.g. 'sudo pacman -S wl-clipboard' or 'sudo apt install wl-clipboard'), or set injection_mode = \"typewriter\" in config.toml."
+fi
+
 # 2. Binary Installation
 IS_LOCAL_CHECKOUT=0
-if [ -f "Cargo.toml" ] && grep -q 'name = "speechyyy"' Cargo.toml 2>/dev/null; then
+if [ -z "${SPEECHYYY_VERSION:-}" ] && [ -f "Cargo.toml" ] && grep -q 'name = "speechyyy"' Cargo.toml 2>/dev/null; then
     if [ -f "target/release/speechyyy" ] && [ -f "target/release/speechyyy-dock" ]; then
         IS_LOCAL_CHECKOUT=1
     fi
@@ -66,18 +88,24 @@ if [ "$IS_LOCAL_CHECKOUT" = "1" ]; then
         echo "[dry-run] Would create directory ${TARGET_BIN_DIR}"
         echo "[dry-run] Would install target/release/speechyyy to ${TARGET_BIN_DIR}/speechyyy (mode 0755)"
         echo "[dry-run] Would install target/release/speechyyy-dock to ${TARGET_BIN_DIR}/speechyyy-dock (mode 0755)"
+        echo "[dry-run] Would copy any companion shared libraries (*.so) to ${TARGET_BIN_DIR}/ (mode 0755)"
     else
         mkdir -p "$TARGET_BIN_DIR"
         install -m 755 "target/release/speechyyy" "${TARGET_BIN_DIR}/speechyyy"
         install -m 755 "target/release/speechyyy-dock" "${TARGET_BIN_DIR}/speechyyy-dock"
-        echo "[✓] Installed release binaries to ${TARGET_BIN_DIR}/"
+        find "target/release" -maxdepth 1 -type f -name "lib*.so*" -exec install -m 755 {} "${TARGET_BIN_DIR}/" \; 2>/dev/null || true
+        echo "[✓] Installed release binaries and libraries to ${TARGET_BIN_DIR}/"
     fi
 else
     if [ "$DRY_RUN" = "1" ]; then
         echo "[dry-run] Would create directory ${TARGET_BIN_DIR}"
-        echo "[dry-run] Would download release binaries and SHA256SUMS from ${RELEASE_BASE} for ${TARGET_ARCH}"
+        if [ -n "$TAG" ]; then
+            echo "[dry-run] Would download release archive (speechyyy-${TAG}-${TARGET_ARCH}-linux.tar.gz) and SHA256SUMS from ${RELEASE_BASE}"
+        else
+            echo "[dry-run] Would download release binaries and SHA256SUMS from ${RELEASE_BASE} for ${TARGET_ARCH}"
+        fi
         echo "[dry-run] Would verify SHA256 checksums before installation"
-        echo "[dry-run] Would install speechyyy and speechyyy-dock to ${TARGET_BIN_DIR}/ (mode 0755)"
+        echo "[dry-run] Would install speechyyy, speechyyy-dock, and companion libraries to ${TARGET_BIN_DIR}/ (mode 0755)"
     else
         TMP_DIR=$(mktemp -d)
         cleanup() {
@@ -88,8 +116,16 @@ else
         echo "==> Downloading release assets from ${RELEASE_BASE}..."
         DOWNLOAD_SUCCESS=0
         if curl -fsSL "${RELEASE_BASE}/SHA256SUMS" -o "${TMP_DIR}/SHA256SUMS" 2>/dev/null; then
-            TARBALL_NAME="speechyyy-${TARGET_ARCH}-unknown-linux-gnu.tar.gz"
-            if curl -fsSL "${RELEASE_BASE}/${TARBALL_NAME}" -o "${TMP_DIR}/${TARBALL_NAME}" 2>/dev/null; then
+            if [ -n "$TAG" ]; then
+                TARBALL_NAME="speechyyy-${TAG}-${TARGET_ARCH}-linux.tar.gz"
+            else
+                TARBALL_NAME=$(awk -v arch="${TARGET_ARCH}" '$2 ~ "^speechyyy-.*-" arch "-linux\\.tar\\.gz$" { print $2 }' "${TMP_DIR}/SHA256SUMS" | head -n1)
+                if [ -z "$TARBALL_NAME" ]; then
+                    TARBALL_NAME=$(grep -oE "speechyyy-[^ ]+-${TARGET_ARCH}-linux\.tar\.gz" "${TMP_DIR}/SHA256SUMS" | head -n1 || true)
+                fi
+            fi
+
+            if [ -n "$TARBALL_NAME" ] && curl -fsSL "${RELEASE_BASE}/${TARBALL_NAME}" -o "${TMP_DIR}/${TARBALL_NAME}" 2>/dev/null; then
                 echo "==> Verifying SHA256 checksum..."
                 (
                     cd "$TMP_DIR"
@@ -103,13 +139,14 @@ else
                     echo "[✓] SHA256 checksum verified."
                     tar -xzf "${TMP_DIR}/${TARBALL_NAME}" -C "${TMP_DIR}"
                     mkdir -p "$TARGET_BIN_DIR"
-                    if [ -f "${TMP_DIR}/speechyyy" ] && [ -f "${TMP_DIR}/speechyyy-dock" ]; then
-                        install -m 755 "${TMP_DIR}/speechyyy" "${TARGET_BIN_DIR}/speechyyy"
-                        install -m 755 "${TMP_DIR}/speechyyy-dock" "${TARGET_BIN_DIR}/speechyyy-dock"
-                        DOWNLOAD_SUCCESS=1
-                    elif [ -f "${TMP_DIR}/target/release/speechyyy" ] && [ -f "${TMP_DIR}/target/release/speechyyy-dock" ]; then
-                        install -m 755 "${TMP_DIR}/target/release/speechyyy" "${TARGET_BIN_DIR}/speechyyy"
-                        install -m 755 "${TMP_DIR}/target/release/speechyyy-dock" "${TARGET_BIN_DIR}/speechyyy-dock"
+                    SPEECHYYY_BIN=$(find "${TMP_DIR}" -type f -name "speechyyy" | head -n1)
+                    DOCK_BIN=$(find "${TMP_DIR}" -type f -name "speechyyy-dock" | head -n1)
+                    if [ -n "$SPEECHYYY_BIN" ] && [ -f "$SPEECHYYY_BIN" ]; then
+                        install -m 755 "$SPEECHYYY_BIN" "${TARGET_BIN_DIR}/speechyyy"
+                        if [ -n "$DOCK_BIN" ] && [ -f "$DOCK_BIN" ]; then
+                            install -m 755 "$DOCK_BIN" "${TARGET_BIN_DIR}/speechyyy-dock"
+                        fi
+                        find "${TMP_DIR}" -type f -name "lib*.so*" -exec install -m 755 {} "${TARGET_BIN_DIR}/" \; 2>/dev/null || true
                         DOWNLOAD_SUCCESS=1
                     fi
                 else
@@ -121,6 +158,11 @@ else
         fi
 
         if [ "$DOWNLOAD_SUCCESS" = "0" ]; then
+            if [ -n "$TAG" ]; then
+                echo "Error: Failed to download release assets for requested version ${TAG} from ${RELEASE_BASE}" >&2
+                echo "Please verify the tag exists at: https://github.com/${REPO}/releases/tag/${TAG}" >&2
+                exit 1
+            fi
             echo "[!] Pre-built binary download unavailable. Checking for cargo to build from source..."
             if command -v cargo >/dev/null 2>&1 && [ -f "Cargo.toml" ] && grep -q 'name = "speechyyy"' Cargo.toml 2>/dev/null; then
                 echo "==> Compiling from source via cargo build --release..."
@@ -128,6 +170,7 @@ else
                 mkdir -p "$TARGET_BIN_DIR"
                 install -m 755 "target/release/speechyyy" "${TARGET_BIN_DIR}/speechyyy"
                 install -m 755 "target/release/speechyyy-dock" "${TARGET_BIN_DIR}/speechyyy-dock"
+                find "target/release" -maxdepth 1 -type f -name "lib*.so*" -exec install -m 755 {} "${TARGET_BIN_DIR}/" \; 2>/dev/null || true
             else
                 echo "Error: Failed to download release binaries from GitHub and cargo is not available to build from source." >&2
                 echo "Please install cargo (https://rustup.rs/) or check release assets at: https://github.com/${REPO}/releases" >&2
@@ -246,9 +289,14 @@ else
         mkdir -p "$CONFIG_DIR"
         (
             umask 077
-            cat > "$CONFIG_FILE" <<EOF
+            if [ -n "$API_KEY" ]; then
+                cat > "$CONFIG_FILE" <<EOF
 hotkey = "RightAlt"
 pacing_delay_ms = 15
+# Injection mode:
+# - "clipboard" (default): fast paste via Ctrl+V; leaves transcription in clipboard and immune to browser hotkey hijacking. (Requires wl-clipboard on Wayland; does not paste in standard terminals).
+# - "typewriter": character-by-character typing via /dev/uinput. Works in terminals, but triggers page shortcuts if no text field is focused.
+injection_mode = "clipboard"
 
 [input]
 hotkey = "RightAlt"
@@ -267,17 +315,51 @@ language_code = "unknown"
 mode = "translit"
 
 [injector]
-method = "typewriter"
+method = "clipboard"
 pacing_delay_ms = 15
 
 [ui]
 nickname = "babe"
 EOF
+            else
+                cat > "$CONFIG_FILE" <<EOF
+hotkey = "RightAlt"
+pacing_delay_ms = 15
+# Injection mode:
+# - "clipboard" (default): fast paste via Ctrl+V; leaves transcription in clipboard and immune to browser hotkey hijacking. (Requires wl-clipboard on Wayland; does not paste in standard terminals).
+# - "typewriter": character-by-character typing via /dev/uinput. Works in terminals, but triggers page shortcuts if no text field is focused.
+injection_mode = "clipboard"
+
+[input]
+hotkey = "RightAlt"
+grab_key = true
+
+[audio]
+sample_rate = 16000
+vad_threshold = 0.005
+min_duration_ms = 200
+
+[inference]
+# Defaults to provider = "local" with model = "parakeet-tdt-v3"
+# Run 'speechyyy download parakeet-tdt-v3' to download offline weights.
+# Or configure a cloud provider: 'speechyyy use sarvam', 'speechyyy use groq', or 'speechyyy use openai'.
+provider = "local"
+model = "parakeet-tdt-v3"
+
+[injector]
+method = "clipboard"
+pacing_delay_ms = 15
+
+[ui]
+nickname = "babe"
+EOF
+            fi
         )
         chmod 600 "$CONFIG_FILE"
 
         if [ -z "$API_KEY" ]; then
-            echo "✦ No API key provided. Add one later in ${CONFIG_FILE}"
+            echo "✦ No API key provided. Defaulting to local offline provider ('parakeet-tdt-v3')."
+            echo "  Run 'speechyyy download parakeet-tdt-v3' to fetch weights, or configure a provider with 'speechyyy use <provider>'."
             API_KEY_STATUS="skipped"
         else
             echo "[✓] Configuration written securely with mode 0600."
@@ -290,59 +372,75 @@ fi
 echo "✦ Checking autostart configuration..."
 HYPR_STATUS="not_detected"
 if [ -f "$HYPR_CONF" ]; then
-    HYPR_LINES=(
-        "exec-once = speechyyy daemon"
-        "exec-once = speechyyy-dock"
-        "bind = , code:108, exec, speechyyy toggle"
-    )
-
-    MISSING_LINES=()
-    for line in "${HYPR_LINES[@]}"; do
-        if ! grep -qxF "$line" "$HYPR_CONF" 2>/dev/null; then
-            MISSING_LINES+=("$line")
-        fi
-    done
-
-    if [ "${#MISSING_LINES[@]}" -eq 0 ]; then
-        echo "[✓] Hyprland configuration (${HYPR_CONF}) already contains Speechyyy autostart & hotkey."
-        HYPR_STATUS="already_present"
+    EXISTING_BINDS=$(grep -E 'exec.*speechyyy (toggle|push-down|push-up)' "$HYPR_CONF" 2>/dev/null || true)
+    if [ -n "$EXISTING_BINDS" ]; then
+        echo "[!] Existing Speechyyy keybinding(s) detected in ${HYPR_CONF}:"
+        echo "$EXISTING_BINDS" | sed 's/^/      /'
+        echo "    To prevent conflicting bindings, new keybindings were not appended automatically."
+        echo "    Suggested push-to-talk configuration for ~/.config/hypr/hyprland.conf:"
+        echo "      exec-once = speechyyy daemon"
+        echo "      exec-once = speechyyy-dock"
+        echo "      bind = , code:108, exec, speechyyy push-down"
+        echo "      bindr = , code:108, exec, speechyyy push-up"
+        echo "      # bind = , Scroll_Lock, exec, speechyyy toggle"
+        HYPR_STATUS="existing_binds_detected"
     else
-        PROCEED_HYPR=1
-        if [ "$DRY_RUN" = "0" ]; then
-            if [ -t 0 ]; then
-                read -rp "✦ Add Speechyyy autostart & hotkey (RightAlt) to ~/.config/hypr/hyprland.conf? [Y/n] " HYPR_REPLY || HYPR_REPLY=""
-                case "$HYPR_REPLY" in
-                    [nN]*) PROCEED_HYPR=0 ;;
-                    *) PROCEED_HYPR=1 ;;
-                esac
-            elif [ ! "/dev/null" -ef /dev/stdin ] && [ -r /dev/tty ] && (exec < /dev/tty 2>/dev/null); then
-                read -rp "✦ Add Speechyyy autostart & hotkey (RightAlt) to ~/.config/hypr/hyprland.conf? [Y/n] " HYPR_REPLY < /dev/tty || HYPR_REPLY=""
-                case "$HYPR_REPLY" in
-                    [nN]*) PROCEED_HYPR=0 ;;
-                    *) PROCEED_HYPR=1 ;;
-                esac
-            fi
-        fi
+        HYPR_LINES=(
+            "exec-once = speechyyy daemon"
+            "exec-once = speechyyy-dock"
+            "bind = , code:108, exec, speechyyy push-down"
+            "bindr = , code:108, exec, speechyyy push-up"
+            "# bind = , Scroll_Lock, exec, speechyyy toggle"
+        )
 
-        if [ "$PROCEED_HYPR" = "1" ]; then
-            if [ "$DRY_RUN" = "1" ]; then
-                echo "[dry-run] Would backup ${HYPR_CONF} to ${HYPR_CONF}.bak.<timestamp>"
-                for line in "${MISSING_LINES[@]}"; do
-                    echo "[dry-run] Would append to ${HYPR_CONF}: ${line}"
-                done
-                HYPR_STATUS="would_update"
-            else
-                BACKUP_PATH="${HYPR_CONF}.bak.$(date +%s)"
-                cp "$HYPR_CONF" "$BACKUP_PATH"
-                for line in "${MISSING_LINES[@]}"; do
-                    echo "$line" >> "$HYPR_CONF"
-                done
-                echo "[✓] Hyprland configuration updated (backup created at ${BACKUP_PATH})."
-                HYPR_STATUS="updated"
+        MISSING_LINES=()
+        for line in "${HYPR_LINES[@]}"; do
+            if ! grep -qxF "$line" "$HYPR_CONF" 2>/dev/null; then
+                MISSING_LINES+=("$line")
             fi
+        done
+
+        if [ "${#MISSING_LINES[@]}" -eq 0 ]; then
+            echo "[✓] Hyprland configuration (${HYPR_CONF}) already contains Speechyyy autostart & push-to-talk hotkeys."
+            HYPR_STATUS="already_present"
         else
-            echo "[!] Skipped Hyprland configuration update."
-            HYPR_STATUS="skipped"
+            PROCEED_HYPR=1
+            if [ "$DRY_RUN" = "0" ]; then
+                if [ -t 0 ]; then
+                    read -rp "✦ Add Speechyyy autostart & push-to-talk hotkeys (RightAlt) to ~/.config/hypr/hyprland.conf? [Y/n] " HYPR_REPLY || HYPR_REPLY=""
+                    case "$HYPR_REPLY" in
+                        [nN]*) PROCEED_HYPR=0 ;;
+                        *) PROCEED_HYPR=1 ;;
+                    esac
+                elif [ ! "/dev/null" -ef /dev/stdin ] && [ -r /dev/tty ] && (exec < /dev/tty 2>/dev/null); then
+                    read -rp "✦ Add Speechyyy autostart & push-to-talk hotkeys (RightAlt) to ~/.config/hypr/hyprland.conf? [Y/n] " HYPR_REPLY < /dev/tty || HYPR_REPLY=""
+                    case "$HYPR_REPLY" in
+                        [nN]*) PROCEED_HYPR=0 ;;
+                        *) PROCEED_HYPR=1 ;;
+                    esac
+                fi
+            fi
+
+            if [ "$PROCEED_HYPR" = "1" ]; then
+                if [ "$DRY_RUN" = "1" ]; then
+                    echo "[dry-run] Would backup ${HYPR_CONF} to ${HYPR_CONF}.bak.<timestamp>"
+                    for line in "${MISSING_LINES[@]}"; do
+                        echo "[dry-run] Would append to ${HYPR_CONF}: ${line}"
+                    done
+                    HYPR_STATUS="would_update"
+                else
+                    BACKUP_PATH="${HYPR_CONF}.bak.$(date +%s)"
+                    cp "$HYPR_CONF" "$BACKUP_PATH"
+                    for line in "${MISSING_LINES[@]}"; do
+                        echo "$line" >> "$HYPR_CONF"
+                    done
+                    echo "[✓] Hyprland configuration updated (backup created at ${BACKUP_PATH})."
+                    HYPR_STATUS="updated"
+                fi
+            else
+                echo "[!] Skipped Hyprland configuration update."
+                HYPR_STATUS="skipped"
+            fi
         fi
     fi
 fi
@@ -428,6 +526,9 @@ case "$HYPR_STATUS" in
         ;;
     would_update)
         echo "• Autostart:      Hyprland config planned for update (dry-run)"
+        ;;
+    existing_binds_detected)
+        echo "• Autostart:      Existing Hyprland bindings detected (manual review recommended)"
         ;;
     skipped)
         echo "• Autostart:      Hyprland update skipped by user"

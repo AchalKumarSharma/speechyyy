@@ -8,6 +8,7 @@ use evdev::KeyCode;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Modifier {
@@ -318,15 +319,28 @@ pub struct StateMachineController<E: DictationEngine> {
     pub tracker: KeyChordTracker,
     pub engine: E,
     pub state: DictationState,
+    pub last_toggle: Option<Instant>,
 }
 
 impl<E: DictationEngine> StateMachineController<E> {
+    pub const TOGGLE_DEBOUNCE_DURATION: Duration = Duration::from_millis(150);
+
     pub fn new(target: TargetChord, engine: E) -> Self {
         Self {
             tracker: KeyChordTracker::new(target),
             engine,
             state: DictationState::Idle,
+            last_toggle: None,
         }
+    }
+
+    pub fn should_debounce_toggle(&self, now: Instant) -> bool {
+        self.last_toggle
+            .is_some_and(|t| now.duration_since(t) < Self::TOGGLE_DEBOUNCE_DURATION)
+    }
+
+    pub fn record_toggle(&mut self, now: Instant) {
+        self.last_toggle = Some(now);
     }
 
     pub fn start_recording(&mut self) -> Result<(), String> {
@@ -374,7 +388,11 @@ impl<E: DictationEngine> StateMachineController<E> {
         self.engine.active_rms()
     }
 
-    pub fn toggle(&mut self) -> Result<Option<String>, String> {
+    pub fn toggle_at(&mut self, now: Instant) -> Result<Option<String>, String> {
+        if self.should_debounce_toggle(now) {
+            return Ok(None);
+        }
+        self.record_toggle(now);
         match self.state {
             DictationState::Idle => {
                 self.start_recording()?;
@@ -383,6 +401,10 @@ impl<E: DictationEngine> StateMachineController<E> {
             DictationState::Recording => self.stop_and_transcribe(),
             _ => Ok(None),
         }
+    }
+
+    pub fn toggle(&mut self) -> Result<Option<String>, String> {
+        self.toggle_at(Instant::now())
     }
 
     pub fn handle_key_event(
@@ -535,12 +557,13 @@ mod tests {
         assert_eq!(controller.state, DictationState::Idle);
 
         // 3. Toggle from Idle -> Recording
-        let toggle_res1 = controller.toggle().unwrap();
+        let t0 = Instant::now();
+        let toggle_res1 = controller.toggle_at(t0).unwrap();
         assert_eq!(toggle_res1, None);
         assert_eq!(controller.state, DictationState::Recording);
 
-        // 4. Toggle from Recording -> Processing/Emitting
-        let toggle_res2 = controller.toggle().unwrap();
+        // 4. Toggle from Recording -> Processing/Emitting (spaced past 150ms debounce)
+        let toggle_res2 = controller.toggle_at(t0 + Duration::from_millis(200)).unwrap();
         assert_eq!(toggle_res2, Some("Direct IPC Payload".to_string()));
         assert_eq!(controller.state, DictationState::Emitting);
         controller.finish_emission();
